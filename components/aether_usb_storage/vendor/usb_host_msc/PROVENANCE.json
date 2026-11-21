@@ -1,0 +1,72 @@
+{
+  "component": "espressif/usb_host_msc",
+  "version": "1.3.0",
+  "upstream": "Existing managed_components snapshot; SDK and managed directory remain unchanged",
+  "managed_component_hash": "d8765c212bb4915d42560886fac3cc5059d61a0bfa14152b32ea9a5258e7a0c9",
+  "patches": [
+    "Allocate BDL VFS wrapper/path completely before mount publication, eliminating late OOM rollback",
+    "Return checked BDL unmount error and retain VFS wrapper/device registration guard until safe retry succeeds"
+  ],
+  "files": {
+    "CMakeLists.txt": {
+      "upstream_sha256": "f673fa34cc23b97f9f370620c348b094e6e5113cf79dab8feb2654bedd5ee5b6",
+      "vendored_sha256": "f673fa34cc23b97f9f370620c348b094e6e5113cf79dab8feb2654bedd5ee5b6"
+    },
+    "LICENCE": {
+      "upstream_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "vendored_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "README.md": {
+      "upstream_sha256": "e78b223ea6671be1c7acbfe5559dcff0ec2889ff3a0fde8b2ff976bd2a959cb2",
+      "vendored_sha256": "e78b223ea6671be1c7acbfe5559dcff0ec2889ff3a0fde8b2ff976bd2a959cb2"
+    },
+    "CHANGELOG.md": {
+      "upstream_sha256": "64b7cb797747dd9efbcdb69d276e4422be9c63b96cebc5912aa2882c17099df9",
+      "vendored_sha256": "64b7cb797747dd9efbcdb69d276e4422be9c63b96cebc5912aa2882c17099df9"
+    },
+    "idf_component.yml": {
+      "upstream_sha256": "75d914db418319cca4a18d0788341a495dba9c6de81361f1ec226a263c1f12db",
+      "vendored_sha256": "75d914db418319cca4a18d0788341a495dba9c6de81361f1ec226a263c1f12db"
+    },
+    "include/esp_private/msc_scsi_bot.h": {
+      "upstream_sha256": "ecb09ee1bbf8f1a37f32ee5f978465493d872cd58a9a0ebd83bc80e13c6c5547",
+      "vendored_sha256": "ecb09ee1bbf8f1a37f32ee5f978465493d872cd58a9a0ebd83bc80e13c6c5547"
+    },
+    "include/usb/msc_host.h": {
+      "upstream_sha256": "f3957ffe188157147a31518b610527be2f2961dc83a17029ef7acf7b403c65f0",
+      "vendored_sha256": "f3957ffe188157147a31518b610527be2f2961dc83a17029ef7acf7b403c65f0"
+    },
+    "include/usb/msc_host_vfs.h": {
+      "upstream_sha256": "4ef947ca2a730bf8c4d9a9dc2eb277589b9bdc3211f78cfdebfca5cf196b40ee",
+      "vendored_sha256": "4ef947ca2a730bf8c4d9a9dc2eb277589b9bdc3211f78cfdebfca5cf196b40ee"
+    },
+    "private_include/diskio_usb.h": {
+      "upstream_sha256": "91b5eba3c81df1d86d8c3681e6871feb4760d34cb78d9ca337c20e0e4cc23f4c",
+      "vendored_sha256": "91b5eba3c81df1d86d8c3681e6871feb4760d34cb78d9ca337c20e0e4cc23f4c"
+    },
+    "private_include/msc_common.h": {
+      "upstream_sha256": "af15862c069245b5a5b5f88483e7c58fcdec3e9aecdc103e977e8fd3d090c55b",
+      "vendored_sha256": "af15862c069245b5a5b5f88483e7c58fcdec3e9aecdc103e977e8fd3d090c55b"
+    },
+    "src/diskio_usb.c": {
+      "upstream_sha256": "da1ed927c1150ef4e9351294ae67c611fe4d1d19ee6c19bcdd8fec8591df234d",
+      "vendored_sha256": "da1ed927c1150ef4e9351294ae67c611fe4d1d19ee6c19bcdd8fec8591df234d"
+    },
+    "src/msc_bdl.c": {
+      "upstream_sha256": "d6be59a99f1ae867290664eca9550bc686d3078a4975a5e163ce1b64e87177a1",
+      "vendored_sha256": "d6be59a99f1ae867290664eca9550bc686d3078a4975a5e163ce1b64e87177a1"
+    },
+    "src/msc_host.c": {
+      "upstream_sha256": "20bca65a326e3c0ac13569734ff98d39ad0c7565a718fd28e2eb65f5a5e1f21c",
+      "vendored_sha256": "20bca65a326e3c0ac13569734ff98d39ad0c7565a718fd28e2eb65f5a5e1f21c"
+    },
+    "src/msc_host_vfs.c": {
+      "upstream_sha256": "5e66056125eabb1441c24d11c1b4113de79dc5a9e27f3bda86597854e6c2a65c",
+      "vendored_sha256": "5745afe6c45bda984e2637bb487eb026b7088a4d4d0a8648c2fcecfd4778df5f"
+    },
+    "src/msc_scsi_bot.c": {
+      "upstream_sha256": "2444d8083ec38bb4b9529c4248520f1eb5970656ab4b3bbf3c67cbfc2604e8c7",
+      "vendored_sha256": "2444d8083ec38bb4b9529c4248520f1eb5970656ab4b3bbf3c67cbfc2604e8c7"
+    }
+  }
+}

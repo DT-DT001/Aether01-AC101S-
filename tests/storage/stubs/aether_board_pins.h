@@ -1,0 +1,8 @@
+#pragma once
+#define AETHER_GPIO_TF_DET 6
+#define AETHER_GPIO_TF_D0 10
+#define AETHER_GPIO_TF_D1 11
+#define AETHER_GPIO_TF_D2 12
+#define AETHER_GPIO_TF_D3 13
+#define AETHER_GPIO_TF_CMD 14
+#define AETHER_GPIO_TF_CLK 15

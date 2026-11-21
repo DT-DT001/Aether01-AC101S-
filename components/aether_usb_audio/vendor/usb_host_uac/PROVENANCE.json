@@ -1,0 +1,54 @@
+{
+  "component": "espressif/usb_host_uac",
+  "version": "1.5.0",
+  "upstream_commit": "6d24137e14a4f6c8138662a7a074be16a899c2c6",
+  "archive_url": "https://components.espressif.com/api/downloads/?object_id=e73bc72f-923c-4777-93e3-511e941c6ce9&object_type=component",
+  "patches": [
+    "open-failure: free ring buffer before interface deletion; guard NULL interface",
+    "interface-add failure: guard interface pointer before member cleanup",
+    "physical-device deletion: only remove registered STAILQ member after construction failure",
+    "interface close: restore physical-device reference count when USB device close fails, permitting checked retry"
+  ],
+  "files": {
+    "CMakeLists.txt": {
+      "upstream_sha256": "e48a39718078b8820063b1b84662d2fd51676212b64b6b3600ae821b90b033af",
+      "vendored_sha256": "e48a39718078b8820063b1b84662d2fd51676212b64b6b3600ae821b90b033af"
+    },
+    "Kconfig": {
+      "upstream_sha256": "a9293f862783578a09cc927a2ee42413c42532da77d98b099baad8917c65858b",
+      "vendored_sha256": "a9293f862783578a09cc927a2ee42413c42532da77d98b099baad8917c65858b"
+    },
+    "LICENSE": {
+      "upstream_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "vendored_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "README.md": {
+      "upstream_sha256": "d9cd03095210444e6162dc95d05e40fbd83292b16516a81d85b4e04d9ba7a08c",
+      "vendored_sha256": "d9cd03095210444e6162dc95d05e40fbd83292b16516a81d85b4e04d9ba7a08c"
+    },
+    "CHANGELOG.md": {
+      "upstream_sha256": "733991557266b0f35759b80bf856d3ec5b83d2c0f84366468d22261dbded1a14",
+      "vendored_sha256": "733991557266b0f35759b80bf856d3ec5b83d2c0f84366468d22261dbded1a14"
+    },
+    "idf_component.yml": {
+      "upstream_sha256": "574c93d195abe8f975a7b22ecebec6901c2f8dd9ed8e37571bb8edad5eebcc9e",
+      "vendored_sha256": "574c93d195abe8f975a7b22ecebec6901c2f8dd9ed8e37571bb8edad5eebcc9e"
+    },
+    "uac_host.c": {
+      "upstream_sha256": "e765972a3afc979b14a278d381ad055af0a234e2981b9a72108e8e4c9cad5a59",
+      "vendored_sha256": "f4792f03f4156943b1275ff3afe75d59c6c1a309ee1bb7a4406ef23350762434"
+    },
+    "uac_descriptors.c": {
+      "upstream_sha256": "d24fb4a6379db4379730b63ff817d3cc4b4bea9fe01f988e2232daf28d9ef8de",
+      "vendored_sha256": "d24fb4a6379db4379730b63ff817d3cc4b4bea9fe01f988e2232daf28d9ef8de"
+    },
+    "include/usb/uac.h": {
+      "upstream_sha256": "a9d011a0c36945b0c4edcdf4515d3fe282588565a27bcf561239bfa121ed6a18",
+      "vendored_sha256": "a9d011a0c36945b0c4edcdf4515d3fe282588565a27bcf561239bfa121ed6a18"
+    },
+    "include/usb/uac_host.h": {
+      "upstream_sha256": "c34170f56fa2cdfd7ec4ef8f79f1422eee83692877339fe2005f900fc84edc87",
+      "vendored_sha256": "c34170f56fa2cdfd7ec4ef8f79f1422eee83692877339fe2005f900fc84edc87"
+    }
+  }
+}

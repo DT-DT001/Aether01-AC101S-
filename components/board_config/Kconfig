@@ -1,0 +1,92 @@
+menu "Aether01 board configuration"
+
+    config AETHER_LCD_H_RES
+        int "AMOLED horizontal resolution"
+        default 480
+        range 1 1024
+        help
+            KD021WVOSN009-C003B specification: 480 pixels.
+
+    config AETHER_LCD_V_RES
+        int "AMOLED vertical resolution"
+        default 480
+        range 1 1024
+        help
+            KD021WVOSN009-C003B specification: 480 pixels.
+
+    config AETHER_LCD_PCLK_HZ
+        int "AMOLED QSPI clock frequency"
+        default 48000000
+        range 1000000 50000000
+        help
+            CO5300 write cycle minimum is 20ns. ESP32-S31 can generate 48MHz
+            exactly; requesting 50MHz selects 40MHz with the current driver.
+
+    config AETHER_LCD_BUFFER_LINES
+        int "LVGL partial buffer height"
+        default 40
+        range 10 160
+
+    config AETHER_SCREEN_TIMEOUT_SEC
+        int "Screen inactivity timeout (seconds, 0 disables)"
+        default 30
+        range 0 3600
+
+    config AETHER_SCREEN_BRIGHTNESS
+        int "Default AMOLED brightness percent"
+        default 80
+        range 1 100
+
+    config AETHER_POWER_ALDO2_MV
+        int "ALDO2 sensor rail voltage (mV)"
+        default 3300
+        range 3300 3300
+        help
+            Sensor I/O shares the 3.3 V system I2C bus with the PMIC.
+            ALDO2 remains enabled even when sensor sampling is disabled.
+
+    config AETHER_POWER_ALDO4_MV
+        int "ALDO4 AC101S rail voltage (mV)"
+        default 3300
+        range 500 3500
+
+    config AETHER_POWER_CLDO1_MV
+        int "CLDO1 CST9220 rail voltage (mV)"
+        default 3300
+        range 500 3500
+        help
+            The module connector specifies TP_VCC_3.3V; absolute maximum is 3.6 V.
+
+    config AETHER_POWER_CLDO3_MV
+        int "CLDO3 CO5300AF I/O rail voltage (mV)"
+        default 3300
+        range 500 3500
+        help
+            The module connector specifies LCD_3.3V; allowed range is 2.5..3.6 V.
+
+    config AETHER_POWER_BLDO1_MV
+        int "BLDO1 microSD rail voltage (mV)"
+        default 3300
+        range 500 3500
+
+    config AETHER_ENABLE_DISPLAY
+        bool "Initialize CO5300AF display"
+        default y
+
+    config AETHER_ENABLE_TOUCH
+        bool "Initialize CST9220 touch"
+        default y
+        depends on AETHER_ENABLE_DISPLAY
+
+    config AETHER_ENABLE_AUDIO
+        bool "Initialize AC101S audio codec"
+        default y
+
+    config AETHER_ENABLE_SENSORS
+        bool "Initialize IMU, pressure sensor and RTC"
+        default y
+        help
+            Controls sensor initialization and sampling, not the ALDO2 supply.
+            ALDO2 stays on to maintain the shared system I2C bus.
+
+endmenu

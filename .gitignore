@@ -1,0 +1,41 @@
+# ESP-IDF generated configuration, builds and downloaded components
+/build/
+/build-*/
+/build_*/
+/cmake-build-*/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.build
+/sdkconfig.build.old
+/sdkconfig.backup
+
+# Local reference material and user media; runtime assets are in main/assets
+/Files/
+/file/
+/SCH/
+/Video/
+/tmp/
+
+# Editors, caches and compiled artifacts
+/.vscode/
+/.idea/
+__pycache__/
+.pytest_cache/
+.cache/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.py[cod]
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+*.elf
+*.map
+*.bin
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,230 @@
+{
+  "component": "fatfs",
+  "upstream": "existing Espressif ESP-IDF6.1 installation",
+  "upstream_repository": "https://github.com/espressif/esp-idf",
+  "upstream_commit": "fff9895c82d744c7237be8847347bdd1b07c6643",
+  "upstream_component_path": "components/fatfs",
+  "upstream_component_worktree_clean": true,
+  "fatfs_revision": "R0.16 / FF_DEFINED80386",
+  "patches": [
+    "Enable official FatFs GPT scanner via FF_LBA64=1 and its required FF_FS_EXFAT=1; preserve LFN and physical512-byte SD geometry",
+    "Retain IDF/managed MSC uint32 sector driver ABI with checked LBA64 read/write and GET_SECTOR_COUNT/CTRL_TRIM adapters in diskio.c",
+    "Use owned local generation helpers from project_include.cmake rather than an installed SDK path",
+    "Normalize disabled CONFIG_FATFS_USE_LABEL to FF_USE_LABEL=0 in C expressions reached by the enabled official exFAT path; retain label feature disabled",
+    "Reject sizes, transfers and seeks outside signed libc VFS off_t/ssize_t bounds before64bit FatFs operations; preserve safe negative seeks and EOF reads",
+    "Retain generic VFS callback context on esp_vfs_unregister failure; BDL unmount preserves diskio/context until checked unregister succeeds",
+    "SD unmount retains card/context/diskio on VFS failure, tracks completed VFS stage and latches nontransactional host-deinit errors without unsafe repeat",
+    "Clear released SD drive/card bindings on mount cleanup and unmount to prevent stale card-address/pdrv aliasing with USB; lookup partition context by base path",
+    "Preallocate SD cleanup-owner context before VFS mount publication rather than failing a late owner allocation after successful mount",
+    "Project-authored timed shared lifecycle mutex serializes TF/USB whole mount/unmount transactions without locking ordinary per-volume file IO"
+  ],
+  "limits": [
+    "Underlying IDF SD/MMC and MSC drivers retain32-bit sector/count contracts; out-of-range requests are explicitly refused",
+    "All consumers must rebuild against this one FatFs header/structure ABI; never mix installed-SDK ff.h with local fatfs sources",
+    "Actual user media is not formatted or modified by compatibility diagnosis/tests",
+    "ESP32-S31 application VFS off_t/st_size is signed32bit; nonrepresentable file sizes/offsets are rejected with EOVERFLOW rather than expanded or truncated",
+    "A failed SD or MSC host/device teardown can be nontransactional; retain ownership and require hardware reset rather than retrying partially freed driver objects",
+    "Compound mount failure plus VFS-unregister rollback failure is not fully transactional in the inherited SDK mount error API and is not qualified by these cleanup tests"
+  ],
+  "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+  "files": {
+    "src/00history.txt": {
+      "upstream_sha256": "bdd612eb26a326e55bc51488801a9d7ff7aad9f63557cdab445327714ac53239",
+      "vendored_sha256": "bdd612eb26a326e55bc51488801a9d7ff7aad9f63557cdab445327714ac53239"
+    },
+    "src/00readme.txt": {
+      "upstream_sha256": "55ee13fe1d2abcf6c6a11aaa0a2eba5aeba511e54dddfde5e3ca4e987d1c4483",
+      "vendored_sha256": "55ee13fe1d2abcf6c6a11aaa0a2eba5aeba511e54dddfde5e3ca4e987d1c4483"
+    },
+    "src/diskio.c": {
+      "upstream_sha256": "19434209f233ce9a6a803a34dd2dcc0ea821d1f308f95ae749ddd91e480d121b",
+      "vendored_sha256": "19434209f233ce9a6a803a34dd2dcc0ea821d1f308f95ae749ddd91e480d121b"
+    },
+    "src/diskio.h": {
+      "upstream_sha256": "9ad9ea857ea7752cb7dcf2f065899eee3abfeec5039598d28cc3cf2acebcbb86",
+      "vendored_sha256": "9ad9ea857ea7752cb7dcf2f065899eee3abfeec5039598d28cc3cf2acebcbb86"
+    },
+    "src/ff.c": {
+      "upstream_sha256": "b9b79c2c523b9d079b30c19157af15d6c60d0be02ab9ecba353a2e2cde9da253",
+      "vendored_sha256": "b9b79c2c523b9d079b30c19157af15d6c60d0be02ab9ecba353a2e2cde9da253"
+    },
+    "src/ff.h": {
+      "upstream_sha256": "0e2721a3a82693adf69aeccafeda25f1790be28cc6aa03c2e6966c7c4f6660f2",
+      "vendored_sha256": "0e2721a3a82693adf69aeccafeda25f1790be28cc6aa03c2e6966c7c4f6660f2"
+    },
+    "src/ffconf.h": {
+      "upstream_sha256": "e6e649a4e921187c651879a6faf79446bb5169831cf462a0b1caa887d1e1d82c",
+      "vendored_sha256": "2c8c68517f9d2034d87193e8893936e0706d65d20059fb72f0172e5a2a0f0375"
+    },
+    "src/ffsystem.c": {
+      "upstream_sha256": "68e6d533645c81e053ffc9fa6c293a0aa3162d6439151404866931c64f423dd3",
+      "vendored_sha256": "68e6d533645c81e053ffc9fa6c293a0aa3162d6439151404866931c64f423dd3"
+    },
+    "src/ffunicode.c": {
+      "upstream_sha256": "f2e03e97fccd9d7b0614b48ee02b7e49fb21c5196d3ff77ba5d8e4558a064d5d",
+      "vendored_sha256": "f2e03e97fccd9d7b0614b48ee02b7e49fb21c5196d3ff77ba5d8e4558a064d5d"
+    },
+    "diskio/diskio.c": {
+      "upstream_sha256": "0d057a5b919c93f5e8055691aa442fc272e09fb2ab24d866655394617cab9585",
+      "vendored_sha256": "f310149b92c8a2adff08b67d2fa041d51f7a6c4db4ae311628f5a010c1d5997d"
+    },
+    "diskio/diskio_bdl.c": {
+      "upstream_sha256": "d8567d117c4fc63e54e5cab9be1cacae2fa644314bcf2157bd662703c1747500",
+      "vendored_sha256": "d8567d117c4fc63e54e5cab9be1cacae2fa644314bcf2157bd662703c1747500"
+    },
+    "diskio/diskio_bdl.h": {
+      "upstream_sha256": "52bbf39ab78d3dac6806b5f2502ca3cc1241a31c9c649bf1368b0d5fe548978e",
+      "vendored_sha256": "52bbf39ab78d3dac6806b5f2502ca3cc1241a31c9c649bf1368b0d5fe548978e"
+    },
+    "diskio/diskio_impl.h": {
+      "upstream_sha256": "bba1565e87fa425794d646cfbb9fda49a03098902105ee4a253e79c97a6a7663",
+      "vendored_sha256": "bba1565e87fa425794d646cfbb9fda49a03098902105ee4a253e79c97a6a7663"
+    },
+    "diskio/diskio_rawflash.c": {
+      "upstream_sha256": "c9503c6e8b6e83cba5adf491f3b9f5cc5255515a3df05fdf2961d583eb2f4624",
+      "vendored_sha256": "c9503c6e8b6e83cba5adf491f3b9f5cc5255515a3df05fdf2961d583eb2f4624"
+    },
+    "diskio/diskio_rawflash.h": {
+      "upstream_sha256": "5a8a44bf20e83a4e8db8a2d7cfe05d8ad847bad33523d7b9392b443e6b1dcf01",
+      "vendored_sha256": "5a8a44bf20e83a4e8db8a2d7cfe05d8ad847bad33523d7b9392b443e6b1dcf01"
+    },
+    "diskio/diskio_sdmmc.c": {
+      "upstream_sha256": "2dc94f4b4f88e6bbed99557250c079466ebe06b66b0a87ff5369ef09f92f4b8d",
+      "vendored_sha256": "1b292647c393656b414752032b61f2b71e520caf9da2f8643863b06a84113281"
+    },
+    "diskio/diskio_sdmmc.h": {
+      "upstream_sha256": "8eff8155bc1e32c63c9bd11f860a40eb432e0881dd1b54d33652ee21aa5ae6fc",
+      "vendored_sha256": "8eff8155bc1e32c63c9bd11f860a40eb432e0881dd1b54d33652ee21aa5ae6fc"
+    },
+    "diskio/diskio_wl.c": {
+      "upstream_sha256": "84c0ab7552d592ec88528cdc2740b7bfeb1327c9438029686524cffb064f3b7d",
+      "vendored_sha256": "84c0ab7552d592ec88528cdc2740b7bfeb1327c9438029686524cffb064f3b7d"
+    },
+    "diskio/diskio_wl.h": {
+      "upstream_sha256": "1ccea0718ee9cfd0e045c11b03762b5376fb3b6502e2c97f69e4fda0ef409500",
+      "vendored_sha256": "1ccea0718ee9cfd0e045c11b03762b5376fb3b6502e2c97f69e4fda0ef409500"
+    },
+    "diskio/private_include/diskio_private.h": {
+      "upstream_sha256": "5cb8d977ef77542fe16f295d2a11a45e03901c154746c01e75ec15c974b479f0",
+      "vendored_sha256": "5cb8d977ef77542fe16f295d2a11a45e03901c154746c01e75ec15c974b479f0"
+    },
+    "diskio/private_include/diskio_sdmmc_private.h": {
+      "upstream_sha256": "06f9689ae44701a656e998f21ca0d4b4ec8b8eaa6f1050d7b7e29e88d8a4d006",
+      "vendored_sha256": "78374176c24a573958be05ddb3c37c1a404b20b010a0dfde50c899b72d5e15af"
+    },
+    "vfs/esp_vfs_fat.h": {
+      "upstream_sha256": "b258f68598159918dff88c28a5d2760e152e6d5d5ccffa5e0299a29609f0d4e1",
+      "vendored_sha256": "b258f68598159918dff88c28a5d2760e152e6d5d5ccffa5e0299a29609f0d4e1"
+    },
+    "vfs/vfs_fat.c": {
+      "upstream_sha256": "ccc064785b246dde4e6fc74f4cfc6bf17fa4d4bb74acbb4e9c04bc72342e368f",
+      "vendored_sha256": "98d44d5a5a467697ecb6682bbde7e77269f60d10371ba9883ea71f5d63f623ef"
+    },
+    "vfs/vfs_fat_bdl.c": {
+      "upstream_sha256": "acb540fa33fbac4bd0266bc6bafe147508fdc0314a5c11a362d6c4bff2c955f3",
+      "vendored_sha256": "38279ead4ba9e7ba3b0219e79db0a9b8500756c9f4acf5521ca83f41b795aeac"
+    },
+    "vfs/vfs_fat_internal.h": {
+      "upstream_sha256": "709dca2090dd45417c24c73136cb98c376e94124bc6e60e88e66cb83cdc2c4f3",
+      "vendored_sha256": "fa4431d6e7c24a7ef3ba966e61db3917d925f3970a84f71594366561d1cba2b6"
+    },
+    "vfs/vfs_fat_sdmmc.c": {
+      "upstream_sha256": "33ba8730df6309d18534063556f3b3f469f6190c9d4e184ab99a13382ae26d8c",
+      "vendored_sha256": "fb3250c0a56cedfb714421744e5eb6da54554c1054fa2740430eee7eedeade95"
+    },
+    "vfs/vfs_fat_spiflash.c": {
+      "upstream_sha256": "6a2ec08014e2df6b7dbc35ef150009735ccca7a84834c2658d9be417960d11a1",
+      "vendored_sha256": "6a2ec08014e2df6b7dbc35ef150009735ccca7a84834c2658d9be417960d11a1"
+    },
+    "port/freertos/ffsystem.c": {
+      "upstream_sha256": "31d6b87cf5d55188ecad01a1ed5d6c003832c6799e2e2097a98676314d3ca832",
+      "vendored_sha256": "31d6b87cf5d55188ecad01a1ed5d6c003832c6799e2e2097a98676314d3ca832"
+    },
+    "port/linux/ffsystem.c": {
+      "upstream_sha256": "4cde69e6e02c4664a1640c11d4cdf8efae2c3a1948653ebbf3aa1c35f0019a0b",
+      "vendored_sha256": "4cde69e6e02c4664a1640c11d4cdf8efae2c3a1948653ebbf3aa1c35f0019a0b"
+    },
+    "fatfs_utils/__init__.py": {
+      "upstream_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "vendored_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fatfs_utils/boot_sector.py": {
+      "upstream_sha256": "355ca60504f45e278b3e1c185982cae02a74105be093ffeb7cbda1e1bc1a4982",
+      "vendored_sha256": "355ca60504f45e278b3e1c185982cae02a74105be093ffeb7cbda1e1bc1a4982"
+    },
+    "fatfs_utils/cluster.py": {
+      "upstream_sha256": "5fd4e98fa30cfdb1289c835f7230203ace78a0e84ef8094908384a4c28fb73ca",
+      "vendored_sha256": "5fd4e98fa30cfdb1289c835f7230203ace78a0e84ef8094908384a4c28fb73ca"
+    },
+    "fatfs_utils/entry.py": {
+      "upstream_sha256": "696304536730fa2f93a5ec58d908336a50ec27361dd09437dda92bcdd157cda6",
+      "vendored_sha256": "696304536730fa2f93a5ec58d908336a50ec27361dd09437dda92bcdd157cda6"
+    },
+    "fatfs_utils/exceptions.py": {
+      "upstream_sha256": "25dff81611423cfec573707e1aa8a1311cbda9094b5004b4c830b109204ac080",
+      "vendored_sha256": "25dff81611423cfec573707e1aa8a1311cbda9094b5004b4c830b109204ac080"
+    },
+    "fatfs_utils/fat.py": {
+      "upstream_sha256": "0f91388eccd11e9bdb77dde6dc8887285cbcc871f69e23fdfb206e15fde4304b",
+      "vendored_sha256": "0f91388eccd11e9bdb77dde6dc8887285cbcc871f69e23fdfb206e15fde4304b"
+    },
+    "fatfs_utils/fatfs_parser.py": {
+      "upstream_sha256": "870455f4ca441aeee8f62ad54ab0db2f7a31b3dee6a4d13d852947f2567e18de",
+      "vendored_sha256": "870455f4ca441aeee8f62ad54ab0db2f7a31b3dee6a4d13d852947f2567e18de"
+    },
+    "fatfs_utils/fatfs_state.py": {
+      "upstream_sha256": "d02f615b08d3e8b480c0485a3b27429b356c8dee3a42de0de76b62be6efcf621",
+      "vendored_sha256": "d02f615b08d3e8b480c0485a3b27429b356c8dee3a42de0de76b62be6efcf621"
+    },
+    "fatfs_utils/fs_object.py": {
+      "upstream_sha256": "15cda19b6bc5f970b7e726dfffae8ab793b71fbcd17d9bf8abda6adbe1718f3f",
+      "vendored_sha256": "15cda19b6bc5f970b7e726dfffae8ab793b71fbcd17d9bf8abda6adbe1718f3f"
+    },
+    "fatfs_utils/long_filename_utils.py": {
+      "upstream_sha256": "bfc17dcbfa49402675eaed8760a910ce2adc4c7d7cf259bb1316c24a6f6a60df",
+      "vendored_sha256": "bfc17dcbfa49402675eaed8760a910ce2adc4c7d7cf259bb1316c24a6f6a60df"
+    },
+    "fatfs_utils/utils.py": {
+      "upstream_sha256": "fb9e378f04f9034b8ce1fdd5534fae8dae2dbfb9406ec148ca628d7f91918372",
+      "vendored_sha256": "fb9e378f04f9034b8ce1fdd5534fae8dae2dbfb9406ec148ca628d7f91918372"
+    },
+    "CMakeLists.txt": {
+      "upstream_sha256": "bb7cd308b388a8817f87f326db7779490af2591dff928b197616e94f8b411826",
+      "vendored_sha256": "4e828e6c53523888d6110b1bb382d8f097f68f0f4ca07021f227ad72a1ace73a"
+    },
+    "Kconfig": {
+      "upstream_sha256": "fc3cd3cc2c23329a7932bb7b2dedf46f9ccc04787d207e2fdf2b27a9c87f7e7d",
+      "vendored_sha256": "fc3cd3cc2c23329a7932bb7b2dedf46f9ccc04787d207e2fdf2b27a9c87f7e7d"
+    },
+    "project_include.cmake": {
+      "upstream_sha256": "440aa3d9f3bc4ff2681babd2121247f1ccaa611a3aceb026e045ef3ee4f8facf",
+      "vendored_sha256": "6c5e35110df7c1e990904cce1c582ef93df524425b97cd0eba4d60ad479205cd"
+    },
+    "sbom.yml": {
+      "upstream_sha256": "38c53c93be25a6a5af2c48fcfd9b561f51eab9beb6582b3704fa260c0142c377",
+      "vendored_sha256": "38c53c93be25a6a5af2c48fcfd9b561f51eab9beb6582b3704fa260c0142c377"
+    },
+    "fatfsgen.py": {
+      "upstream_sha256": "48010b7a0d627f7b54ef4e5f40d37983f24947fee16fa32f6fccb7e50d883d44",
+      "vendored_sha256": "48010b7a0d627f7b54ef4e5f40d37983f24947fee16fa32f6fccb7e50d883d44"
+    },
+    "wl_fatfsgen.py": {
+      "upstream_sha256": "8fecdcbf2e1e8bcddb3216cf1b6823ffe8d77cdce99af7c9f6e1f027d62d5fdb",
+      "vendored_sha256": "8fecdcbf2e1e8bcddb3216cf1b6823ffe8d77cdce99af7c9f6e1f027d62d5fdb"
+    },
+    "fatfsparse.py": {
+      "upstream_sha256": "172b01de483ed028fd7ce6c6ab617abc8e13349b1b65b1157c418cdfdef7f6e0",
+      "vendored_sha256": "172b01de483ed028fd7ce6c6ab617abc8e13349b1b65b1157c418cdfdef7f6e0"
+    },
+    "vfs/vfs_fat_lifecycle.c": {
+      "upstream_sha256": null,
+      "origin": "Aether01 project-authored lifecycle guard",
+      "vendored_sha256": "41e5ea57782bdfb20031add01421765a9bcc1e24415e157254c8d1c933df6f26"
+    },
+    "vfs/esp_vfs_fat_lifecycle.h": {
+      "upstream_sha256": null,
+      "origin": "Aether01 project-authored lifecycle guard",
+      "vendored_sha256": "f97e3e4df519cfe45f296f22d7a24d335ff05dbdbba5e3d33bec99e04999e0f3"
+    }
+  }
+}

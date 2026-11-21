@@ -1,0 +1,42 @@
+#pragma once
+#include "lvgl.h"
+#include "app_io.h"
+#include "app_frames.h"
+#include <stdarg.h>
+typedef struct app_ui app_ui_t;
+struct app_ui {
+    void *power;
+    aether_storage_handle_t storage;
+    app_io_handle_t io;
+    aether_video_player_handle_t video_player;
+    aether_nes_handle_t nes;
+    lv_indev_t *touch_indev;
+    lv_obj_t *screen, *content, *app_obj[12];
+    char app_path[192];
+    uint32_t app_value;
+    lv_timer_t *timer;
+    void (*page_cleanup)(app_ui_t *);
+    void *page_context;
+    uint32_t page_generation;
+    void (*io_complete)(app_ui_t *, const app_io_result_t *);
+    app_frames_handle_t frames;
+    bool touch_restore_pending, media_active, media_started;
+};
+const lv_font_t *app_ui_chinese_font(void);
+const lv_font_t *app_ui_chinese_font_size(unsigned);
+lv_obj_t *app_ui_begin_page(app_ui_t *, const char *);
+lv_obj_t *app_ui_add_text(lv_obj_t *, const char *, lv_align_t, int32_t, int32_t, uint32_t, const lv_font_t *);
+void app_ui_label_text(lv_obj_t *, const char *);
+void app_ui_label_fmt(lv_obj_t *, const char *, ...) __attribute__((format(printf, 2, 3)));
+void app_ui_set_timer(app_ui_t *, lv_timer_cb_t, uint32_t);
+void app_ui_request_io_ex(app_ui_t *, const app_io_request_t *, void (*)(app_ui_t *, const app_io_result_t *));
+void app_ui_show_home(app_ui_t *);
+void app_open_video_path(app_ui_t *, const char *);
+void app_open_nes_path(app_ui_t *, const char *);
+void app_open_video(app_ui_t *);
+void app_open_nes(app_ui_t *);
+size_t strlcpy(char *, const char *, size_t);
+
+bool app_power_is_sleeping(const void *);
+
+void app_ui_set_user_key_exit(app_ui_t *ui,bool armed);

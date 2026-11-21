@@ -1,0 +1,136 @@
+{
+  "generator": "builtin image_gen.imagegen",
+  "transparent_background": true,
+  "icon_pixels": 48,
+  "originals_preserved": true,
+  "icons": [
+    {
+      "id": "music",
+      "prompt": "Use case: stylized-concept. Asset type: one production launcher icon for a 480px AMOLED handheld, transparent PNG. Subject: a single vivid coral-orange musical eighth-note, with two tiny subtle equalizer bars behind its lower right. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated glyph filling 76% of square, orthographic frontal view, comfortable equal padding on all sides. Lighting: soft upper-left studio light, no cast shadow outside the object. Palette: coral orange #FF926C, warm ivory accent. Constraints: genuinely transparent background; NO tile, NO rounded-square backdrop, NO text, NO letters, NO watermark, NO mockup, NO other icons. Crisp professional app icon asset.",
+      "original": "originals/music.png",
+      "runtime": "icon_music.c",
+      "original_sha256": "f3b36ca7dcd49460c171fb9f40cdf67c1b451b34e803d3923077e5c2c49070bb",
+      "runtime_sha256": "0792a07c7d76df98bd5f7930022063659ca2f51e6ec51064226cfd2024e0c255"
+    },
+    {
+      "id": "status",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: a sapphire-blue rounded microchip, four short pins on each side, small luminous cyan heart-shaped status pulse in its center. Palette sapphire blue #74A7FF, ice-blue highlight.",
+      "original": "originals/status.png",
+      "runtime": "icon_status.c",
+      "original_sha256": "09f31b22194d9c448ded840b93808c9ce4ca11fa9c992f1bf3ba5776607973c8",
+      "runtime_sha256": "3865650dc0423eebbe828f9feffab3caaa57c701dd699090b8dff2b28b173fba"
+    },
+    {
+      "id": "clock",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: a lavender circular alarm clock without numbers, creamy white clock face, two bold dark violet hands pointing near ten past ten, small lavender top bell shapes. Palette lavender #B9A3FF and ivory.",
+      "original": "originals/clock.png",
+      "runtime": "icon_clock.c",
+      "original_sha256": "29a026bd2c041ddad75d041b7e1fdefbe0bf2dd7fb1b792008f479ee9fec9fa3",
+      "runtime_sha256": "ca6a12945df428af9fc5893bb5b30fb5d628e11e12e1b4fec7b072233162a35d"
+    },
+    {
+      "id": "motion",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: two lively coral-pink small rounded footsteps angled forward together, with one elegant curved motion swoosh. Palette pink #FF81B3, pale pink highlights. Simple and unmistakable movement icon.",
+      "original": "originals/motion.png",
+      "runtime": "icon_motion.c",
+      "original_sha256": "7027c4c206ca49c43b19feb1bf531f3ca78084fde0fc692844085bcd38d7f859",
+      "runtime_sha256": "76ed18ff1c0beba7a21464aede2eca2cda9b810701068896473c762d82a6b284"
+    },
+    {
+      "id": "compass",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: a mint-turquoise circular compass with a single bold coral north needle and ivory south needle inside a thick softly rounded teal bezel, NO cardinal letters. Palette teal #62D7C4, coral #FF8A81, ivory.",
+      "original": "originals/compass.png",
+      "runtime": "icon_compass.c",
+      "original_sha256": "3bdd7c97cba53fc53b8c5f794b604652ad9fb62ad0b5df739535810a1d9ba36c",
+      "runtime_sha256": "26526f0390240aff445d056e324a27ea7cb0b07c3151ff9c29995c972271e6b0"
+    },
+    {
+      "id": "barometer",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: two simple icy-blue mountain peaks with white snowy tops, with a compact cyan rounded semicircular pressure gauge rising behind the right peak, no numbers. Palette sky blue #79CAFF, ivory, turquoise.",
+      "original": "originals/barometer.png",
+      "runtime": "icon_barometer.c",
+      "original_sha256": "3020e61ed591c7756cbf4b9f64b0e18aa76adf57a115d9c283f70c1126c85de4",
+      "runtime_sha256": "fb323acde6fbb5be54bd1446524eed9f82b735bed1c813302dc64a1759fcf730"
+    },
+    {
+      "id": "video",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: a softly rounded purple glass play-button triangle in a lilac circular rim, small film-strip perforations along one short purple tab behind it. Palette orchid #D39BFF, bright lavender, ivory.",
+      "original": "originals/video.png",
+      "runtime": "icon_video.c",
+      "original_sha256": "72f2f9731f7bb78b3c66fa154f5d474afb6989486a059ef17b777c58f5d33804",
+      "runtime_sha256": "ed24516b0a85c5c616967afff780587182951974b0dd72a956aad4e7486e2cfe"
+    },
+    {
+      "id": "reader",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: an open book with emerald-green rounded cover, warm ivory gently curved pages and a small coral bookmark, pages completely blank. Palette emerald #63D8AC, ivory #FFF4DC, coral.",
+      "original": "originals/reader.png",
+      "runtime": "icon_reader.c",
+      "original_sha256": "ed75b34b6bca80ad55b5f1a29da841b1062facd71a38cbde05c242bbb72dd93f",
+      "runtime_sha256": "1bb658e9a04b748be801ef58f753dbbe855cb8291fedbb3170b94bf046e16c6b"
+    },
+    {
+      "id": "files",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: one sky-blue softly rounded open file folder, a single ivory sheet peeking from it, one understated pale blue corner tab. Palette periwinkle sky blue #8CB7FF, ivory.",
+      "original": "originals/files.png",
+      "runtime": "icon_files.c",
+      "original_sha256": "1123ff1d565868edbd2d063a41637a5893411a9af22d6a53570dd8602bd72ff8",
+      "runtime_sha256": "c0d40c628325d5b40ccf91756c2a3c9d4f6024aff366629fe1f54634b1a18a18"
+    },
+    {
+      "id": "game",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: four chunky rounded puzzle tiles in a compact playful cluster, a coral tile, butter-yellow tile, lilac tile and mint tile, bold simple silhouettes, no lettering. Palette coral #FF8B97, butter yellow #FFD783, lilac, mint.",
+      "original": "originals/game.png",
+      "runtime": "icon_game.c",
+      "original_sha256": "89942ba0ea98578ab294106141819a55b5b6668e49eed3a49cf6c849232ba031",
+      "runtime_sha256": "bd2ceac73f0614b5add3cfa4b8990448a24d72fe7fe0c2884121f9ea779c4e54"
+    },
+    {
+      "id": "nes",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: one small classic retro videogame controller, pill-like light lavender body, a bold dark violet plus-shaped D-pad left, two coral round buttons right, tiny two lavender bars center, no brand or lettering. Palette periwinkle #B7A7EF, coral #FF8794, dark purple.",
+      "original": "originals/nes.png",
+      "runtime": "icon_nes.c",
+      "original_sha256": "b3010fc53846fc2a75e4e1ec829671d1edddcc8f87dce193961d4634a737afa6",
+      "runtime_sha256": "548418aa8d798c2a9e2eb2f1540cbbc2f419abce189766ce4a0c3b26c87a9b0a"
+    },
+    {
+      "id": "settings",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: one thick soft blue-gray rounded eight-tooth mechanical gear, circular hollow center with a small luminous pale-cyan center ring. Palette slate lavender #A1AECF, pale cyan #AAF0EF, ivory.",
+      "original": "originals/settings.png",
+      "runtime": "icon_settings.c",
+      "original_sha256": "e2c92465fcc43e2bf8a0e2b57259bc2d8c3b424999cc82dbf123b1cab3d577ee",
+      "runtime_sha256": "76cba745db733c39cef4141272a2b2e4538fb9ab40852b6450fe8496ecd7cacf"
+    },
+    {
+      "id": "wifi",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: the universal Wi-Fi symbol made from three thick softly rounded cyan curved arcs over one matching round dot, each disconnected, frontal symmetric clean design. Palette vivid sky cyan #6AD7FF, icy highlights.",
+      "original": "originals/wifi.png",
+      "runtime": "icon_wifi.c",
+      "original_sha256": "26dbcbc09f6af2cba2fc23ce946506fb80dd9d8dec1f555ab11351422a41c941",
+      "runtime_sha256": "7fea8095b1b50012f5b92f7c458b38461e7567069f5b2d28f4564555566f7128"
+    },
+    {
+      "id": "bluetooth",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: the recognizable Bluetooth rune made from a single thick rounded periwinkle blue glass stroke, vertical stem and two triangular loops to its right with diagonal crossing strokes, one isolated symbol. Palette periwinkle #91B6FF, icy blue highlights.",
+      "original": "originals/bluetooth.png",
+      "runtime": "icon_bluetooth.c",
+      "original_sha256": "e5b7d1efc8cc05b66e1726dce21a31d38798e27071722f1fa558290a1031a842",
+      "runtime_sha256": "720cc18101ec61bb15977a26258ec914d28c46ca2b5e10070c44d9c19d39100c"
+    },
+    {
+      "id": "headphones",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: one compact over-ear headphone headset with a mint soft curved headband and two lavender rounded ear cushions, no wires or microphone. Palette mint #81E2C8, lavender #B7AEED, ivory highlights.",
+      "original": "originals/headphones.png",
+      "runtime": "icon_headphones.c",
+      "original_sha256": "05ac6a893f91c130558a45a551799bb682175fa58eaf19c1419479dc39aaa860",
+      "runtime_sha256": "c13c8e9ce368018ef0d550ed037a942c4910009dd1305cbd1754381eeebcda55"
+    },
+    {
+      "id": "network",
+      "prompt": "Use case: stylized-concept. Asset type: ONE production launcher icon, transparent PNG for a 480px AMOLED handheld. Style: refined friendly soft 3D clay-glass UI glyph, polished edge highlights, restrained depth, clean bold silhouette legible at 48 pixels. Composition: centered isolated object filling 76% of square, frontal orthographic view, generous equal padding. Lighting: soft upper-left studio light, no cast shadow beyond object. Constraints: actual transparent background; NO square tile or backdrop, NO text, NO letters or numbers, NO watermark, NO other icons, NO mockup. Crisp professional coordinated icon family. Subject: one softly rounded sky blue miniature globe, with three bold ivory longitude/latitude grid arcs across its face, a small mint connection dot at lower right. Palette sky blue #86C9FF, ivory, mint.",
+      "original": "originals/network.png",
+      "runtime": "icon_network.c",
+      "original_sha256": "1e9b4d51d50148ae4c494f89f810473448774bb034fea83750953aaf967955fb",
+      "runtime_sha256": "27b20d779b603bfb97f661aafcc7d5f741780fa53f138c6a974f89a4b6c41bd3"
+    }
+  ]
+}
