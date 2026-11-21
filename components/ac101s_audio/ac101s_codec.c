@@ -127,9 +127,12 @@ esp_err_t ac101s_codec_start(i2c_master_dev_handle_t dev, bool capture_only, flo
 
 esp_err_t ac101s_codec_set_speaker(i2c_master_dev_handle_t dev, unsigned level)
 {
-    if (level > 70) return ESP_ERR_INVALID_ARG;
-    /* The highest two board levels use one extra 3 dB step (-12 dB). */
-    const uint8_t gain = level >= 69 ? 11U : (uint8_t)((level * 15U) / 100U);
+    enum { MAX_LEVEL = 70, QUIETEST_CODE = 15, MAX_SPEAKER_CODE = 5 };
+    if (level > MAX_LEVEL) return ESP_ERR_INVALID_ARG;
+    /* Higher line-output codes attenuate the speaker more on this board.
+     * Use the former 50% setting (code 5) as the speaker ceiling. */
+    const unsigned steps = level * (QUIETEST_CODE - MAX_SPEAKER_CODE) / MAX_LEVEL;
+    const uint8_t gain = (uint8_t)(QUIETEST_CODE - steps);
     const setting_t settings[] = {
         {REG_LINEOUT, LINEOUT_GAIN_MASK, gain},
         {REG_DAC_ANA, LINEOUT_MUTE, level ? 0 : LINEOUT_MUTE},

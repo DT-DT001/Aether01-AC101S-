@@ -69,9 +69,9 @@ int main(void)
     for (unsigned i = 0; i < 100; ++i) {
         assert(ac101s_codec_start(dev, false, 42) == ESP_OK);
         assert(registers[6] == 0x35 && registers[7] == 0x17 && registers[0x20] == 0xf9);
-        assert((registers[0x25] & 0x64) == 0x64 && registers[0x26] == 0x20 + (i ? 11 : 0));
+        assert((registers[0x25] & 0x64) == 0x64 && registers[0x26] == 0x20 + (i ? 5 : 0));
         assert(ac101s_codec_set_speaker(dev, 71) == ESP_ERR_INVALID_ARG);
-        assert(ac101s_codec_set_speaker(dev, 70) == ESP_OK && registers[0x26] == 0x2b);
+        assert(ac101s_codec_set_speaker(dev, 70) == ESP_OK && registers[0x26] == 0x25);
         assert(!(registers[0x25] & 4));
         assert(ac101s_codec_stop(dev) == ESP_OK);
         assert(!registers[6] && !registers[7] && !(registers[2] & 4));
@@ -81,8 +81,18 @@ int main(void)
         assert(ac101s_codec_stop(dev) == ESP_OK);
     }
     assert(ac101s_codec_start(dev, false, 24) == ESP_OK);
-    assert(ac101s_codec_set_speaker(dev, 68) == ESP_OK && registers[0x26] == 0x2a);
-    assert(ac101s_codec_set_speaker(dev, 69) == ESP_OK && registers[0x26] == 0x2b);
+    unsigned previous = 15;
+    for (unsigned level = 0; level <= 70; ++level) {
+        assert(ac101s_codec_set_speaker(dev, level) == ESP_OK);
+        const unsigned gain = registers[0x26] & 0x0f;
+        assert(gain >= 5 && gain <= previous && previous - gain <= 1);
+        assert((registers[0x26] & 0xf0) == 0x20);
+        assert(((registers[0x25] & 4) != 0) == (level == 0));
+        if (level == 0) assert(gain == 15);
+        if (level == 35) assert(gain == 10);
+        if (level == 70) assert(gain == 5);
+        previous = gain;
+    }
     assert(ac101s_codec_set_speaker(dev, 0) == ESP_OK && (registers[0x25] & 4));
     assert(ac101s_codec_set_speaker(dev, 70) == ESP_OK && !(registers[0x25] & 4));
     assert(ac101s_codec_set_speaker(dev, 0) == ESP_OK && (registers[0x25] & 4));
