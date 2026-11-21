@@ -5,8 +5,8 @@ UI suite has populated its real LVGL and font object cache. The test recompiles
 the production `main/ui/app_home.c`, the 15 icon assets enabled in the firmware (the retained compass icon is excluded), and the two
 additional Montserrat heading sizes. Hardware state is mocked.
 
-Checks cover 14 real routes and the absence of the removed compass entry, four-column geometry, scrolling to the last
-row, thirteen 48px image descriptors and the recorder's vector microphone,
+Checks cover 19 real routes and the absence of the removed compass entry, four-column geometry, scrolling to the last
+row, the 48px image descriptors, recorder vector microphone and GPS vector target,
 RTC/TF/audio state changes and cleanup. Actual
 RGB565 frames are exported as `build/host_home_ui/home-top.png` and
 `home-bottom.png`. This does not certify device refresh rate or radio operation.

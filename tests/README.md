@@ -35,6 +35,8 @@ Neither suite replaces native FPS, radio memory admission or physical UI tests.
 No dependencies are installed. Build products, generated media and test saves use `build/host_*` or automatically cleaned temporary directories. Tests compile production source; stubs replace the SDK, hardware and OS interfaces needed for deterministic fault injection.
 
 | Suite | Coverage |
+| [gnss_nmea](gnss_nmea/) | Production streaming NMEA checksum/coordinate/date validation, fresh no-fix veto, expiry, multi-page/signal GSV, trailing empty slots and bounded malformed/noise input; ASan/UBSan |
+| [gps_service](gps_service/README.md) | Production GPS worker: verified-power sequencing, RX39/TX40 safety, PPS, cancellation, partial failures, cleanup retention and no automatic fault restart; real parser with mocked hardware/RTOS and ASan/UBSan |
 |---|---|
 | frames | Copy ownership, latest frame, front protection, contention, five allocation rollback points, mutable-image cache invalidation and 10,000 handover/metric cycles |
 | display_metrics | Production completion counting and sequence-based DMA ownership; pthread late ISR/stale semaphore races, timeout retention, fixed aligned internal mirror allocation/error/geometry/source checks; no physical scanout measurement |

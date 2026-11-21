@@ -52,6 +52,7 @@ APP(motion,12) APP(barometer,13) APP(recorder,14)
 APP(pc_remote,15) APP(obs_switcher,16)
 APP(displacement,17)
 APP(intercom,18)
+APP(gps,19)
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p)
 {const uint16_t *s=(const uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*s++;}lv_display_flush_ready(d);}
 static void read_input(lv_indev_t *in,lv_indev_data_t *data)
@@ -75,9 +76,9 @@ int main(int argc,char **argv)
     lv_indev_set_display(input,display);lv_indev_set_read_cb(input,read_input);
     lv_display_set_flush_cb(display,flush);app_ui_t ui={.storage=(void*)1};
     app_ui_show_home(&ui);lv_obj_update_layout(ui.screen);
-    assert(app_home_app_count()==18&&lv_obj_get_child_count(ui.content)==18);
+    assert(app_home_app_count()==19&&lv_obj_get_child_count(ui.content)==19);
     assert(!find(ui.screen,"指南针"));
-    for(unsigned i=0;i<app_home_app_count();++i){lv_obj_t *tile=lv_obj_get_child(ui.content,i);assert(lv_obj_get_width(tile)==100);lv_obj_t *icon=lv_obj_get_child(tile,0);if(i!=13){const lv_image_dsc_t *src=lv_image_get_src(icon);assert(src&&src->header.w==48&&src->header.h==48);}else{assert(lv_obj_get_width(icon)==48&&lv_obj_get_height(icon)==48);assert(lv_obj_get_child_count(icon)==3);}lv_obj_send_event(tile,LV_EVENT_CLICKED,NULL);assert(opened==i+1);}
+    for(unsigned i=0;i<app_home_app_count();++i){lv_obj_t *tile=lv_obj_get_child(ui.content,i);assert(lv_obj_get_width(tile)==100);lv_obj_t *icon=lv_obj_get_child(tile,0);if(i!=13&&i!=18){const lv_image_dsc_t *src=lv_image_get_src(icon);assert(src&&src->header.w==48&&src->header.h==48);}else{assert(lv_obj_get_width(icon)==48&&lv_obj_get_height(icon)==48);assert(lv_obj_get_child_count(icon)==(i==13?3:6));}lv_obj_send_event(tile,LV_EVENT_CLICKED,NULL);assert(opened==i+1);}
     assert(!strcmp(lv_label_get_text(ui.home_time),"10:24"));
     lv_obj_t *battery=find(ui.screen,"80%");assert(battery);
     lv_area_t badge,tf,audio_area;lv_obj_get_coords(lv_obj_get_parent(battery),&badge);
@@ -90,6 +91,10 @@ int main(int argc,char **argv)
     lv_area_t area;lv_obj_get_coords(microphone,&area);
     point=(lv_point_t){.x=(area.x1+area.x2)/2,.y=area.y1+12};opened=0;
     held=true;advance(80);held=false;advance(80);assert(opened==14);
+    lv_obj_t *gps=lv_obj_get_child(lv_obj_get_child(ui.content,18),0);
+    lv_obj_get_coords(gps,&area);
+    point=(lv_point_t){.x=(area.x1+area.x2)/2,.y=(area.y1+area.y2)/2};opened=0;
+    held=true;advance(80);held=false;advance(80);assert(opened==19);
     audio.master_volume=0;storage.mounted=false;storage.card_inserted=false;telemetry.rtc_error=ESP_FAIL;
     update_callback(ui.timer);
     assert(!strcmp(lv_label_get_text(ui.home_audio),"已静音"));
@@ -98,5 +103,5 @@ int main(int argc,char **argv)
     tools.battery.percentage=12;advance(1100);assert(find(ui.screen,"12%"));
     tools.battery_error=ESP_FAIL;advance(1100);assert(find(ui.screen,"--%")&&!find(ui.screen,"12%"));
     lv_timer_delete(ui.timer);lv_obj_delete(ui.screen);lv_indev_delete(input);lv_display_delete(display);lv_deinit();
-    puts("PASS production home: 18 routes including intercom, four columns, scrolling, RTC/TF/audio state and cleanup");
+    puts("PASS production home: 19 routes including GPS, four columns, scrolling, RTC/TF/audio state and cleanup");
 }

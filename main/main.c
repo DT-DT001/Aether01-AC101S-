@@ -7,6 +7,10 @@
 #include "aether_usb_msc.h"
 #include "app_power.h"
 #include "app_otg.h"
+#include "app_gps.h"
+#ifdef AETHER_GPS_DIAGNOSTIC
+#include "app_gps_diagnostic.h"
+#endif
 #include "aether_usb_audio.h"
 #include "app_usb_input.h"
 #include "app_telemetry.h"
@@ -159,6 +163,7 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
     aether_bluetooth_handle_t bluetooth=s_bluetooth;
     if(stage==APP_POWER_SHUTDOWN_BEGIN) {
         *state=(shutdown_context_t){.active=true};
+        app_gps_cancel();
         /* Stop source admission promptly; cleanup shares the existing budget. */
         (void)app_otg_set_enabled(false);
         app_pc_remote_leave();
@@ -184,7 +189,9 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
         return ui_error;
     }
     if(stage==APP_POWER_SHUTDOWN_FINALIZE) {
-        esp_err_t error=app_otg_disable_wait(shutdown_remaining(deadline));
+        esp_err_t error=app_gps_stop_wait(shutdown_remaining(deadline));
+        if(error!=ESP_OK) return error;
+        error=app_otg_disable_wait(shutdown_remaining(deadline));
         if(error!=ESP_OK) return error;
         error=app_ui_quiesce_storage_wait(s_ui,shutdown_remaining(deadline));
         if(error!=ESP_OK) return error;
@@ -477,6 +484,8 @@ void app_main(void)
     app_nes_controls_set_persistence_guard(media_flash_busy, NULL);
     const esp_err_t otg_error = app_otg_init(&s_board, s_nes, &s_power);
     if (otg_error != ESP_OK) ESP_LOGW(TAG, "USB host unavailable: %s", esp_err_to_name(otg_error));
+    const esp_err_t gps_error = app_gps_init(&s_power);
+    if (gps_error != ESP_OK) ESP_LOGW(TAG, "GPS unavailable: %s", esp_err_to_name(gps_error));
     if (s_nes) ESP_ERROR_CHECK(aether_nes_set_input_gate(s_nes, nes_input_gate, &s_power));
     if (s_board.touch_ready) {
         touch_indev = app_touch_add(display, s_board.touch, &s_power);
@@ -499,6 +508,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Aether01 UI ready: %u apps, TF hot-plug, screen idle power management",
              (unsigned)app_home_app_count());
+#ifdef AETHER_GPS_DIAGNOSTIC
+    ESP_LOGI(TAG, "GPS one-shot input-only probe: %s", esp_err_to_name(app_gps_diagnostic_start()));
+#endif
 #ifdef AETHER_VIDEO_AUTOPROBE
     void (*probe_followup)(void *) = NULL;
 #ifdef AETHER_RADIO_SELFTEST

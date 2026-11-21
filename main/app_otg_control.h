@@ -21,6 +21,8 @@ typedef struct {
     uint16_t vbus_raw; /* 14-bit ADC units; meaningful with valid and C0.bit2. */
     uint16_t ts_mv;
     uint8_t cc_raw;
+    uint8_t cc_detection_raw; /* REG0B from the same power snapshot. */
+    uint8_t cc_mode_raw; /* REGE3 from the same power snapshot. */
     uint8_t control_raw;
     uint8_t rbfet_control_raw; /* REG13, preserved alongside the same power snapshot. */
     uint8_t adc_enable_raw; /* REG C0, not a voltage-valid flag. */
@@ -36,6 +38,31 @@ typedef struct {
 /* Nonblocking GUI commands and cached status only. */
 esp_err_t app_otg_set_enabled(bool enabled);
 esp_err_t app_otg_set_manual_enabled(bool enabled);
+/* One accessory lease. Acquire from OFF starts a manual session; acquire on an
+ * existing user manual session borrows it. AUTO/teardown are not taken over.
+ * Commands are nonblocking; ESP_ERR_NOT_FINISHED means retry after contention.
+ * A valid lease is admission only, NOT proof that output_verified is true.
+ * User OFF, shutdown and faults invalidate the token. A stale release never
+ * affects a newer session; releasing a borrowed session leaves user power ON. */
+esp_err_t app_otg_manual_lease_acquire(uint32_t *token);
+esp_err_t app_otg_manual_lease_release(uint32_t token);
+bool app_otg_manual_lease_valid(uint32_t token);
+typedef struct {
+    bool valid;
+    bool present;
+    bool voltage_valid;
+    uint16_t voltage_mv;
+} app_otg_input_status_t;
+/* Worker-only external-input measurement lease; never starts Host or changes
+ * the mux/CC/BOOST/TS/charger. NOT_FOUND alone permits trying manual source
+ * admission. A failed acquire may return a nonzero cleanup token: retain and
+ * release it. All other errors must not fall back to source power. Read is
+ * fresh I2C, not a voltage-ready proof; wait for settled consecutive samples.
+ * User source OFF leaves this input lease intact. Failed release retains its
+ * token; only a successful release permits another source/input session. */
+esp_err_t app_otg_external_input_acquire(uint32_t *token);
+esp_err_t app_otg_external_input_read(uint32_t token, app_otg_input_status_t *status);
+esp_err_t app_otg_external_input_release(uint32_t token);
 esp_err_t app_otg_get_status(aether_usb_host_status_t *status);
 /* Cache only: no I2C/ADC/USB operations. Live snapshots expire after 2000ms;
  * historical failures remain readable with failure_snapshot=true and age_ms. */

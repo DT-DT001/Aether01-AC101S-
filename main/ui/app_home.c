@@ -31,6 +31,7 @@ static const home_app_t apps[] = {
     {&icon_video, "OBS 切换", 0xD7B3FF, app_open_obs_switcher},
     {&icon_motion, "位移测量", 0x97DFCE, app_open_displacement},
     {&icon_network, "无线对讲", 0x8FDBEC, app_open_intercom},
+    {NULL, "定位", 0x69E4AD, app_open_gps},
 };
 
 size_t app_home_app_count(void) { return sizeof(apps) / sizeof(apps[0]); }
@@ -105,6 +106,41 @@ static lv_obj_t *microphone_icon(lv_obj_t *parent)
     return icon;
 }
 
+static lv_obj_t *gps_icon(lv_obj_t *parent)
+{
+    lv_obj_t *icon = lv_obj_create(parent);
+    lv_obj_remove_style_all(icon);
+    lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(icon, 48, 48);
+    lv_obj_t *ring = lv_obj_create(icon);
+    lv_obj_remove_style_all(ring);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(ring, 8, 8); lv_obj_set_size(ring, 32, 32);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(ring, 3, 0);
+    lv_obj_set_style_border_color(ring, lv_color_hex(0x69E4AD), 0);
+    lv_obj_t *center = lv_obj_create(icon);
+    lv_obj_remove_style_all(center);
+    lv_obj_remove_flag(center, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(center, 19, 19); lv_obj_set_size(center, 10, 10);
+    lv_obj_set_style_radius(center, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(center, lv_color_hex(0xB6FCE0), 0);
+    lv_obj_set_style_bg_opa(center, LV_OPA_COVER, 0);
+    static const lv_point_precise_t ticks[4][2] = {
+        {{24, 2}, {24, 12}}, {{24, 36}, {24, 46}},
+        {{2, 24}, {12, 24}}, {{36, 24}, {46, 24}},
+    };
+    for (unsigned i = 0; i < 4; ++i) {
+        lv_obj_t *line = lv_line_create(icon);
+        lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_line_set_points(line, ticks[i], 2);
+        lv_obj_set_style_line_width(line, 3, 0);
+        lv_obj_set_style_line_color(line, lv_color_hex(0x69E4AD), 0);
+        lv_obj_set_style_line_rounded(line, true, 0);
+    }
+    return icon;
+}
+
 void app_ui_show_home(app_ui_t *ui)
 {
     lv_obj_t *screen = app_ui_new_screen(ui);
@@ -154,7 +190,7 @@ void app_ui_show_home(app_ui_t *ui)
         if (apps[i].icon) {
             icon = lv_image_create(tile);
             lv_image_set_src(icon, apps[i].icon);
-        } else icon = microphone_icon(tile);
+        } else icon = apps[i].open == app_open_gps ? gps_icon(tile) : microphone_icon(tile);
         lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 10);
         lv_obj_t *name = app_ui_add_text(tile, apps[i].name, LV_ALIGN_BOTTOM_MID,
                                         0, -17, 0xE2EBFA, app_ui_chinese_font());

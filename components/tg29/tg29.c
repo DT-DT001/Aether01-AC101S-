@@ -72,6 +72,10 @@ struct tg29_dev_t {
     bool ts_bias_owned;
     uint8_t ts_idle_nibble;
     bool vbus_adc_owned;
+    atomic_uint input_token; /* Independent retained external ADC owner. */
+    uint32_t input_sequence;
+    bool input_adc_owned;
+    atomic_bool input_probe_active; /* Bringup probe also releases the mutex. */
 };
 
 typedef struct {
@@ -205,6 +209,8 @@ esp_err_t tg29_new(i2c_master_bus_handle_t bus, tg29_handle_t *out_handle)
     atomic_init(&handle->source_epoch, 0);
     atomic_init(&handle->manual_start_active, false);
     atomic_init(&handle->authorized_epoch, 0);
+    atomic_init(&handle->input_token, 0);
+    atomic_init(&handle->input_probe_active, false);
     handle->mutex = xSemaphoreCreateRecursiveMutex();
     if (!handle->mutex) {
         free(handle);
@@ -604,7 +610,8 @@ esp_err_t tg29_set_otg_fixed_ts_10k_policy(tg29_handle_t h, bool enabled)
     if (xSemaphoreTakeRecursive(h->mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
     esp_err_t err = ESP_OK;
-    if (atomic_load(&h->source_allowed) || h->ts_bias_owned || h->vbus_adc_owned)
+    if (atomic_load(&h->source_allowed) || h->ts_bias_owned || h->vbus_adc_owned ||
+        atomic_load(&h->input_token))
         err = ESP_ERR_INVALID_STATE;
     else h->fixed_ts_10k = enabled;
     xSemaphoreGiveRecursive(h->mutex);
@@ -690,14 +697,17 @@ static esp_err_t boost_off_locked(tg29_handle_t h)
 
 static bool otg_cc_state_ready(bool manual, uint8_t cc)
 {
-    return cc == TG29_CC_ATTACH_SRC ||
-           (manual && (cc == TG29_CC_UNATTACH_SNK || cc == TG29_CC_UNATTACH_SRC));
+    /* A disabled CC FSM can retain any historical E7 state. In explicit
+     * manual mode its state is diagnostic only; detector/port OFF, software
+     * permission and independent physical power checks remain mandatory. */
+    return manual || cc == TG29_CC_ATTACH_SRC;
 }
 
 static bool otg_cc_role_ready(bool manual, uint8_t detect, uint8_t mode, uint8_t cc)
 {
+    if (manual) return !(detect & 0x08U) && mode == TG29_CC_DISABLED;
     return (detect & 0x08U) && (mode == TG29_CC_SOURCE || mode == TG29_CC_DRP) &&
-           otg_cc_state_ready(manual, cc);
+           otg_cc_state_ready(false, cc);
 }
 
 /* A failure probe must never delay a newly requested OFF with more I2C.
@@ -714,8 +724,10 @@ static esp_err_t probe_read_locked(tg29_handle_t h, uint8_t reg, uint8_t *value,
     if ((reg == TG29_REG_CC_STATUS && !otg_cc_state_ready(h->manual_otg, *value & 15U)) ||
         (reg == TG29_REG_MODULE_ENABLE_2 && !(*value & TG29_BOOST_ENABLE_BIT)) ||
         (reg == TG29_REG_RBFET_CONTROL && !(*value & 0x01U)) ||
-        (reg == TG29_REG_GAUGE_CONTROL && !(*value & 0x08U)) ||
-        (reg == TG29_REG_CC_MODE && (*value & 3U) != TG29_CC_SOURCE && (*value & 3U) != TG29_CC_DRP))
+        (reg == TG29_REG_GAUGE_CONTROL &&
+            (h->manual_otg ? (*value & 0x08U) != 0 : !(*value & 0x08U))) ||
+        (reg == TG29_REG_CC_MODE && (h->manual_otg ? (*value & 3U) != TG29_CC_DISABLED :
+            ((*value & 3U) != TG29_CC_SOURCE && (*value & 3U) != TG29_CC_DRP))))
         return ESP_ERR_INVALID_STATE;
     return ESP_OK;
 }
@@ -735,6 +747,7 @@ static esp_err_t read_usb_power_locked(tg29_handle_t h, tg29_usb_power_state_t *
     const tg29_cc_state_t cc = (tg29_cc_state_t)(values[1] & 15U);
     *state = (tg29_usb_power_state_t){
         .snapshot_valid = true, .cc_mode = mode, .cc_state = cc, .cc_raw = values[1],
+        .cc_detection_raw = values[5], .cc_mode_raw = values[0],
         .cc_detection_enabled = (values[5] & 0x08U) != 0,
         .source_allowed = source_permission_current(h),
         .attached_as_source = (values[5] & 0x08U) && cc == TG29_CC_ATTACH_SRC &&
@@ -777,35 +790,143 @@ esp_err_t tg29_get_usb_power_state(tg29_handle_t h, tg29_usb_power_state_t *stat
     return err;
 }
 
+static bool external_input_role_safe(const tg29_usb_power_state_t *p)
+{
+    return p->snapshot_valid && !p->source_allowed && !p->boost_enabled && !p->rbfet_enabled &&
+        (p->cc_mode == TG29_CC_SINK || p->cc_mode == TG29_CC_DRP) &&
+        (p->cc_state == TG29_CC_UNATTACH_SNK || p->cc_state == TG29_CC_ATTACHWAIT_SNK ||
+         p->cc_state == TG29_CC_ATTACH_SNK ||
+         (!p->cc_detection_enabled && p->cc_state == TG29_CC_STATE_DISABLED));
+}
+
+static esp_err_t input_release_locked(tg29_handle_t h)
+{
+    esp_err_t err = ESP_OK;
+    if (h->input_adc_owned) {
+        uint8_t adc = 0;
+        err = tg29_read_reg(h, TG29_REG_ADC_ENABLE, &adc);
+        if (err == ESP_OK && (adc & 0x04U))
+            err = tg29_write_checked(h, TG29_REG_ADC_ENABLE, adc & (uint8_t)~0x04U, 0x04U);
+    }
+    if (err == ESP_OK) {
+        h->input_adc_owned = false;
+        atomic_store(&h->input_token, 0);
+    }
+    return err;
+}
+
+esp_err_t tg29_vbus_input_acquire(tg29_handle_t h, uint32_t *token)
+{
+    if (!token) return ESP_ERR_INVALID_ARG;
+    *token = 0;
+    if (!h) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTakeRecursive(h->mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    tg29_usb_power_state_t p = {0};
+    if (atomic_load(&h->input_token) || atomic_load(&h->manual_start_active) ||
+        atomic_load(&h->input_probe_active) || h->vbus_adc_owned || h->ts_bias_owned ||
+        source_permission_current(h)) goto done;
+    err = read_usb_power_locked(h, &p, NULL);
+    if (err != ESP_OK) goto done;
+    /* Absence of input is not permission to output. It only hands admission
+     * to the separate explicit manual policy, which still proves low VBUS.
+     * A disabled/stale CC FSM must not trap a healthy battery-only restart. */
+    if (!p.snapshot_valid || p.source_allowed || p.boost_enabled || p.rbfet_enabled) {
+        err = ESP_ERR_INVALID_STATE; goto done;
+    }
+    if (!p.vbus_good) { err = ESP_ERR_NOT_FOUND; goto done; }
+    if (!external_input_role_safe(&p)) { err = ESP_ERR_INVALID_STATE; goto done; }
+    ++h->input_sequence;
+    if (!h->input_sequence) ++h->input_sequence;
+    atomic_store(&h->input_token, h->input_sequence);
+    *token = h->input_sequence;
+    if (!(p.adc_enable_raw & 0x04U)) {
+        h->input_adc_owned = true; /* A failed ACK may still have changed C0. */
+        err = tg29_write_checked(h, TG29_REG_ADC_ENABLE, p.adc_enable_raw | 0x04U, 0x04U);
+        if (err != ESP_OK && input_release_locked(h) == ESP_OK) *token = 0;
+    }
+done:
+    xSemaphoreGiveRecursive(h->mutex);
+    return err;
+}
+
+esp_err_t tg29_vbus_input_read(tg29_handle_t h, uint32_t token, tg29_usb_power_state_t *state)
+{
+    if (!state) return ESP_ERR_INVALID_ARG;
+    memset(state, 0, sizeof(*state));
+    if (!h || !token) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTakeRecursive(h->mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    tg29_usb_power_state_t p = {0};
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (atomic_load(&h->input_token) == token) {
+        err = read_usb_power_locked(h, &p, NULL);
+        if (err == ESP_OK && (!external_input_role_safe(&p) || !p.vbus_good ||
+                             !(p.adc_enable_raw & 0x04U))) err = ESP_ERR_INVALID_STATE;
+        if (err == ESP_OK) *state = p;
+    }
+    xSemaphoreGiveRecursive(h->mutex);
+    return err;
+}
+
+esp_err_t tg29_vbus_input_release(tg29_handle_t h, uint32_t token)
+{
+    if (!h || !token) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTakeRecursive(h->mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    const esp_err_t err = atomic_load(&h->input_token) == token ?
+                          input_release_locked(h) : ESP_ERR_INVALID_STATE;
+    xSemaphoreGiveRecursive(h->mutex);
+    return err;
+}
+
 static esp_err_t configure_otg_policy(tg29_handle_t h, bool allow_source, bool manual)
 {
     if (!h) return ESP_ERR_INVALID_ARG;
     /* Capture before changing permission: a later GUI OFF must cancel this
      * configuration even while I2C or the PMIC mutex is in flight. */
     const unsigned epoch = atomic_load(&h->source_epoch);
-    if (allow_source && atomic_load(&h->manual_start_active)) return ESP_ERR_INVALID_STATE;
+    if (allow_source && (atomic_load(&h->manual_start_active) || atomic_load(&h->input_token)))
+        return ESP_ERR_INVALID_STATE;
     if (allow_source) atomic_store(&h->source_allowed, false);
     else tg29_revoke_otg_source_permission(h);
     if (xSemaphoreTakeRecursive(h->mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
-    if (allow_source && atomic_load(&h->manual_start_active)) {
+    if (allow_source && (atomic_load(&h->manual_start_active) || atomic_load(&h->input_token))) {
         xSemaphoreGiveRecursive(h->mutex);
         return ESP_ERR_INVALID_STATE;
     }
     uint8_t mode = 0, detect = 0;
     esp_err_t err = tg29_read_reg(h, TG29_REG_GAUGE_CONTROL, &detect);
     if (err == ESP_OK) err = tg29_read_reg(h, TG29_REG_CC_MODE, &mode);
-    const uint8_t setting = allow_source ? 0x13U : 0x11U;
+    const uint8_t setting = allow_source ? (manual ? 0x10U : 0x13U) : 0x11U;
     if (err == ESP_OK && (!allow_source || manual || h->manual_otg ||
                           (mode & 0x3FU) != setting || !(detect & 0x08U)))
         err = boost_off_locked(h);
-    if (err == ESP_OK && !(detect & 0x08U))
-        /* REG0B.bit0 is RWAC; never replay a transient watchdog command. */
-        err = tg29_write_checked(h, TG29_REG_GAUGE_CONTROL,
-                                 (detect & (uint8_t)~0x01U) | 0x08U, 0x08U);
-    if (err == ESP_OK && (mode & 0x3FU) != setting)
-        err = tg29_write_checked(h, TG29_REG_CC_MODE,
-                                 (mode & 0xC0U) | setting, 0x3FU);
+    if (allow_source && manual) {
+        /* Explicit CC-less output owns software policy, not the hardware CC
+         * FSM. Disable both detector and port after checked output OFF; keep
+         * them disabled throughout this session. E7 is diagnostic only. */
+        if (err == ESP_OK && atomic_load(&h->source_epoch) != epoch) err = ESP_ERR_INVALID_STATE;
+        if (err == ESP_OK)
+            err = tg29_write_checked(h, TG29_REG_GAUGE_CONTROL, detect & (uint8_t)~0x09U, 0x08U);
+        if (err == ESP_OK && atomic_load(&h->source_epoch) != epoch) err = ESP_ERR_INVALID_STATE;
+        if (err == ESP_OK)
+            err = tg29_write_checked(h, TG29_REG_CC_MODE, (mode & 0xC0U) | setting, 0x3FU);
+    } else {
+        /* After CC-less output, install SINK/DRP while detection is still OFF,
+         * then enable the detector against its final verified port policy. */
+        if (err == ESP_OK && (mode & 0x3FU) != setting)
+            err = tg29_write_checked(h, TG29_REG_CC_MODE,
+                                     (mode & 0xC0U) | setting, 0x3FU);
+        if (err == ESP_OK && !(detect & 0x08U))
+            /* REG0B.bit0 is RWAC; never replay a transient watchdog command. */
+            err = tg29_write_checked(h, TG29_REG_GAUGE_CONTROL,
+                                     (detect & (uint8_t)~0x01U) | 0x08U, 0x08U);
+    }
+    if (err == ESP_OK && allow_source && atomic_load(&h->source_epoch) != epoch)
+        err = ESP_ERR_INVALID_STATE;
     if (err == ESP_OK && allow_source) {
         h->manual_otg = manual;
         atomic_store(&h->authorized_epoch, epoch);
@@ -901,9 +1022,14 @@ static esp_err_t settle_manual_vbus_locked(tg29_handle_t h, unsigned epoch, bool
 esp_err_t tg29_set_otg_enabled(tg29_handle_t h, bool enabled)
 {
     if (!h) return ESP_ERR_INVALID_ARG;
+    if (enabled && atomic_load(&h->input_token)) return ESP_ERR_INVALID_STATE;
     if (!enabled && atomic_load(&h->manual_start_active)) tg29_revoke_otg_source_permission(h);
     if (xSemaphoreTakeRecursive(h->mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
+    if (enabled && atomic_load(&h->input_token)) {
+        xSemaphoreGiveRecursive(h->mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
     bool locked = true;
     bool starting_manual = false;
     esp_err_t err = ESP_OK;
@@ -925,8 +1051,8 @@ esp_err_t tg29_set_otg_enabled(tg29_handle_t h, bool enabled)
     tg29_usb_power_state_t before = {0};
     err = read_usb_power_locked(h, &before, NULL);
     if (err != ESP_OK) goto refuse;
-    /* Only the stable local SOURCE role means a remote sink/Rd. The manual
-     * does not expose a raw Rd/debounce flag; WAIT/TRY are not substitutes.
+    /* Automatic output requires stable local SOURCE/Rd. Manual output instead
+     * requires verified detector/port OFF and ignores historical E7 states.
      * VBUSGOOD before our boost is enabled is conservatively treated as an
      * external supply. Once boosting, VBUSGOOD may be our own output. */
     const bool output_on = before.boost_enabled && before.rbfet_enabled;
@@ -1214,8 +1340,16 @@ esp_err_t tg29_probe_vbus_input(tg29_handle_t h, uint32_t timeout_ms,
     }
     const unsigned epoch = atomic_load(&h->source_epoch);
     esp_err_t err = ESP_ERR_TIMEOUT;
+    bool reserved = false;
     if (xSemaphoreTakeRecursive(h->mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
         goto cleanup;
+    if (atomic_load(&h->input_token) || atomic_load(&h->input_probe_active)) {
+        xSemaphoreGiveRecursive(h->mutex);
+        result->probe_error = ESP_ERR_INVALID_STATE;
+        return result->probe_error;
+    }
+    atomic_store(&h->input_probe_active, true);
+    reserved = true;
     err = read_usb_power_locked(h, &result->power, NULL);
     if (err == ESP_OK && !vbus_input_probe_allowed(&result->power)) err = ESP_ERR_INVALID_STATE;
     if (err == ESP_OK) {
@@ -1268,6 +1402,7 @@ cleanup:
         result->cleanup_error = restore_owned_vbus_adc_locked(h);
         xSemaphoreGiveRecursive(h->mutex);
     } else result->cleanup_error = ESP_ERR_TIMEOUT;
+    if (reserved) atomic_store(&h->input_probe_active, false);
     return result->probe_error;
 }
 

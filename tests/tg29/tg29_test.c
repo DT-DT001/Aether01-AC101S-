@@ -33,6 +33,7 @@ static int cancel_on_read_reg = -1;
 static bool lose_gate_after_boost, good_after_gate, detach_after_gate;
 static uint8_t write_order[256];
 static unsigned write_order_count;
+static bool manual_disable_guard;
 TickType_t xTaskGetTickCount(void) { return fake_ticks; }
 void vTaskDelay(TickType_t ticks)
 {
@@ -150,6 +151,10 @@ esp_err_t i2c_master_transmit(i2c_master_dev_handle_t device, const uint8_t *dat
     } else if (reg == 0x4C) {
         chip.reg[reg] &= (uint8_t)~value; chip.reg[reg] |= cc_arrive_on_ack; cc_arrive_on_ack = 0;
     } else chip.reg[reg] = value;
+    if (manual_disable_guard && reg == 0x0B && !(value & 0x08U)) {
+        assert(!(chip.reg[0x13] & 1U) && !(chip.reg[0x19] & 0x10U));
+        assert(!(value & 1U)); /* Never replay RWAC watchdog. */
+    }
     if (reg == 0x13 && (value & 1U) && good_after_gate) chip.reg[0x00] |= 0x20U;
     if (reg == 0x13 && (value & 1U) && detach_after_gate) chip.reg[0xE7] = 3;
     if (reg == 0x19 && (value & 0x10U) && change_cc_after_boost) chip.reg[0xE7] = cc_after_boost;
@@ -170,6 +175,7 @@ static void reset_chip(void)
 {
     memset(&chip, 0, sizeof(chip));
     fake_ticks = 0; delay_hook = NULL; revoke_on_mode_write = false; cancel_on_read_reg = -1;
+    manual_disable_guard=false;
     memset(reads, 0, sizeof(reads));
     memset(writes, 0, sizeof(writes));
     memset(last_write, 0, sizeof(last_write));
@@ -960,7 +966,7 @@ static void manual_fixture(tg29_handle_t h, uint8_t cc)
     chip.reg[0x1E] = 0x94;
     set_vbus_raw(0);
     assert(tg29_configure_manual_otg(h) == ESP_OK);
-    assert(h->manual_otg && (chip.reg[0x0B] & 0x08U) && (chip.reg[0xE3] & 3U) == TG29_CC_DRP);
+    assert(h->manual_otg && !(chip.reg[0x0B] & 0x08U) && (chip.reg[0xE3] & 3U) == TG29_CC_DISABLED);
     assert(!writes[0x13] && !writes[0x19]);
 }
 
@@ -991,6 +997,11 @@ static void interleaved_manual_off(void)
     assert(tg29_set_otg_enabled(h, false) == ESP_OK);
 }
 
+static void enable_detector_during_manual(void)
+{
+    if (fake_ticks >= 40) chip.reg[0x0B] |= 8U;
+}
+
 static void test_manual_otg(tg29_handle_t h)
 {
     const uint8_t eligible[] = {TG29_CC_UNATTACH_SNK, TG29_CC_UNATTACH_SRC, TG29_CC_ATTACH_SRC};
@@ -1000,7 +1011,7 @@ static void test_manual_otg(tg29_handle_t h)
         if (borrowed_adc) { chip.reg[0xC0] |= 4U; set_vbus_raw(800); }
         tg29_usb_power_state_t p;
         assert(tg29_get_usb_power_state(h, &p) == ESP_OK && p.otg_role_ready && p.source_allowed);
-        assert(p.attached_as_source == (eligible[i] == TG29_CC_ATTACH_SRC));
+        assert(!p.attached_as_source && !p.attached_as_sink && !p.cc_detection_enabled);
         assert(tg29_set_otg_enabled(h, true) == ESP_OK && fake_ticks == 1010);
         assert(chip.reg[0x13] == 0xA5 && chip.reg[0x19] == 0xBF && chip.reg[0x50] == 0xDE);
         assert(h->vbus_adc_owned != borrowed_adc);
@@ -1011,7 +1022,7 @@ static void test_manual_otg(tg29_handle_t h)
         assert_manual_off(h, borrowed_adc ? 0x97 : 0x93);
         assert(!source_permission_current(h));
     }
-    puts("PASS manual OTG accepts stable unattached SRC/SNK or attached SOURCE after two settled low samples, verifies measured5V and restores owned settings only");
+    puts("PASS explicit CC-less manual OTG ignores historical E7 after verified detector/port OFF, still requires settled low VBUS and measured5V, and restores owned settings only");
 
     manual_fixture(h, TG29_CC_UNATTACH_SNK);
     for (uint8_t mode = 0; mode < 4; ++mode) for (uint8_t cc = 0; cc < 16; ++cc) {
@@ -1019,9 +1030,10 @@ static void test_manual_otg(tg29_handle_t h)
         chip.reg[0xE7] = cc;
         tg29_usb_power_state_t p;
         assert(tg29_get_usb_power_state(h, &p) == ESP_OK);
-        assert(p.otg_role_ready == ((mode == 2 || mode == 3) && (cc == 1 || cc == 4 || cc == 6)));
+        assert(p.otg_role_ready == (mode == TG29_CC_DISABLED));
     }
     manual_fixture(h, TG29_CC_ATTACH_SNK);
+    chip.reg[0x0B] |= 8U;
     assert(tg29_set_otg_enabled(h, true) == ESP_ERR_INVALID_STATE && !fake_ticks);
     assert(!writes[0x13] && !writes[0x19]);
     assert_manual_off(h, 0x93);
@@ -1030,7 +1042,7 @@ static void test_manual_otg(tg29_handle_t h)
     assert(tg29_set_otg_enabled(h, true) == ESP_ERR_INVALID_STATE && !fake_ticks && !writes[0xC0]);
     assert(!writes[0x13] && !writes[0x19]);
     assert_manual_off(h, 0x93);
-    puts("PASS manual role truth table rejects sink, WAIT/TRY, accessory, disabled/fault states and preexisting external VBUSGOOD");
+    puts("PASS manual policy accepts all stale E7 states only with detector/port OFF; unexpected detector enable and external VBUSGOOD remain refused");
 
     for (unsigned fault = 0; fault < 7; ++fault) {
         manual_fixture(h, TG29_CC_UNATTACH_SNK);
@@ -1050,12 +1062,12 @@ static void test_manual_otg(tg29_handle_t h)
     for (unsigned event = 0; event < 3; ++event) {
         manual_fixture(h, TG29_CC_UNATTACH_SNK);
         delay_hook = event == 0 ? revoke_during_settle :
-                     event == 1 ? detach_during_settle : interleaved_manual_off;
+                     event == 1 ? enable_detector_during_manual : interleaved_manual_off;
         assert(tg29_set_otg_enabled(h, true) == ESP_ERR_INVALID_STATE && fake_ticks <= 40);
         assert(!writes[0x13] && !writes[0x19]);
         assert_manual_off(h, 0x93);
     }
-    puts("PASS OFF epoch, sink transition and checked OFF can cancel unlocked preflight without permitting another start or losing ADC cleanup");
+    puts("PASS OFF epoch, unexpected detector enable and checked OFF cancel unlocked manual preflight without permitting another start or losing ADC cleanup");
 
     tg29_otg_verify_result_t r;
     manual_fixture(h, TG29_CC_UNATTACH_SNK);
@@ -1069,14 +1081,242 @@ static void test_manual_otg(tg29_handle_t h)
     assert_manual_off(h, 0x93);
     manual_fixture(h, TG29_CC_UNATTACH_SNK);
     assert(tg29_set_otg_enabled(h, true) == ESP_OK);
-    chip.reg[0xE7] = TG29_CC_ATTACH_SNK;
+    chip.reg[0xE3] = (chip.reg[0xE3] & ~3U) | TG29_CC_SINK;
     assert(tg29_verify_otg_output_ex(h, 2000, &r) == ESP_ERR_INVALID_STATE && !r.pre_cleanup_diag_attempted);
     assert_manual_off(h, 0x93);
     assert(tg29_configure_cc_detection(h, true) == ESP_OK && !h->manual_otg);
     chip.reg[0xE7] = TG29_CC_UNATTACH_SNK;
     assert(tg29_set_otg_enabled(h, true) == ESP_ERR_INVALID_STATE);
-    puts("PASS manual mode cannot use control-only fallback, records unproved voltage safely, stops on sink change and leaves automatic ATTACH_SRC requirement intact");
+    puts("PASS manual mode cannot use control-only fallback, records unproved voltage safely, stops on unexpected port changes and leaves automatic ATTACH_SRC requirement intact");
     verification_handle = NULL;
+}
+
+static void test_manual_cc_reinstall(tg29_handle_t h)
+{
+    verified_fixture(h,true);
+    chip.reg[0x0B]=0xB9;chip.reg[0xE3]=0xD3;chip.reg[0x13]=0xA5;chip.reg[0x19]=0xBF;
+    chip.reg[0x1E]=0x94;
+    for(unsigned attempt=0;attempt<2;++attempt) {
+        chip.reg[0xE7]=0x40;
+        manual_disable_guard=true;
+        const unsigned detect_writes=writes[0x0B],mode_writes=writes[0xE3];
+        assert(tg29_configure_manual_otg(h)==ESP_OK);
+        assert(writes[0x0B]==detect_writes+1 && writes[0xE3]==mode_writes+1);
+        assert(chip.reg[0x0B]==0xB0 && chip.reg[0xE3]==0xD0);
+        assert(!(chip.reg[0x13]&1U) && !(chip.reg[0x19]&0x10U));
+        tg29_usb_power_state_t p;
+        assert(tg29_get_usb_power_state(h,&p)==ESP_OK && p.otg_role_ready && p.cc_raw==0x40);
+        assert(p.cc_detection_raw==0xB0 && p.cc_mode_raw==0xD0 && !p.cc_detection_enabled);
+        set_vbus_raw(0);
+        assert(tg29_set_otg_enabled(h,true)==ESP_OK);
+        set_vbus_raw(5134);
+        assert(tg29_verify_otg_output(h,2000,&p)==ESP_OK && p.vbus_mv==5134);
+        const uint8_t stale_states[]={0,1,4,6,3};
+        const unsigned stable_writes=write_count;
+        const TickType_t active_start=fake_ticks;
+        for(unsigned second=0;second<61;++second) {
+            chip.reg[0xE7]=0x40U|stale_states[second%sizeof(stale_states)];
+            assert(read_otg_control_sample(h,atomic_load(&h->source_epoch),true,&p)==ESP_OK);
+            assert(p.otg_role_ready && p.boost_enabled && p.rbfet_enabled && p.vbus_mv==5134);
+            vTaskDelay(1000);
+        }
+        assert(fake_ticks-active_start>60000 && write_count==stable_writes);
+        assert(tg29_set_otg_enabled(h,false)==ESP_OK && !source_permission_current(h));
+        assert(tg29_configure_cc_detection(h,false)==ESP_OK && (chip.reg[0x0B]&8U) && (chip.reg[0xE3]&3U)==TG29_CC_SINK);
+    }
+    puts("PASS manual 5.134V output stays healthy beyond60s with disabled CC and stale E7 0/1/4/6/3; repeated OFF restores sink detection and explicit ON disables it again");
+
+    for(unsigned stage=0;stage<2;++stage) for(unsigned dropped=0;dropped<2;++dropped) {
+        manual_fixture(h,TG29_CC_UNATTACH_SRC);
+        chip.reg[0x0B] |= 8U;
+        chip.reg[0xE3]=0xD1; /* A dropped mode write cannot pass equal-value readback. */
+        const int reg=stage==1 ? 0xE3 : 0x0B;
+        const unsigned occurrence=writes[reg]+1;
+        if(dropped){drop_write_reg=reg;drop_write_occurrence=occurrence;}
+        else{fail_write_reg=reg;fail_write_occurrence=occurrence;}
+        assert(tg29_configure_manual_otg(h)!=ESP_OK);
+        assert(!source_permission_current(h) && !h->manual_otg);
+        assert(!(chip.reg[0x13]&1U) && !(chip.reg[0x19]&0x10U));
+        assert(!h->manual_output_started && !atomic_load(&h->manual_start_active));
+    }
+    puts("PASS every checked manual detector/port disable write/drop failure leaves source unauthorized and both output controls OFF");
+
+    manual_fixture(h,TG29_CC_UNATTACH_SRC);
+    const unsigned before=writes[0x0B];revoke_on_mode_write=true;
+    assert(tg29_configure_manual_otg(h)==ESP_ERR_INVALID_STATE);
+    assert(writes[0x0B]==before+1 && !(chip.reg[0x0B]&8U));
+    assert(!source_permission_current(h) && !h->manual_otg);
+    assert(!(chip.reg[0x13]&1U) && !(chip.reg[0x19]&0x10U));
+    assert(tg29_configure_manual_otg(h)==ESP_OK && source_permission_current(h));
+    assert(tg29_configure_cc_detection(h,false)==ESP_OK);
+    verification_handle=NULL;
+    puts("PASS OFF epoch during manual detector/port disable prevents authorization; only a later explicit configure can resume");
+}
+
+static void test_manual_physical_guards(tg29_handle_t h)
+{
+    const uint8_t stale[]={0,1,4,6,3};
+    tg29_otg_verify_result_t result;
+    for(unsigned i=0;i<sizeof(stale);++i) {
+        manual_fixture(h,0x40U|stale[i]);chip.reg[0]|=0x20U;set_vbus_raw(5134);
+        assert(tg29_set_otg_enabled(h,true)==ESP_ERR_INVALID_STATE && !fake_ticks);
+        assert(!writes[0x13] && !writes[0x19]);
+        manual_fixture(h,0x40U|stale[i]);set_vbus_raw(5134);
+        assert(tg29_set_otg_enabled(h,true)==ESP_ERR_INVALID_STATE && fake_ticks>=1000);
+        assert(!writes[0x13] && !writes[0x19]);
+    }
+    puts("PASS every historical E7 state still rejects external VBUSGOOD and physically high input ADC; disabling CC never skips settled low-voltage preflight");
+
+    for(unsigned fault=0;fault<2;++fault) {
+        manual_fixture(h,0x43);assert(tg29_set_otg_enabled(h,true)==ESP_OK);
+        set_vbus_raw(5134);assert(tg29_verify_otg_output_ex(h,2000,&result)==ESP_OK);
+        if(!fault)chip.reg[0x0B]|=8U;
+        else chip.reg[0xE3]=(chip.reg[0xE3]&~3U)|TG29_CC_SINK;
+        assert(tg29_verify_otg_output_ex(h,2000,&result)==ESP_ERR_INVALID_STATE);
+        assert(result.cleanup_error==ESP_OK && !(chip.reg[0x19]&0x10U) && !(chip.reg[0x13]&1U));
+    }
+    verified_fixture(h,true);assert(tg29_set_otg_enabled(h,true)==ESP_OK);
+    chip.reg[0xE7]=0x40;set_vbus_raw(5134);
+    assert(tg29_verify_otg_output_ex(h,2000,&result)==ESP_ERR_INVALID_STATE && result.cleanup_error==ESP_OK);
+    puts("PASS manual output rejects unexpected detector enable or port changes even at5.134V; automatic output still rejects CC state0 at the same healthy voltage");
+
+    manual_fixture(h,0x40);
+    const unsigned begin=write_order_count;
+    assert(tg29_configure_cc_detection(h,false)==ESP_OK);
+    assert(write_order_count==begin+2 && write_order[begin]==0xE3 && write_order[begin+1]==0x0B);
+    assert((chip.reg[0xE3]&3U)==TG29_CC_SINK && (chip.reg[0x0B]&8U));
+    verification_handle=NULL;
+    puts("PASS manual OFF installs verified SINK port before re-enabling CC detection, without changing unrelated controls");
+}
+
+static void runtime_input_fixture(tg29_handle_t h)
+{
+    assert(!atomic_load(&h->input_token));
+    input_probe_fixture(h);
+    atomic_store(&h->manual_start_active, false);
+    atomic_store(&h->input_probe_active, false);
+    h->manual_otg = h->manual_output_started = false;
+    chip.reg[0xE3] = 0xD1; chip.reg[0xE7] = TG29_CC_ATTACH_SNK;
+    chip.reg[0x0B] = 8; chip.reg[0x13] = 0xA0;
+    chip.reg[0x01] = 0x94; /* Charging complete, not actively charging. */
+}
+
+static void test_runtime_input_lease(tg29_handle_t h)
+{
+    uint32_t token, newer;
+    tg29_usb_power_state_t p;
+    tg29_vbus_input_probe_result_t probe;
+    runtime_input_fixture(h);
+    assert(tg29_vbus_input_acquire(h, &token) == ESP_OK && token);
+    assert(h->input_adc_owned && atomic_load(&h->input_token) == token);
+    assert(write_count == 1 && writes[0xC0] == 1 && chip.reg[0xC0] == 0x97);
+    assert(tg29_vbus_input_read(h, token, &p) == ESP_OK && p.vbus_good && p.vbus_voltage_valid && p.vbus_mv == 5126);
+    unsigned before = write_count;
+    assert(tg29_configure_manual_otg(h) == ESP_ERR_INVALID_STATE);
+    assert(tg29_configure_cc_detection(h, true) == ESP_ERR_INVALID_STATE);
+    assert(tg29_set_otg_enabled(h, true) == ESP_ERR_INVALID_STATE && write_count == before);
+    assert(tg29_probe_vbus_input(h, 100, &probe) == ESP_ERR_INVALID_STATE && !probe.attempted && write_count == before);
+    assert(tg29_set_otg_enabled(h, false) == ESP_OK && (chip.reg[0xC0] & 4));
+    assert(tg29_configure_cc_detection(h, false) == ESP_OK && (chip.reg[0xC0] & 4));
+    assert(tg29_vbus_input_read(h, token, &p) == ESP_OK);
+    chip.reg[0xC0] |= 0x40; /* Preserve another ADC user's later enable. */
+    assert(tg29_vbus_input_release(h, token) == ESP_OK && chip.reg[0xC0] == 0xD3);
+    assert(!h->input_adc_owned && !atomic_load(&h->input_token));
+    puts("PASS runtime external input supports charge-complete VBUSGOOD, changes only owned ADC bit, excludes source ON, and survives ordinary source OFF");
+
+    runtime_input_fixture(h); chip.reg[0xC0] |= 4;
+    assert(tg29_vbus_input_acquire(h, &newer) == ESP_OK && newer != token && !h->input_adc_owned && !write_count);
+    before = write_count;
+    assert(tg29_vbus_input_release(h, token) == ESP_ERR_INVALID_STATE && write_count == before);
+    assert(tg29_vbus_input_read(h, token, &p) == ESP_ERR_INVALID_STATE && all_zero(&p,sizeof(p)));
+    assert(tg29_vbus_input_acquire(h, &token) == ESP_ERR_INVALID_STATE && !token);
+    assert(tg29_vbus_input_release(h, newer) == ESP_OK && chip.reg[0xC0] == 0x97 && !write_count);
+    puts("PASS borrowed external ADC remains enabled on release; stale input tokens cannot read, clear or overwrite a newer lease");
+
+    runtime_input_fixture(h);
+    assert(tg29_vbus_input_acquire(h, &token) == ESP_OK);
+    const uint16_t raw[] = {0,0x3FFC,0x3FFF,0x2000,4700,5600};
+    for (unsigned n=0;n<sizeof(raw)/sizeof(raw[0]);++n) {
+        chip.reg[0xC6]=raw[n]>>8;chip.reg[0xC7]=raw[n]&0xFF;
+        assert(tg29_vbus_input_read(h,token,&p)==ESP_OK);
+        assert(p.vbus_voltage_valid==(raw[n]>0 && raw[n]<=0x1FFF));
+    }
+    const uint8_t regs[]={0xE3,0xE7,0x19,0x1E,0,0x0B,0xC0,0x13,0xC6,0xC7};
+    for (unsigned n=0;n<sizeof(regs);++n) {
+        fail_read_reg=regs[n];fail_read_occurrence=reads[regs[n]]+1;
+        assert(tg29_vbus_input_read(h,token,&p)==ESP_FAIL && all_zero(&p,sizeof(p)));
+        assert(atomic_load(&h->input_token)==token);
+    }
+    const uint8_t conflicts[]={0,0x19,0x13,0xE3,0xE7,0xC0};
+    for (unsigned n=0;n<sizeof(conflicts);++n) {
+        uint8_t reg=conflicts[n], saved=chip.reg[reg];
+        if(reg==0)chip.reg[reg]&=~0x20U;
+        else if(reg==0x19)chip.reg[reg]|=0x10;
+        else if(reg==0x13)chip.reg[reg]|=1;
+        else if(reg==0xE3)chip.reg[reg]=TG29_CC_SOURCE;
+        else if(reg==0xE7)chip.reg[reg]=TG29_CC_ATTACH_SRC;
+        else chip.reg[reg]&=~4U;
+        assert(tg29_vbus_input_read(h,token,&p)==ESP_ERR_INVALID_STATE && all_zero(&p,sizeof(p)));
+        chip.reg[reg]=saved;
+    }
+    assert(tg29_vbus_input_release(h,token)==ESP_OK);
+    puts("PASS runtime input treats ADC readiness separately from range policy, clears all partial reads, and rejects input removal/source-role/gate/boost/ADC loss without dropping owner");
+
+    runtime_input_fixture(h);chip.reg[0]&=~0x20U;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_NOT_FOUND && !token && !write_count);
+    const uint8_t stale_states[]={0,1,4,6,3};
+    for(unsigned detector=0;detector<2;++detector) for(unsigned n=0;n<sizeof(stale_states);++n) {
+        runtime_input_fixture(h);chip.reg[0]&=~0x20U;
+        chip.reg[0xE7]=0x40U|stale_states[n];
+        chip.reg[0x0B]=detector?8U:0U;chip.reg[0xE3]=detector?0x11U:0x10U;
+        assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_NOT_FOUND && !token && !write_count);
+        assert(tg29_configure_manual_otg(h)==ESP_OK && source_permission_current(h));
+        assert(!(chip.reg[0x0B]&8U) && (chip.reg[0xE3]&3U)==TG29_CC_DISABLED);
+        assert(tg29_configure_cc_detection(h,false)==ESP_OK);
+    }
+    for(unsigned conflict=0;conflict<4;++conflict) {
+        runtime_input_fixture(h);chip.reg[0]&=~0x20U;chip.reg[0xE7]=0x40;
+        if(conflict==0)chip.reg[0x19]|=0x10U;
+        if(conflict==1)chip.reg[0x13]|=1U;
+        if(conflict==2){atomic_store(&h->authorized_epoch,atomic_load(&h->source_epoch));atomic_store(&h->source_allowed,true);}
+        if(conflict==3)h->vbus_adc_owned=true;
+        assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_INVALID_STATE && !token && !write_count);
+        h->vbus_adc_owned=false;
+    }
+    runtime_input_fixture(h);chip.reg[0xE7]=0x40;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_INVALID_STATE && !token && !write_count);
+    puts("PASS battery-only stale CC states permit NOT_FOUND handoff to explicit manual configuration; owners/source/BOOST/RBFET and known external input conflicts never become fallback permission");
+    runtime_input_fixture(h);fail_read_reg=0;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_FAIL && !token && !write_count);
+    runtime_input_fixture(h);atomic_store(&h->manual_start_active,true);
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_INVALID_STATE && !token);
+    runtime_input_fixture(h);atomic_store(&h->input_probe_active,true);
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_INVALID_STATE && !token);
+    runtime_input_fixture(h);h->vbus_adc_owned=true;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_INVALID_STATE && !token);h->vbus_adc_owned=false;
+    runtime_input_fixture(h);chip.reg[0x13]|=1;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_INVALID_STATE && !token);
+    runtime_input_fixture(h);fail_mutex_take=true;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_TIMEOUT && !token);
+    assert(tg29_vbus_input_acquire(NULL,&token)==ESP_ERR_INVALID_ARG && !token);
+    assert(tg29_vbus_input_acquire(h,NULL)==ESP_ERR_INVALID_ARG);
+    assert(tg29_vbus_input_read(h,0,&p)==ESP_ERR_INVALID_ARG && all_zero(&p,sizeof(p)));
+    assert(tg29_vbus_input_release(h,0)==ESP_ERR_INVALID_ARG);
+    puts("PASS external input admission distinguishes definite absence from bus/role/source/preflight/probe/cleanup conflicts; invalid arguments never change hardware");
+
+    runtime_input_fixture(h);drop_write_reg=0xC0;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_ERR_INVALID_RESPONSE && !token && !atomic_load(&h->input_token));
+    runtime_input_fixture(h);fail_read_reg=0xC0;fail_read_occurrence=2;
+    fail_write_reg=0xC0;fail_write_occurrence=2;
+    assert(tg29_vbus_input_acquire(h,&token)==ESP_FAIL && token && h->input_adc_owned);
+    assert(tg29_configure_manual_otg(h)==ESP_ERR_INVALID_STATE);
+    fail_mutex_take=true;
+    assert(tg29_vbus_input_release(h,token)==ESP_ERR_TIMEOUT && atomic_load(&h->input_token)==token);
+    fail_write_reg=0xC0;fail_write_occurrence=writes[0xC0]+1;
+    assert(tg29_vbus_input_release(h,token)==ESP_FAIL && atomic_load(&h->input_token)==token);
+    assert(tg29_vbus_input_release(h,token)==ESP_OK && !atomic_load(&h->input_token) && !(chip.reg[0xC0]&4));
+    verification_handle=NULL;
+    puts("PASS failed input acquisition rolls back only its ADC bit; failed rollback or release retains a cleanup token and blocks source until successful retry");
 }
 
 int main(void)
@@ -1351,6 +1591,9 @@ int main(void)
     test_continuous_input_probe(pmic);
     test_rbfet_gate(pmic);
     test_manual_otg(pmic);
+    test_manual_cc_reinstall(pmic);
+    test_manual_physical_guards(pmic);
+    test_runtime_input_lease(pmic);
     assert(tg29_del(pmic) == ESP_OK);
     puts("PASS key setup failures are reported without touching shutdown/protection configuration");
     return 0;

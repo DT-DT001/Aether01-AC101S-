@@ -10,6 +10,8 @@ test=root/'tests/home_ui'
 out=root/'build/host_home_ui'
 out.mkdir(parents=True,exist_ok=True)
 cached=root/'build/host_reader_ui'
+if not cached.exists():
+    cached=out
 lvgl=root/'managed_components/lvgl__lvgl'
 flags=['gcc','-std=c11','-O0','-g','-Wall','-Wextra','-Werror','-ffunction-sections','-fdata-sections',
        '-DLV_CONF_INCLUDE_SIMPLE','-DLV_LVGL_H_INCLUDE_SIMPLE','-D_DEFAULT_SOURCE',
@@ -17,10 +19,10 @@ flags=['gcc','-std=c11','-O0','-g','-Wall','-Wextra','-Werror','-ffunction-secti
        *['-I'+str(p) for p in [test/'stubs',root/'tests/battery_ui/stubs',root/'tests/player/stubs',root/'tests/reader_ui/stubs',root/'tests/reader_ui',root/'main/ui',root/'main',root/'components/tg29/include',root/'components/pcf85063/include',lvgl]]]
 objects=[]
 rebuild=[]
-for source in [*sorted((lvgl/'src').rglob('*.c')),root/'main/assets/font_16.c',root/'main/assets/font_24.c']:
+for source in [*[p for p in sorted((lvgl/'src').rglob('*.c')) if not any(disabled in p.as_posix() for disabled in ['drivers/opengles/', 'libs/gltf/'])],root/'main/assets/font_16.c',root/'main/assets/font_24.c']:
     name=str(source.relative_to(root)).replace('/','_')+'.o'
     obj=cached/name
-    if source.name in ['lv_font_montserrat_20.c','lv_font_montserrat_28.c'] or not obj.exists():
+    if source.name in ['lv_font_montserrat_20.c','lv_font_montserrat_28.c'] or not obj.exists() or obj.stat().st_mtime < max(source.stat().st_mtime,(root/'tests/reader_ui/lv_conf.h').stat().st_mtime):
         obj=out/name
         rebuild.append((source,obj))
     objects.append(obj)
@@ -30,7 +32,8 @@ for source in [root/'main/ui/app_home.c',root/'main/ui/app_battery.c',*[p for p 
     objects.append(obj)
 def compile_pair(pair):
     source,obj=pair
-    result=subprocess.run(flags+['-c',str(source),'-o',str(obj)],capture_output=True,text=True)
+    upstream_flags=['-Wno-unused-parameter'] if lvgl in source.parents else []
+    result=subprocess.run(flags+upstream_flags+['-c',str(source),'-o',str(obj)],capture_output=True,text=True)
     if result.returncode:
         print(result.stderr)
         result.check_returncode()

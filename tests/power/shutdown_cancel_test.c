@@ -22,7 +22,7 @@ static esp_err_t aether_wifi_set_enabled(void *p,bool enabled){assert(p==s_wifi&
 #include "shutdown_cancel.inc"
 int main(void)
 {
-    shutdown_context_t state={.active=true,.storage_gate=true,.lease_gate=true,.wifi_enabled=true,.bluetooth_enabled=true};
+    shutdown_context_t state={.active=true,.storage_gate=true,.lease_gate=true,.wifi_enabled=true,.bluetooth_audio_requested=true};
     storage_error=ESP_ERR_TIMEOUT;resume_error=ESP_ERR_INVALID_STATE;ui_blocked=true;
     assert(actual_cancel(&state,100)==ESP_ERR_TIMEOUT&&state.active&&state.storage_gate&&state.lease_gate&&!state.ui_resume_requested);
     assert(resume_calls==1&&!unblock_calls&&!audio_calls&&!wifi_calls&&!bt_calls);

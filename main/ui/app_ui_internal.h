@@ -82,6 +82,7 @@ void app_open_status(app_ui_t *ui);
 void app_open_clock(app_ui_t *ui);
 void app_open_motion(app_ui_t *ui);
 void app_open_displacement(app_ui_t *ui);
+void app_open_gps(app_ui_t *ui);
 void app_open_barometer(app_ui_t *ui);
 void app_open_music(app_ui_t *ui);
 void app_open_video(app_ui_t *ui);

@@ -99,11 +99,13 @@ typedef struct {
     tg29_cc_mode_t cc_mode;
     tg29_cc_state_t cc_state;
     uint8_t cc_raw;
+    uint8_t cc_detection_raw; /* REG0B, same snapshot as the CC state. */
+    uint8_t cc_mode_raw; /* REGE3, includes port preference/current policy. */
     bool cc_detection_enabled;
     bool source_allowed;    /* Verified software policy; resets false at creation. */
     bool attached_as_source; /* Local SOURCE / remote SINK (Rd); stable state6 only. */
     bool attached_as_sink;   /* Local SINK / remote SOURCE; never source VBUS. */
-    bool otg_role_ready;     /* Eligible role for the configured automatic/manual policy. */
+    bool otg_role_ready;     /* AUTO: stable SOURCE. MANUAL: detector and port OFF; E7 diagnostic only. */
     bool boost_enabled;      /* Verified control bit, not a measured VBUS voltage. */
     bool vbus_good; /* Input-source detection only; never OTG output PG. */
     uint8_t module_enable_raw;
@@ -137,7 +139,7 @@ typedef struct {
 } tg29_otg_verify_result_t;
 
 /** Extended verification: returns original verify_error, with cleanup_error
- * independently retained. Only a stable-CC voltage deadline permits one full
+ * independently retained. Only a current eligible-policy voltage deadline permits one full
  * pre-cleanup probe. Cancellation, role loss and read/lock errors skip it.
  * Probe reads check cancellation between transactions; no fault ACK or ADC mux
  * writes. Invalid/incomplete probe is entirely cleared. No probe on success. */
@@ -219,20 +221,38 @@ typedef struct {
  * or detection change first switches boost off.
  * Does not enable boost or charging. Call from a task, never from an ISR. */
 esp_err_t tg29_configure_cc_detection(tg29_handle_t handle, bool allow_source);
-/** Authorize explicit manual source mode, keeping normal CC detection and DRP.
- * Checked OFF precedes authorization. Stable SOURCE attachment or a CC
- * unattached state is eligible. Starting still requires settled unpowered
- * VBUS preflight, and USB host power requires measured output verification. */
+/** Authorize explicit CC-less manual output. Checked OFF precedes verified
+ * detector disable and port DISABLED; E7 can retain a stale state and is
+ * diagnostic only. Starting still requires settled unpowered VBUS preflight,
+ * TS/undervoltage protection, and measured output verification before Host.
+ * configure_cc_detection(false) restores enabled SINK detection. Turn manual output OFF before attaching
+ * a charger/computer: a disabled CC FSM cannot report attachment roles. */
 esp_err_t tg29_configure_manual_otg(tg29_handle_t handle);
 /** Read/ACK only CC detection-finished/removal IRQs in REG4C[6:5]. Poll from
  * the USB control task so shared PMIC IRQ cannot remain low; key/fault IRQs
  * are untouched. On ACK failure events still contains the read snapshot. */
 esp_err_t tg29_get_cc_events(tg29_handle_t handle, uint8_t *events);
 /** Pure register snapshot. No interrupt acknowledgment, ADC or charger writes.
- * ATTACHWAIT/TRY/reserved states never authorize VBUS sourcing. */
+ * Automatic sourcing rejects ATTACHWAIT/TRY/reserved states. Explicit manual
+ * sourcing instead verifies detector/port OFF and treats E7 as diagnostic. */
 esp_err_t tg29_get_usb_power_state(tg29_handle_t handle, tg29_usb_power_state_t *state);
+/** Worker-only external-input ADC lease. Does not change CC, BOOST, TS or
+ * charger settings, and excludes source configuration/enable until released.
+ * NOT_FOUND means absent VBUSGOOD with no owner/source/BOOST/RBFET conflict;
+ * stale CC state is irrelevant to absence. Only the separate manual policy
+ * and physical preflight may subsequently authorize output.
+ * A nonzero token on a failed acquire retains cleanup ownership: release it
+ * before trying anything else. Read is fresh, with no settling guarantee;
+ * callers must wait for settled, consecutive valid in-range samples. Missing
+ * input or a conflicting source role invalidates the read, not the owner.
+ * Release restores only an ADC bit enabled by this lease. Failure retains
+ * ownership for retry; stale tokens never touch a newer owner's hardware. */
+esp_err_t tg29_vbus_input_acquire(tg29_handle_t handle, uint32_t *token);
+esp_err_t tg29_vbus_input_read(tg29_handle_t handle, uint32_t token,
+                               tg29_usb_power_state_t *state);
+esp_err_t tg29_vbus_input_release(tg29_handle_t handle, uint32_t token);
 /** Synchronous checked control. Automatic mode requires fresh ATTACH_SRC in
- * SOURCE/DRP. Manual mode also permits unattached SRC/SNK and requires settled
+ * SOURCE/DRP. Explicit manual mode requires detector OFF/port DISABLED and settled
  * VBUS ADC readings <=800mV with VBUSGOOD low before opening the source path.
  * Both modes require verified source policy and reject external VBUSGOOD.
  * Programs 5.126V / 500mA with the existing VBAT cutoff retained. Disabling

@@ -70,4 +70,11 @@
 #define AETHER_GPIO_POGO_3             GPIO_NUM_38
 #define AETHER_GPIO_POGO_4             GPIO_NUM_37
 
+/* VG7669T160N0MA on the expansion header. Labels TX/RX are at the module:
+ * GPIO39 <- GPS_TXD; GPIO40 -> GPS_RXD. UART signals are 3.3V, supply is 5V. */
+#define AETHER_GPIO_GPS_ON_OFF          GPIO_NUM_37
+#define AETHER_GPIO_GPS_PPS             GPIO_NUM_38
+#define AETHER_GPIO_GPS_UART_RX         GPIO_NUM_39
+#define AETHER_GPIO_GPS_UART_TX         GPIO_NUM_40
+
 /* Native USB pins are dedicated USB_DP/USB_DM pads, not ordinary GPIOs. */

@@ -2,9 +2,11 @@
  * replace hardware, host scheduling and time. No LVGL or panel-wake symbols. */
 #include <assert.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include "stubs/app_usb_input.h"
+#define TEST_OTG_CAPTURE_LOGS 1
 #include "../../main/app_otg.c"
 
 static app_power_t manager;
@@ -29,6 +31,14 @@ static esp_err_t new_error, command_error, status_error, wait_error, power_error
 static esp_err_t configure_error, cc_error, vbus_error, input_error, verify_error, diagnostic_error;
 static int64_t now_us;
 static bool shutdown_between_check_and_publish;
+static bool off_during_host_on;
+static unsigned external_acquires, external_reads, external_releases;
+static uint32_t external_sequence, external_owner;
+static esp_err_t external_acquire_error, external_read_error, external_release_error;
+static bool external_failed_owner, off_during_external_acquire;
+static char phase_logs[8192];
+static unsigned phase_log_count;
+static bool recover_cc_on_manual_configure;
 static _Thread_local unsigned critical_depth;
 #define HOST ((aether_usb_host_handle_t)&host_token)
 #define PMIC ((tg29_handle_t)&pmic_token)
@@ -38,6 +48,15 @@ void test_enter(portMUX_TYPE *lock) { assert(!critical_depth); assert(!pthread_m
 void test_exit(portMUX_TYPE *lock) { assert(critical_depth==1); --critical_depth; assert(!pthread_mutex_unlock(lock)); }
 int64_t esp_timer_get_time(void) { return now_us; }
 static void outside_cache_lock(void) { assert(!critical_depth); }
+void test_otg_log(const char *level,const char *tag,const char *format,...)
+{
+    outside_cache_lock();assert(level && tag && format);++phase_log_count;
+    const size_t used=strlen(phase_logs);assert(used<sizeof(phase_logs)-1);
+    va_list args;va_start(args,format);
+    const int count=vsnprintf(phase_logs+used,sizeof(phase_logs)-used,format,args);
+    va_end(args);assert(count>=0 && (size_t)count<sizeof(phase_logs)-used);
+    const size_t end=strlen(phase_logs);assert(end+1<sizeof(phase_logs));phase_logs[end]='\n';phase_logs[end+1]=0;
+}
 
 /* Cache-only mapping double: exercise the registered callback and full HID
  * bitmap without bringing the production NVS/settings worker into this suite. */
@@ -62,6 +81,10 @@ esp_err_t aether_usb_host_new(const aether_usb_host_config_t *c, aether_usb_host
 esp_err_t aether_usb_host_set_enabled(aether_usb_host_handle_t h, bool enabled)
 {
     outside_cache_lock(); assert(h==HOST); ++commands; last_command=enabled;
+    if(enabled && off_during_host_on) {
+        off_during_host_on=false;
+        assert(app_otg_set_enabled(false)==ESP_OK);
+    }
     if(command_error==ESP_OK)host_state.enabled=enabled;
     return command_error;
 }
@@ -93,6 +116,8 @@ esp_err_t tg29_configure_cc_detection(tg29_handle_t h, bool enabled)
     if(configure_error)return configure_error;
     if(enabled && cancel_in_configure) { cancel_in_configure=false; assert(app_otg_set_enabled(false)==ESP_OK); }
     cc_state.source_allowed=enabled;
+    cc_state.cc_detection_enabled=true;
+    cc_state.cc_detection_raw=0x18;cc_state.cc_mode_raw=enabled ? 0x13 : 0x11;
     if(!enabled) {
         cc_state.boost_enabled=false; cc_state.module_enable_raw&=~0x10U; cc_state.vbus_voltage_valid=false;
         cc_state.rbfet_enabled=false;cc_state.rbfet_control_raw&=~1U;
@@ -103,10 +128,43 @@ esp_err_t tg29_configure_cc_detection(tg29_handle_t h, bool enabled)
 esp_err_t tg29_configure_manual_otg(tg29_handle_t h)
 {
     ++manual_configure_calls;
-    return tg29_configure_cc_detection(h, true);
+    const esp_err_t error=tg29_configure_cc_detection(h, true);
+    if(error==ESP_OK) {
+        cc_state.cc_detection_enabled=false;cc_state.cc_detection_raw&=~8U;
+        cc_state.cc_mode=TG29_CC_DISABLED;cc_state.cc_mode_raw=0x10;
+    }
+    if(error==ESP_OK && recover_cc_on_manual_configure) {
+        recover_cc_on_manual_configure=false;cc_state.cc_raw=0x40;
+        cc_state.cc_state=TG29_CC_STATE_DISABLED;cc_state.otg_role_ready=true;
+    }
+    return error;
 }
 esp_err_t tg29_get_usb_power_state(tg29_handle_t h, tg29_usb_power_state_t *s)
 { outside_cache_lock(); assert(h==PMIC && s); ++cc_reads; if(cc_error){memset(s,0,sizeof(*s));return cc_error;} *s=cc_state;return ESP_OK; }
+esp_err_t tg29_vbus_input_acquire(tg29_handle_t h,uint32_t *token)
+{
+    outside_cache_lock();assert(h==PMIC && token);++external_acquires;*token=0;
+    if(external_owner)return ESP_ERR_INVALID_STATE;
+    if(external_acquire_error==ESP_OK || external_failed_owner) {
+        external_owner=++external_sequence;*token=external_owner;
+    }
+    if(off_during_external_acquire) {off_during_external_acquire=false;assert(app_otg_set_enabled(false)==ESP_OK);}
+    return external_acquire_error;
+}
+esp_err_t tg29_vbus_input_read(tg29_handle_t h,uint32_t token,tg29_usb_power_state_t *s)
+{
+    outside_cache_lock();assert(h==PMIC && s);++external_reads;memset(s,0,sizeof(*s));
+    if(!token || token!=external_owner)return ESP_ERR_INVALID_STATE;
+    if(external_read_error)return external_read_error;
+    *s=cc_state;return ESP_OK;
+}
+esp_err_t tg29_vbus_input_release(tg29_handle_t h,uint32_t token)
+{
+    outside_cache_lock();assert(h==PMIC);++external_releases;
+    if(!token || token!=external_owner)return ESP_ERR_INVALID_STATE;
+    if(external_release_error)return external_release_error;
+    external_owner=0;return ESP_OK;
+}
 esp_err_t tg29_set_otg_enabled(tg29_handle_t h, bool enabled)
 {
     outside_cache_lock(); assert(h==PMIC); ++vbus_calls; last_vbus=enabled;
@@ -186,6 +244,12 @@ static void fresh(void)
     manual_configure_calls=0;
     last_command=last_vbus=last_configure=cancel_in_verify=cancel_in_configure=false;
     last_buttons=0; last_timeout=0; now_us=0; shutdown_between_check_and_publish=false;
+    off_during_host_on=false;
+    external_acquires=external_reads=external_releases=0;external_sequence=external_owner=0;
+    external_acquire_error=external_read_error=external_release_error=ESP_OK;
+    external_failed_owner=off_during_external_acquire=false;
+    phase_logs[0]=0;phase_log_count=0;
+    recover_cc_on_manual_configure=false;
     new_error=command_error=status_error=wait_error=power_error=ESP_OK;
     configure_error=cc_error=vbus_error=input_error=verify_error=diagnostic_error=ESP_OK;
 }
@@ -209,6 +273,8 @@ static void request_manual(void)
     cc_state.cc_state=TG29_CC_UNATTACH_SRC;
     cc_state.otg_role_ready=true;
     verify_state.attached_as_source=false;
+    verify_state.cc_detection_enabled=false;
+    verify_state.cc_detection_raw=0x10;verify_state.cc_mode_raw=0x10;verify_state.cc_mode=TG29_CC_DISABLED;
     verify_state.cc_state=TG29_CC_UNATTACH_SRC;
     verify_state.otg_role_ready=true;
     assert(app_otg_set_manual_enabled(true)==ESP_OK && host_state.enabled && !hardware_calls());
@@ -258,7 +324,7 @@ int main(void)
     assert(app_otg_init(&board,NES,&manager)==ESP_ERR_INVALID_ARG && new_calls==1);
     enable(); assert(commands==1 && last_command && power_reads==2 && !hardware_calls());
     assert(app_otg_set_enabled(false)==ESP_OK && commands==2 && !last_command && revokes==1 && !hardware_calls());
-    command_error=ESP_ERR_NO_MEM; assert(app_otg_set_enabled(true)==ESP_ERR_NO_MEM && commands==3 && !hardware_calls());
+    command_error=ESP_ERR_NO_MEM; assert(app_otg_set_enabled(true)==ESP_ERR_NO_MEM && commands==4 && !hardware_calls());
     assert(atomic_load(&s_otg.source_mode)==OTG_SOURCE_OFF && revokes==2);
     puts("PASS lazy init/default OFF performs no hardware work; command failures and OFF revoke atomically without I2C");
 
@@ -412,7 +478,7 @@ int main(void)
 
     fresh(); init();shutdown_between_check_and_publish=true;
     assert(app_otg_set_enabled(true)==ESP_ERR_INVALID_STATE);
-    assert(!host_state.enabled && atomic_load(&s_otg.source_mode)==OTG_SOURCE_OFF && revokes==2 && commands==3 && !hardware_calls());
+    assert(!host_state.enabled && atomic_load(&s_otg.source_mode)==OTG_SOURCE_OFF && revokes==1 && commands==1 && !hardware_calls());
     manager.shutdown_state=APP_POWER_SHUTDOWN_IDLE;enable();manager.shutdown_state=APP_POWER_SHUTDOWN_PREPARING;
     assert(callbacks.query_sink(callbacks.context,&sink)==ESP_ERR_INVALID_STATE && !sink && !hardware_calls());
     assert(callbacks.set_vbus(callbacks.context,true)==ESP_ERR_INVALID_STATE && !hardware_calls());
@@ -590,7 +656,7 @@ int main(void)
         cc_state.vbus_good=false; cc_state.attached_as_sink=false;
         assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && !sink && !vbus_calls);
     }
-    puts("PASS external input or CC sink role cancels manual ON without boosting or retry after input removal");
+    puts("PASS external input or an inconsistent sink snapshot cancels manual ON without boosting or retry after input removal");
 
     fresh(); request_manual();
     cc_state.otg_role_ready=false;
@@ -599,7 +665,7 @@ int main(void)
     now_us+=OTG_MANUAL_ROLE_TIMEOUT_US;
     assert(callbacks.query_sink(callbacks.context,&sink)==ESP_ERR_TIMEOUT && !sink && !host_state.enabled);
     assert(power_snapshot().manual_source_failed && !vbus_calls);
-    puts("PASS manual request releases the USB host reservation after a persistent unsuitable CC state");
+    puts("PASS manual request releases the USB host reservation after a persistent unverified manual policy");
 
     fresh(); request_manual();
     assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
@@ -618,7 +684,7 @@ int main(void)
     assert(callbacks.query_sink(callbacks.context,&sink)==ESP_ERR_INVALID_STATE && !sink && !host_state.enabled);
     assert(callbacks.set_vbus(callbacks.context,false)==ESP_OK && !cc_state.boost_enabled);
     assert(!power_snapshot().output_verified && power_snapshot().manual_source_failed);
-    puts("PASS later CC sink detection terminates and cleans up an active manual session");
+    puts("PASS an inconsistent sink snapshot terminates and cleans up an active manual session");
 
     fresh(); request_manual();
     host_state.last_error=ESP_ERR_NO_MEM;
@@ -627,5 +693,325 @@ int main(void)
     host_state.state=AETHER_OTG_STOPPING; host_state.cleanup_pending=true;
     assert(app_otg_set_manual_enabled(true)==ESP_ERR_INVALID_STATE && app_otg_set_enabled(true)==ESP_ERR_INVALID_STATE);
     puts("PASS failed USB backend cancels manual session; either mode waits for physical teardown before starting");
+
+    fresh();
+    uint32_t lease=99, other=99;
+    assert(app_otg_manual_lease_acquire(NULL)==ESP_ERR_INVALID_ARG);
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease);
+    assert(!app_otg_manual_lease_valid(0));
+    assert(app_otg_manual_lease_release(0)==ESP_ERR_INVALID_ARG);
+    init();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK && lease && host_state.enabled);
+    assert(app_otg_manual_lease_valid(lease) && !hardware_calls() && commands==1);
+    assert(!power_snapshot().output_verified); /* Admission is not 5V proof. */
+    assert(app_otg_manual_lease_acquire(&other)==ESP_ERR_INVALID_STATE && !other);
+    assert(app_otg_manual_lease_release(lease)==ESP_OK && !host_state.enabled);
+    assert(!app_otg_manual_lease_valid(lease) && commands==2);
+    assert(app_otg_manual_lease_release(lease)==ESP_ERR_INVALID_STATE && commands==2);
+    puts("PASS accessory lease starts manual power asynchronously and releases only its owned session; admission never claims verified5V");
+
+    fresh();request_manual();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK && lease && commands==1);
+    assert(app_otg_manual_lease_valid(lease));
+    assert(app_otg_manual_lease_release(lease)==ESP_OK && host_state.enabled && commands==1);
+    assert(power_snapshot().manual_source_requested && !app_otg_manual_lease_valid(lease));
+    assert(app_otg_set_manual_enabled(false)==ESP_OK);
+    puts("PASS borrowed manual session remains user-owned and ON after accessory release");
+
+    fresh();init();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK);
+    assert(app_otg_set_enabled(false)==ESP_OK && !app_otg_manual_lease_valid(lease));
+    assert(callbacks.set_vbus(callbacks.context,false)==ESP_OK);
+    assert(app_otg_set_manual_enabled(true)==ESP_OK && host_state.enabled);
+    const unsigned new_session_commands=commands;
+    assert(app_otg_manual_lease_release(lease)==ESP_ERR_INVALID_STATE && host_state.enabled && commands==new_session_commands);
+    assert(app_otg_manual_lease_acquire(&other)==ESP_OK && other && other!=lease);
+    assert(app_otg_manual_lease_release(lease)==ESP_ERR_INVALID_STATE && app_otg_manual_lease_valid(other));
+    assert(app_otg_manual_lease_release(other)==ESP_OK && host_state.enabled && commands==new_session_commands);
+    puts("PASS forced OFF invalidates old tokens; stale release cannot stop a restarted user session or invalidate its newer lease");
+
+    fresh();init();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK);
+    assert(app_otg_set_manual_enabled(true)==ESP_OK); /* Deliberate user adoption. */
+    const unsigned adopted_commands=commands;
+    assert(app_otg_manual_lease_release(lease)==ESP_OK && host_state.enabled && commands==adopted_commands);
+    puts("PASS explicit user manual ON adopts accessory-owned power so later accessory release does not turn it off");
+
+    fresh();init();enable();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease && commands==1);
+    assert(atomic_load(&s_otg.source_mode)==OTG_SOURCE_AUTO);
+    assert(app_otg_set_enabled(false)==ESP_OK);
+    host_state.cleanup_pending=true;host_state.state=AETHER_OTG_STOPPING;
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease);
+    assert(!power_snapshot().manual_source_requested);
+    puts("PASS accessory never takes over normal AUTO OTG or physical cleanup");
+
+    fresh();init();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK);
+    cc_state.attached_as_sink=true;
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_ERR_INVALID_STATE && !sink);
+    assert(!app_otg_manual_lease_valid(lease) && !host_state.enabled);
+    const unsigned fault_commands=commands;
+    assert(app_otg_manual_lease_release(lease)==ESP_ERR_INVALID_STATE && commands==fault_commands);
+    puts("PASS manual worker faults immediately invalidate the accessory lease and never trigger automatic re-enable");
+
+    fresh();init();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK);
+    assert(command_begin(&s_otg));
+    assert(app_otg_manual_lease_acquire(&other)==ESP_ERR_NOT_FINISHED && !other);
+    assert(app_otg_manual_lease_release(lease)==ESP_ERR_NOT_FINISHED && app_otg_manual_lease_valid(lease));
+    assert(app_otg_set_manual_enabled(false)==ESP_OK && !app_otg_manual_lease_valid(lease));
+    assert(app_otg_set_manual_enabled(true)==ESP_ERR_NOT_FINISHED);
+    assert(command_end(&s_otg)==ESP_OK && !host_state.enabled && !atomic_load(&s_otg.stop_pending));
+    assert(!hardware_calls());
+    puts("PASS command contention never blocks GUI; OFF revokes immediately and retained Host OFF drains before a new command");
+
+    fresh();init();off_during_host_on=true;
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease);
+    assert(!host_state.enabled && !atomic_load(&s_otg.command_busy) && !atomic_load(&s_otg.stop_pending));
+    assert(atomic_load(&s_otg.source_mode)==OTG_SOURCE_OFF && !hardware_calls());
+    assert(app_otg_set_manual_enabled(true)==ESP_OK && host_state.enabled);
+    puts("PASS OFF interleaved during Host ON publication cancels the command and cannot resurrect power; later explicit user ON remains possible");
+
+    fresh();init();shutdown_between_check_and_publish=true;
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease);
+    assert(!host_state.enabled && !app_otg_manual_lease_valid(lease));
+    puts("PASS shutdown BEGIN during lease admission cannot publish an accessory token or manual source");
+
+    fresh();init();
+    app_otg_input_status_t input;
+    cc_state=(tg29_usb_power_state_t){.snapshot_valid=true,.vbus_good=true,
+        .vbus_voltage_valid=true,.vbus_mv=5100};
+    assert(app_otg_external_input_acquire(&lease)==ESP_OK && lease && external_acquires==1);
+    assert(!commands && !hardware_calls() && !host_state.enabled && !cc_state.source_allowed);
+    assert(app_otg_external_input_read(lease,&input)==ESP_OK && input.valid && input.present && input.voltage_valid && input.voltage_mv==5100);
+    cc_state.vbus_voltage_valid=false;cc_state.vbus_mv=0x3FFC;
+    assert(app_otg_external_input_read(lease,&input)==ESP_OK && input.valid && input.present && !input.voltage_valid && !input.voltage_mv);
+    assert(app_otg_set_enabled(true)==ESP_ERR_INVALID_STATE && !commands);
+    assert(app_otg_set_manual_enabled(true)==ESP_ERR_INVALID_STATE && !commands);
+    assert(app_otg_manual_lease_acquire(&other)==ESP_ERR_INVALID_STATE && !other && !commands);
+    assert(app_otg_external_input_acquire(&other)==ESP_ERR_INVALID_STATE && !other && external_acquires==1);
+    assert(app_otg_external_input_release(lease)==ESP_OK && !commands && !hardware_calls());
+    assert(app_otg_set_manual_enabled(true)==ESP_OK && host_state.enabled);
+    puts("PASS external input lease performs only worker ADC operations, exposes readiness separately, blocks both source modes and leaves Host/mux untouched");
+
+    fresh();init();
+    assert(app_otg_external_input_acquire(&lease)==ESP_OK);
+    assert(app_otg_set_enabled(false)==ESP_OK && s_otg.input_token==lease && external_owner==lease);
+    assert(app_otg_external_input_read(lease,&input)==ESP_OK && external_reads==1);
+    assert(app_otg_external_input_release(lease)==ESP_OK && !external_owner);
+    assert(app_otg_external_input_acquire(&other)==ESP_OK && other!=lease);
+    unsigned old_release_calls=external_releases;
+    assert(app_otg_external_input_release(lease)==ESP_ERR_INVALID_STATE && external_releases==old_release_calls && external_owner==other);
+    assert(app_otg_external_input_read(lease,&input)==ESP_ERR_INVALID_STATE && !input.valid);
+    assert(app_otg_external_input_release(other)==ESP_OK);
+    puts("PASS ordinary source OFF preserves external measurement owner; stale external tokens cannot read or release a replacement lease");
+
+    fresh();request_manual();
+    assert(app_otg_external_input_acquire(&lease)==ESP_ERR_NOT_FOUND && !lease && !external_acquires);
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK && app_otg_manual_lease_valid(lease));
+    assert(app_otg_manual_lease_release(lease)==ESP_OK && host_state.enabled);
+    fresh();init();enable();
+    assert(app_otg_external_input_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease && !external_acquires);
+    fresh();init();host_state.cleanup_pending=true;host_state.state=AETHER_OTG_STOPPING;
+    assert(app_otg_external_input_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease && !external_acquires);
+    puts("PASS external admission explicitly permits manual-user borrowing fallback but never takes over AUTO or incomplete Host cleanup");
+
+    const esp_err_t input_errors[]={ESP_ERR_NOT_FOUND,ESP_FAIL,ESP_ERR_TIMEOUT,ESP_ERR_INVALID_RESPONSE,ESP_ERR_INVALID_STATE};
+    for(unsigned i=0;i<sizeof(input_errors)/sizeof(input_errors[0]);++i) {
+        fresh();init();external_acquire_error=input_errors[i];
+        assert(app_otg_external_input_acquire(&lease)==input_errors[i] && !lease && external_acquires==1 && !commands && !hardware_calls());
+    }
+    fresh();init();status_error=ESP_FAIL;
+    assert(app_otg_external_input_acquire(&lease)==ESP_FAIL && !lease && !external_acquires);
+    fresh();init();power_error=ESP_FAIL;
+    assert(app_otg_external_input_acquire(&lease)==ESP_FAIL && !lease && !external_acquires);
+    puts("PASS only explicit NOT_FOUND authorizes external-not-applicable handling; PMIC/status/power errors propagate without starting source or Host");
+
+    fresh();init();external_acquire_error=ESP_FAIL;external_failed_owner=true;
+    assert(app_otg_external_input_acquire(&lease)==ESP_FAIL && lease && s_otg.input_token==lease);
+    assert(app_otg_set_manual_enabled(true)==ESP_ERR_INVALID_STATE && !commands);
+    external_release_error=ESP_FAIL;
+    assert(app_otg_external_input_release(lease)==ESP_FAIL && s_otg.input_token==lease && external_owner==lease);
+    assert(app_otg_set_enabled(true)==ESP_ERR_INVALID_STATE && !commands);
+    external_release_error=ESP_OK;
+    assert(app_otg_external_input_release(lease)==ESP_OK && !s_otg.input_token && !external_owner);
+    assert(app_otg_set_manual_enabled(true)==ESP_OK && host_state.enabled);
+    puts("PASS failed external acquire publishes retained cleanup token; failed release blocks source until a successful retry without losing owner");
+
+    fresh();init();assert(app_otg_external_input_acquire(&lease)==ESP_OK);
+    external_read_error=ESP_FAIL;memset(&input,0xA5,sizeof(input));
+    assert(app_otg_external_input_read(lease,&input)==ESP_FAIL && !input.valid && !input.present && !input.voltage_valid && !input.voltage_mv);
+    assert(external_owner==lease && !commands);
+    assert(app_otg_external_input_release(lease)==ESP_OK);
+    fresh();init();off_during_external_acquire=true;
+    assert(app_otg_external_input_acquire(&lease)==ESP_OK && lease && s_otg.input_token==lease && !host_state.enabled);
+    assert(!atomic_load(&s_otg.command_busy) && !atomic_load(&s_otg.stop_pending));
+    assert(app_otg_external_input_release(lease)==ESP_OK);
+    puts("PASS external read faults clear status but retain cleanup ownership; a concurrent source OFF neither steals nor clears the independent ADC lease");
+
+    fresh();init();assert(command_begin(&s_otg));
+    assert(app_otg_external_input_acquire(&lease)==ESP_ERR_NOT_FINISHED && !lease);
+    assert(app_otg_external_input_read(1,&input)==ESP_ERR_NOT_FINISHED && !input.valid);
+    assert(app_otg_external_input_release(1)==ESP_ERR_NOT_FINISHED);
+    assert(command_end(&s_otg)==ESP_OK);
+    assert(app_otg_external_input_acquire(NULL)==ESP_ERR_INVALID_ARG);
+    assert(app_otg_external_input_read(0,&input)==ESP_ERR_INVALID_ARG);
+    assert(app_otg_external_input_read(1,NULL)==ESP_ERR_INVALID_ARG);
+    assert(app_otg_external_input_release(0)==ESP_ERR_INVALID_ARG);
+    fresh();init();manager.shutdown_state=APP_POWER_SHUTDOWN_PREPARING;
+    assert(app_otg_external_input_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease && !external_acquires);
+    puts("PASS external worker commands share nonblocking admission, reject invalid arguments and cannot acquire power during shutdown");
+
+    fresh();request_manual();
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    assert(phase_log_count==1 && strstr(phase_logs,"phase=configure_cc"));
+    assert(callbacks.set_vbus(callbacks.context,true)==ESP_OK);
+    assert(phase_log_count==2 && strstr(phase_logs,"phase=verify_output"));
+    const unsigned normal_diagnostics=diagnostic_calls;
+    for(unsigned i=0;i<5;++i)assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    assert(phase_log_count==2 && diagnostic_calls==normal_diagnostics && verify_calls==1 && vbus_calls==1);
+    puts("PASS manual configuration and output proof log once per attempt; ordinary role polling adds no phase logs or diagnostic reads");
+
+    fresh();request_manual();cc_state.otg_role_ready=false;
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && !sink);
+    now_us=1000001;
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_ERR_TIMEOUT && !sink);
+    assert(phase_log_count==2 && strstr(phase_logs,"phase=role_wait") && strstr(phase_logs,"verify=107"));
+    assert(!verify_calls && !vbus_calls);
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && !sink && phase_log_count==2);
+    fresh();request_manual();configure_error=ESP_FAIL;
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_FAIL);
+    assert(phase_log_count==1 && strstr(phase_logs,"phase=configure_cc") && strstr(phase_logs,"snapshot=0"));
+    assert(!cc_reads && !diagnostic_calls && !verify_calls && !vbus_calls);
+    puts("PASS manual role timeout is distinguished from CC configuration failure without adding a PMIC snapshot or repeating after cancellation");
+
+    fresh();request_manual();
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    const unsigned enable_hardware=hardware_calls();
+    vbus_error=ESP_ERR_TIMEOUT;
+    assert(callbacks.set_vbus(callbacks.context,true)==ESP_ERR_TIMEOUT);
+    assert(phase_log_count==2 && strstr(phase_logs,"phase=enable_output") && !strstr(phase_logs,"phase=verify_output"));
+    assert(strstr(phase_logs,"diag_valid=0") && !verify_calls && hardware_calls()==enable_hardware+1);
+    puts("PASS failed checked enable has its own phase and explicitly unavailable snapshot; logging performs no extra PMIC I/O");
+
+    fresh();request_manual();
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    probe_power_override=true;verify_error=ESP_ERR_TIMEOUT;verify_cleanup_error=ESP_FAIL;
+    failure_diagnostic_state.power=(tg29_usb_power_state_t){.snapshot_valid=true,
+        .cc_raw=0xA6,.cc_detection_raw=0xB8,.cc_mode_raw=0xD3,.module_enable_raw=0x71,.rbfet_control_raw=0xB1,
+        .adc_enable_raw=0x97,.vbus_raw=0x3FFC,.vbus_voltage_valid=false};
+    const unsigned verify_hardware=hardware_calls();
+    assert(callbacks.set_vbus(callbacks.context,true)==ESP_ERR_TIMEOUT);
+    const char *failed_log=strstr(phase_logs,"phase=verify_output");assert(failed_log);
+    assert(strstr(failed_log,"CC=A6 R19=71 R13=B1 C0=97 VBUS_raw=3FFC VBUS_mv=0 voltage_valid=0"));
+    assert(strstr(failed_log,"R0B=B8 RE3=D3 CC=A6"));
+    assert(power_snapshot().cc_detection_raw==0xB8 && power_snapshot().cc_mode_raw==0xD3);
+    assert(strstr(failed_log,"diag_attempted=1 diag_valid=1 R50=1E TS_half_mv=1000 TS_valid=1 work_fault=03"));
+    assert(strstr(failed_log,"verify=107 cleanup=FFFFFFFF diag=0"));
+    assert(phase_log_count==2 && hardware_calls()==verify_hardware+2);
+    assert(diagnostic_state.ts_config_raw==0x12); /* Actual cleanup changed live state. */
+    puts("PASS verification failure logs its complete pre-cleanup phase and independent errors, never restored TS or an invented endpoint voltage");
+
+    fresh();request_manual();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK);
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    verify_error=ESP_ERR_TIMEOUT;
+    assert(callbacks.set_vbus(callbacks.context,true)==ESP_ERR_TIMEOUT);
+    assert(!host_state.enabled && !app_otg_manual_lease_valid(lease));
+    assert(atomic_load(&s_otg.source_mode)==OTG_SOURCE_OFF && !s_otg.lease_token && !s_otg.input_token);
+    host_state.state=AETHER_OTG_STOPPING;host_state.cleanup_pending=true;
+    assert(app_otg_set_manual_enabled(true)==ESP_ERR_INVALID_STATE);
+    assert(app_otg_manual_lease_acquire(&other)==ESP_ERR_INVALID_STATE && !other);
+    assert(callbacks.set_vbus(callbacks.context,false)==ESP_OK);
+    /* The bridge fake does not run Host's worker. Publish its completed drain. */
+    host_state=(aether_usb_host_status_t){.state=AETHER_OTG_OFF};
+    assert(app_otg_manual_lease_acquire(&other)==ESP_OK && other && other!=lease);
+    const unsigned restarted_commands=commands;
+    assert(app_otg_manual_lease_release(lease)==ESP_ERR_INVALID_STATE && commands==restarted_commands);
+    assert(host_state.enabled && app_otg_manual_lease_valid(other));
+    assert(!power_snapshot().manual_source_failed);
+    puts("PASS manual physical-output fault retains no bridge token; incomplete teardown rejects restart, completed Host OFF admits it, and stale failed-session release cannot stop the replacement");
+
+    fresh();init();
+    host_state=(aether_usb_host_status_t){.state=AETHER_OTG_ERROR,.last_error=ESP_ERR_TIMEOUT};
+    assert(app_otg_set_manual_enabled(true)==ESP_ERR_INVALID_STATE && !commands);
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease);
+    assert(app_otg_external_input_acquire(&lease)==ESP_ERR_INVALID_STATE && !lease);
+    /* Characterization only: production Host never assigns ERROR. Its worker
+     * normalizes actual failure/cleanup to OFF, which all admissions accept. */
+    host_state=(aether_usb_host_status_t){.state=AETHER_OTG_OFF};
+    assert(app_otg_set_manual_enabled(true)==ESP_OK && host_state.enabled);
+    puts("PASS synthetic drained ERROR is rejected, while physical completion published as OFF is restartable; this fake ERROR is not a production Host failure transition");
+
+    fresh();init();
+    assert(app_otg_manual_lease_acquire(&lease)==ESP_OK);
+    command_error=ESP_FAIL;
+    assert(app_otg_manual_lease_release(lease)==ESP_FAIL && !app_otg_manual_lease_valid(lease));
+    assert(atomic_load(&s_otg.source_mode)==OTG_SOURCE_OFF && !s_otg.lease_token && !cc_state.source_allowed);
+    const unsigned failed_stop_commands=commands;
+    assert(app_otg_manual_lease_release(lease)==ESP_ERR_INVALID_STATE && commands==failed_stop_commands);
+    assert(app_otg_set_manual_enabled(true)==ESP_ERR_INVALID_STATE && host_state.enabled);
+    command_error=ESP_OK;
+    assert(app_otg_set_manual_enabled(false)==ESP_OK && !host_state.enabled);
+    assert(app_otg_set_manual_enabled(true)==ESP_OK && host_state.enabled);
+    puts("PASS failed Host OFF publication revokes the manual lease permanently; stale release does not retry or stop a new session, while an explicit successful OFF permits restart");
+
+    fresh();request_manual();
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    const uint32_t configured_epoch=s_otg.configured_source_epoch;
+    const unsigned first_configures=manual_configure_calls;
+    for(unsigned i=0;i<4;++i)assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    assert(manual_configure_calls==first_configures);
+    cc_state.cc_raw=0x40;cc_state.cc_state=TG29_CC_STATE_DISABLED;cc_state.otg_role_ready=false;
+    now_us=1000001;
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_ERR_TIMEOUT && !sink);
+    assert(atomic_load(&s_otg.source_mode)==OTG_SOURCE_OFF && !host_state.enabled);
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && !sink && manual_configure_calls==first_configures);
+    /* Preserve an old worker cache across a newly admitted session. The
+     * epoch, rather than this stale bool, must force the new configure. */
+    assert(s_otg.cc_configured && s_otg.configured_source_epoch==configured_epoch);
+    host_state=(aether_usb_host_status_t){.state=AETHER_OTG_OFF};
+    now_us=5000000;recover_cc_on_manual_configure=true;
+    assert(app_otg_set_manual_enabled(true)==ESP_OK);
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+    assert(manual_configure_calls==first_configures+1 && s_otg.configured_source_epoch!=configured_epoch);
+    assert(s_otg.manual_role_deadline==now_us+OTG_MANUAL_ROLE_TIMEOUT_US);
+    assert(cc_state.cc_raw==0x40 && power_snapshot().cc_detection_raw==0x10 && power_snapshot().cc_mode_raw==0x10);
+    assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink && manual_configure_calls==first_configures+1);
+    puts("PASS each new source epoch reinstalls manual CC policy and a fresh role deadline despite a stale configured flag; faults never restart automatically and same-epoch polls never reconfigure");
+
+    fresh();request_manual();
+    verify_state.vbus_mv=verify_state.vbus_raw=5134;
+    const uint8_t stale_cc[]={0,1,4,6,3};
+    for(unsigned cycle=0;cycle<3;++cycle) {
+        if(cycle)assert(app_otg_set_manual_enabled(true)==ESP_OK);
+        cc_state.otg_role_ready=true;cc_state.attached_as_sink=false;
+        assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+        assert(callbacks.set_vbus(callbacks.context,true)==ESP_OK);
+        for(unsigned second=0;second<61;++second) {
+            cc_state.cc_raw=0x40U|stale_cc[second%sizeof(stale_cc)];
+            cc_state.cc_state=(tg29_cc_state_t)stale_cc[second%sizeof(stale_cc)];
+            now_us+=1000000;
+            assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+            assert(host_state.enabled && power_snapshot().output_verified && power_snapshot().vbus_mv==5134);
+        }
+        assert(app_otg_set_manual_enabled(false)==ESP_OK);
+        assert(callbacks.set_vbus(callbacks.context,false)==ESP_OK);
+        assert(cc_state.cc_detection_enabled && cc_state.cc_mode_raw==0x11);
+        host_state=(aether_usb_host_status_t){.state=AETHER_OTG_OFF};
+    }
+    puts("PASS three explicit manual sessions each run beyond60s at5.134V with stale E7 states and no CC-triggered shutdown; every OFF restores sink detection");
+
+    for(unsigned fault=0;fault<2;++fault) {
+        fresh();request_manual();
+        assert(callbacks.query_sink(callbacks.context,&sink)==ESP_OK && sink);
+        assert(callbacks.set_vbus(callbacks.context,true)==ESP_OK);
+        if(!fault)cc_state.cc_detection_enabled=true;
+        else{cc_state.cc_mode=TG29_CC_SINK;cc_state.otg_role_ready=false;}
+        assert(callbacks.query_sink(callbacks.context,&sink)==ESP_ERR_INVALID_STATE && !sink && !host_state.enabled);
+        assert(!power_snapshot().output_verified);
+    }
+    puts("PASS manual output is revoked if detection is unexpectedly re-enabled or the disabled-port policy changes, while E7 history alone never revokes it");
     return 0;
 }

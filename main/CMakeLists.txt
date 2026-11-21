@@ -23,6 +23,7 @@ idf_component_register(
          "app_media_control.c"
          "app_power.c"
          "app_otg.c"
+         "app_gps.c"
          "app_nes_controls.c"
          "app_intercom.c"
          "app_pc_remote.c"
@@ -62,6 +63,7 @@ idf_component_register(
          "apps/app_bluetooth.c"
          "apps/app_pc_remote.c"
          "apps/app_displacement.c"
+         "apps/app_gps.c"
          "apps/app_intercom.c"
          "apps/app_wifi.c"
          "assets/font_16.c"
@@ -70,7 +72,7 @@ idf_component_register(
     INCLUDE_DIRS "." "ui"
     REQUIRES aether_media_fs aether_usb_storage aether_usb_audio aether_board aether_storage aether_usb_msc aether_usb_host aether_audio_player aether_recorder
              aether_video_player aether_bluetooth aether_wifi aether_intercom_radio aether_intercom_audio aether_nes co5300_display
-             esp_lvgl_port esp_psram esp_timer esp_app_format spi_flash lvgl nvs_flash fatfs)
+             aether_gnss esp_driver_uart esp_lvgl_port esp_psram esp_timer esp_app_format spi_flash lvgl nvs_flash fatfs)
 # Pull the project custom memory provider before the later LVGL archive is read.
 # All nine public allocator entry points live in this single object.
 if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_LV_USE_CUSTOM_MALLOC)
@@ -90,6 +92,13 @@ if(AETHER_DISPLAY_PROFILING AND NOT CMAKE_BUILD_EARLY_EXPANSION)
 endif()
 if(AETHER_RADIO_SELFTEST AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_RADIO_SELFTEST=1)
+endif()
+if(AETHER_GPS_DIAGNOSTIC AND NOT CMAKE_BUILD_EARLY_EXPANSION)
+    target_sources(${COMPONENT_LIB} PRIVATE "app_gps_diagnostic.c")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_GPS_DIAGNOSTIC=1)
+    if(AETHER_GPS_DIAGNOSTIC_PASSIVE)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_GPS_DIAGNOSTIC_PASSIVE=1)
+    endif()
 endif()
 if(AETHER_VIDEO_DIAGNOSTIC AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_VIDEO_DIAGNOSTIC=1)
