@@ -26,6 +26,7 @@ static esp_err_t panel_delete(esp_lcd_panel_t *panel)
  */
 static const co5300_lcd_init_cmd_t kd021wvosn009_init[] = {
     {0xFE, (uint8_t[]){0x00}, 1, 0},
+    {0x28, NULL, 0, 0},
     {0xC4, (uint8_t[]){0x80}, 1, 0},
     {0x44, (uint8_t[]){0x00, 0x00}, 2, 0},
     {0x35, (uint8_t[]){0x00}, 1, 10},
@@ -34,8 +35,7 @@ static const co5300_lcd_init_cmd_t kd021wvosn009_init[] = {
     {0x63, (uint8_t[]){0xFF}, 1, 10},
     {0x2A, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4, 0},
     {0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4, 0},
-    {0x11, NULL, 0, 60},
-    {0x29, NULL, 0, 0},
+    {0x11, NULL, 0, 120},
 };
 
 esp_err_t co5300_display_new(const co5300_display_config_t *config,
@@ -87,7 +87,6 @@ esp_err_t co5300_display_new(const co5300_display_config_t *config,
 
     ESP_GOTO_ON_ERROR(esp_lcd_panel_reset(panel), fail, TAG, "reset panel");
     ESP_GOTO_ON_ERROR(esp_lcd_panel_init(panel), fail, TAG, "initialize panel");
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), fail, TAG, "turn panel on");
     const esp_err_t te_error = co5300_te_init(io, config->te);
     if (te_error != ESP_OK) ESP_LOGW(TAG, "TE synchronization unavailable: %s", esp_err_to_name(te_error));
     s_original_delete = panel->del;

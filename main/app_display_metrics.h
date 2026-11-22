@@ -37,11 +37,12 @@ typedef struct {
  * Display/IO and this lifetime semaphore must remain alive for the application. */
 esp_err_t app_display_metrics_attach(esp_lcd_panel_io_handle_t io, lv_display_t *display);
 /* Same lifetime/locking contract, with a fixed 64-byte-aligned INTERNAL|DMA
- * mirror for packed partial RGB565. The original port swaps mirror bytes;
+ * mirror for packed partial RGB565, with byte order converted during copying.
  * LVGL may render in PSRAM without direct PSRAM DMA. Capacity is bytes, not
  * a height limit: narrow/tall chunks are valid when their packed data fits.
  * Allocation/registration failure leaves original hooks unchanged; callers
  * using PSRAM buffers must treat failure as fatal rather than direct-flush. */
-esp_err_t app_display_metrics_attach_staged_rgb565(esp_lcd_panel_io_handle_t io, lv_display_t *display, size_t capacity);
+esp_err_t app_display_metrics_attach_staged_rgb565(esp_lcd_panel_io_handle_t io,
+    esp_lcd_panel_handle_t panel, lv_display_t *display, size_t capacity);
 void app_display_metrics_set_active(bool active);
 void app_display_metrics_get(app_display_metrics_t *metrics);

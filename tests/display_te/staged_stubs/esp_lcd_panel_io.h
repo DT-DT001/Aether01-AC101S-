@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include "esp_err.h"
 typedef void *esp_lcd_panel_io_handle_t;
+typedef void *esp_lcd_panel_handle_t;
 typedef struct { int unused; } esp_lcd_panel_io_event_data_t;
 typedef bool (*esp_lcd_panel_io_color_trans_done_cb_t)(esp_lcd_panel_io_handle_t,
     esp_lcd_panel_io_event_data_t *, void *);

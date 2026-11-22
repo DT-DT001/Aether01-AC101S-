@@ -4,6 +4,7 @@
 #include "app_otg_control.h"
 #include "app_ui_internal.h"
 #include "app_telemetry.h"
+#include "app_utilities.h"
 #include "app_tools.h"
 #include "app_tools_math.h"
 #include "co5300_display.h"
@@ -115,6 +116,7 @@ void app_open_status(app_ui_t *ui)
 typedef struct {
     lv_obj_t *fields[6];
     uint32_t clock_revision;
+    uint32_t network_revision;
     bool submitted;
     bool initialized;
     bool edited;
@@ -146,7 +148,7 @@ static void clock_save(lv_event_t *event)
 {
     app_ui_t *ui = lv_event_get_user_data(event);
     clock_page_t *page = ui->page_context;
-    if (!page) return;
+    if (!page || app_ui_input_blocked(ui)) return;
     const pcf85063_time_t time = {
         .year = 2000 + lv_dropdown_get_selected(page->fields[0]),
         .month = 1 + lv_dropdown_get_selected(page->fields[1]),
@@ -163,14 +165,37 @@ static void clock_save(lv_event_t *event)
         page->clock_revision = snapshot.clock_revision;
         for (unsigned i = 0; i < 6; ++i) lv_obj_add_state(page->fields[i], LV_STATE_DISABLED);
         lv_obj_add_state(ui->app_obj[3], LV_STATE_DISABLED);
+        lv_obj_add_state(ui->app_obj[4], LV_STATE_DISABLED);
         app_ui_label_text(ui->app_obj[2], "正在写入并核验 RTC…");
     } else app_ui_label_fmt(ui->app_obj[2], "未保存：%s", esp_err_to_name(err));
+}
+
+static void clock_sync(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    clock_page_t *page = ui->page_context;
+    if (!page || app_ui_input_blocked(ui)) return;
+    if (!app_tools_clock_network_ready()) {
+        app_ui_label_text(ui->app_obj[2], "请先连接 Wi-Fi");
+        return;
+    }
+    const esp_err_t error = app_tools_sync_clock();
+    if (error != ESP_OK) {
+        if (error == ESP_ERR_NOT_FOUND) app_ui_label_text(ui->app_obj[2], "RTC 未连接");
+        else app_ui_label_fmt(ui->app_obj[2], "无法开始校时：%s", esp_err_to_name(error));
+        return;
+    }
+    for (unsigned i = 0; i < 6; ++i) lv_obj_add_state(page->fields[i], LV_STATE_DISABLED);
+    lv_obj_add_state(ui->app_obj[3], LV_STATE_DISABLED);
+    lv_obj_add_state(ui->app_obj[4], LV_STATE_DISABLED);
+    app_ui_label_text(ui->app_obj[2], "正在获取网络时间…");
 }
 
 static void update_clock(lv_timer_t *timer)
 {
     app_ui_t *ui = lv_timer_get_user_data(timer);
     clock_page_t *page = ui->page_context;
+    if (!page) return;
     app_telemetry_snapshot_t telemetry;
     app_telemetry_get(&telemetry);
     if (telemetry.rtc_error == ESP_OK) {
@@ -179,7 +204,7 @@ static void update_clock(lv_timer_t *timer)
         static const char *const week[] = {"日", "一", "二", "三", "四", "五", "六"};
         app_ui_label_fmt(ui->app_obj[1], "%04u-%02u-%02u  星期%s%s", now->year, now->month, now->day,
                          now->weekday < 7 ? week[now->weekday] : "?", now->oscillator_stopped ? "  需要校时" : "");
-        if (page && !page->initialized && !page->edited &&
+        if (!page->initialized && !page->edited &&
             app_calendar_valid(now->year, now->month, now->day, now->hour, now->minute, now->second)) {
             set_clock_fields(page, now);
             page->initialized = true;
@@ -190,12 +215,41 @@ static void update_clock(lv_timer_t *timer)
     }
     app_tools_snapshot_t tools;
     app_tools_get_snapshot(&tools);
-    if (page && page->submitted && !tools.clock_pending && tools.clock_revision != page->clock_revision) {
+    const bool busy = tools.clock_pending || tools.network_clock_pending;
+    for (unsigned i = 0; i < 6; ++i) {
+        if (busy) lv_obj_add_state(page->fields[i], LV_STATE_DISABLED);
+        else lv_obj_remove_state(page->fields[i], LV_STATE_DISABLED);
+    }
+    if (busy) lv_obj_add_state(ui->app_obj[3], LV_STATE_DISABLED);
+    else lv_obj_remove_state(ui->app_obj[3], LV_STATE_DISABLED);
+    if (busy || !app_tools_clock_network_ready()) lv_obj_add_state(ui->app_obj[4], LV_STATE_DISABLED);
+    else lv_obj_remove_state(ui->app_obj[4], LV_STATE_DISABLED);
+
+    if (page->submitted && !tools.clock_pending && tools.clock_revision != page->clock_revision) {
         page->submitted = false;
-        for (unsigned i = 0; i < 6; ++i) lv_obj_remove_state(page->fields[i], LV_STATE_DISABLED);
-        lv_obj_remove_state(ui->app_obj[3], LV_STATE_DISABLED);
         app_ui_label_fmt(ui->app_obj[2], "%s%s", tools.clock_error == ESP_OK ? "RTC 已保存并核验" : "写入失败：",
                          tools.clock_error == ESP_OK ? "" : esp_err_to_name(tools.clock_error));
+    }
+    if (tools.network_clock_pending) {
+        app_ui_label_text(ui->app_obj[2], tools.network_clock_received ?
+                          "正在写入并核验 RTC…" : "正在获取网络时间…");
+    } else if (page->network_revision != tools.network_clock_revision) {
+        page->network_revision = tools.network_clock_revision;
+        if (tools.network_clock_error == ESP_OK) {
+            set_clock_fields(page, &tools.clock_verified);
+            page->initialized = true;
+            page->edited = false;
+            app_ui_label_text(ui->app_obj[2], "网络校时成功，RTC 已保存并核验");
+        } else if (tools.network_clock_received) {
+            app_ui_label_fmt(ui->app_obj[2], "系统已校时，RTC 写入失败：%s",
+                             esp_err_to_name(tools.network_clock_error));
+        } else if (tools.network_clock_error == ESP_ERR_TIMEOUT) {
+            app_ui_label_text(ui->app_obj[2], "网络校时超时，请检查互联网连接");
+        } else if (tools.network_clock_error == ESP_ERR_INVALID_STATE && !app_tools_clock_network_ready()) {
+            app_ui_label_text(ui->app_obj[2], "校时中断，请重新连接 Wi-Fi");
+        } else {
+            app_ui_label_fmt(ui->app_obj[2], "网络校时失败：%s", esp_err_to_name(tools.network_clock_error));
+        }
     }
 }
 
@@ -220,6 +274,13 @@ static lv_obj_t *clock_field(lv_obj_t *parent, const char *name, int x, int y,
     return field;
 }
 
+static void show_alarm(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    app_open_alarm(ui);
+    ui->page_back = app_open_clock;
+}
+
 void app_open_clock(app_ui_t *ui)
 {
     lv_obj_t *content = app_ui_begin_page(ui, "时钟与日期");
@@ -232,16 +293,22 @@ void app_open_clock(app_ui_t *ui)
     ui->page_cleanup = page_free;
     ui->app_obj[0] = app_ui_add_text(content, "--:--:--", LV_ALIGN_TOP_MID, 0, 0, 0x77B8FF, &lv_font_montserrat_28);
     ui->app_obj[1] = app_ui_add_text(content, "等待 RTC…", LV_ALIGN_TOP_MID, 0, 38, 0xC9DCF8, app_ui_chinese_font());
+    action(content, LV_SYMBOL_BELL, 350, 6, 52, show_alarm, ui);
     page->fields[0] = clock_field(content, "年", 0, 82, 2000, 100, ui);
     page->fields[1] = clock_field(content, "月", 140, 82, 1, 12, ui);
     page->fields[2] = clock_field(content, "日", 280, 82, 1, 31, ui);
     page->fields[3] = clock_field(content, "时", 0, 160, 0, 24, ui);
     page->fields[4] = clock_field(content, "分", 140, 160, 0, 60, ui);
     page->fields[5] = clock_field(content, "秒", 280, 160, 0, 60, ui);
-    ui->app_obj[3] = action(content, "保存日期时间", 110, 246, 188, clock_save, ui);
-    ui->app_obj[2] = app_ui_add_text(content, "选择字段后保存；星期自动计算", LV_ALIGN_TOP_MID, 0, 310, 0x8FA9CD, app_ui_chinese_font());
+    ui->app_obj[3] = action(content, "保存日期时间", 0, 246, 192, clock_save, ui);
+    ui->app_obj[4] = action(content, "NTP 校时", 210, 246, 192, clock_sync, ui);
+    ui->app_obj[2] = app_ui_add_text(content, "连上 Wi-Fi 后可同步北京时间", LV_ALIGN_TOP_MID, 0, 310, 0x8FA9CD, app_ui_chinese_font());
     lv_obj_set_width(ui->app_obj[2], 402);
     lv_obj_set_style_text_align(ui->app_obj[2], LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(ui->app_obj[2], LV_LABEL_LONG_WRAP);
+    app_tools_snapshot_t tools;
+    app_tools_get_snapshot(&tools);
+    page->network_revision = tools.network_clock_revision;
     app_ui_set_timer(ui, update_clock, 500);
     update_clock(ui->timer);
 }
@@ -293,7 +360,9 @@ static void usb_switch_event(lv_event_t *event)
 
 static void usb_details(lv_event_t *event)
 {
-    app_open_usb(lv_event_get_user_data(event));
+    app_ui_t *ui = lv_event_get_user_data(event);
+    app_open_usb(ui);
+    ui->page_back = app_open_settings;
 }
 
 static void refresh_otg_power(settings_page_t *page, const app_otg_power_status_t *power)
@@ -592,7 +661,9 @@ static void settings_timer(lv_timer_t *timer)
 
 static void nes_controls_event(lv_event_t *event)
 {
-    app_open_nes_controls(lv_event_get_user_data(event));
+    app_ui_t *ui = lv_event_get_user_data(event);
+    app_open_nes_controls(ui);
+    ui->page_back = app_open_settings;
 }
 
 void app_open_settings(app_ui_t *ui)

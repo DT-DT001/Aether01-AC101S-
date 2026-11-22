@@ -14,6 +14,7 @@ typedef struct {
     app_ui_t *ui;
     lv_obj_t *box, *body;
     uint32_t request_id;
+    void (*destination)(app_ui_t *);
 } usb_eject_dialog_t;
 
 static esp_err_t submit_usb(app_ui_t *ui, bool enabled, bool confirmed, uint32_t request_id)
@@ -42,21 +43,32 @@ static void eject_dialog_confirm(lv_event_t *event)
 {
     usb_eject_dialog_t *dialog = lv_event_get_user_data(event);
     const esp_err_t error = submit_usb(dialog->ui, false, true, dialog->request_id);
-    if (error == ESP_OK) lv_msgbox_close(dialog->box);
-    else {
+    if (error == ESP_OK) {
+        app_ui_t *ui = dialog->ui;
+        void (*destination)(app_ui_t *) = dialog->destination;
+        if (destination) {
+            /* The page transition retires the dialog with its screen. */
+            destination(ui);
+        } else {
+            lv_msgbox_close_async(dialog->box);
+        }
+    } else {
         app_ui_label_text(dialog->body, "USB 状态已改变，请返回后重新操作。\n确认前仍需在电脑安全弹出。");
         lv_obj_add_state(lv_event_get_target_obj(event), LV_STATE_DISABLED);
     }
 }
 
-static esp_err_t confirm_ejected_on_pc(app_ui_t *ui, uint32_t request_id)
+static esp_err_t confirm_ejected_on_pc(app_ui_t *ui, uint32_t request_id,
+                                       void (*destination)(app_ui_t *))
 {
     if (app_ui_modal_present(ui->screen)) return ESP_OK;
     usb_eject_dialog_t *dialog = calloc(1, sizeof(*dialog));
     if (!dialog) return ESP_ERR_NO_MEM;
     dialog->ui = ui;
     dialog->request_id = request_id;
+    dialog->destination = destination;
     dialog->box = app_ui_modal_msgbox(ui->screen);
+    if (!dialog->box) { free(dialog); return ESP_ERR_NO_MEM; }
     lv_obj_set_width(dialog->box, 408);
     lv_obj_center(dialog->box);
     lv_obj_set_style_text_font(dialog->box, app_ui_chinese_font(), 0);
@@ -85,7 +97,7 @@ esp_err_t app_ui_usb_set_enabled(app_ui_t *ui, bool enabled)
          * Neither suspend nor reset proves that host caches have been flushed.
          * Accept only this explicit user acknowledgment, bound to this request. */
         if (status.active && !status.host_ejected)
-            return confirm_ejected_on_pc(ui, status.request_id);
+            return confirm_ejected_on_pc(ui, status.request_id, NULL);
     }
     return submit_usb(ui, enabled, false, 0);
 }
@@ -115,9 +127,24 @@ void app_usb_storage_notice(app_ui_t *ui)
 
 static void usb_cleanup(app_ui_t *ui)
 {
-    /* Leaving this page does not implicitly disconnect the computer. */
     free(ui->page_context);
     ui->page_context = NULL;
+}
+
+static bool usb_can_exit(app_ui_t *ui, void (*destination)(app_ui_t *))
+{
+    usb_page_t *page = ui->page_context;
+    app_io_usb_status_t status;
+    page->submit_error = app_io_usb_get_status(ui->io, &status);
+    if (page->submit_error != ESP_OK) return false;
+    if (status.pending) return !status.requested_enabled;
+    if (!status.blocked) return true;
+    if (status.active && !status.host_ejected) {
+        page->submit_error = confirm_ejected_on_pc(ui, status.request_id, destination);
+        return false;
+    }
+    page->submit_error = submit_usb(ui, false, false, 0);
+    return page->submit_error == ESP_OK;
 }
 
 static void enabled(lv_obj_t *object, bool value)
@@ -213,6 +240,7 @@ void app_open_usb(app_ui_t *ui)
     }
     ui->page_context = page;
     ui->page_cleanup = usb_cleanup;
+    ui->page_can_exit = usb_can_exit;
     page->state = text(ui, 0, 44, 0xC9E8FF);
     page->card = text(ui, 56, 66, 0xB5C8DF);
     lv_obj_t *notes = text(ui, 130, 112, 0x91A8C6);

@@ -1,5 +1,6 @@
 #include "app_usb_input.h"
 #include "app_ui_internal.h"
+#include "app_text_input.h"
 #include "app_text.h"
 #include "aether_wifi.h"
 #include <stdlib.h>
@@ -10,7 +11,7 @@ typedef struct {
     aether_wifi_handle_t wifi;
     lv_obj_t *status,*message,*toggle,*toggle_label,*scan,*disconnect,*forget;
     lv_obj_t *rows[AETHER_WIFI_MAX_APS],*names[AETHER_WIFI_MAX_APS];
-    lv_obj_t *overlay,*password,*remember,*show_password;
+    lv_obj_t *overlay,*panel,*password,*remember,*show_password,*password_notice;
     aether_wifi_ap_t aps[AETHER_WIFI_MAX_APS],selected;
     uint32_t generation;
     uint32_t notice_started;
@@ -28,19 +29,18 @@ static void close_password(wifi_page_t *p)
 {
     if(!p->overlay) return;
     if(p->password) lv_textarea_set_text(p->password,"");
-    lv_obj_delete(p->overlay); p->overlay=p->password=p->remember=p->show_password=NULL;
+    lv_obj_delete(p->overlay);
+    p->overlay=p->panel=p->password=p->remember=p->show_password=p->password_notice=NULL;
 }
 static void submit(wifi_page_t *p)
 {
     if(!p || !p->overlay) return;
     const char *password=lv_textarea_get_text(p->password);
     esp_err_t error=aether_wifi_connect(p->wifi,&p->selected,password,lv_obj_has_state(p->remember,LV_STATE_CHECKED));
-    if(error==ESP_OK) { close_password(p); app_ui_label_text(p->message,"正在连接，请稍候"); }
-    else {
-        close_password(p);
-        show_error(p,error);
-        if(error==ESP_ERR_INVALID_ARG) app_ui_label_text(p->message,"密码长度有误：WPA/WPA2需8至63位");
-    }
+    if(error==ESP_OK) { close_password(p); app_ui_label_text(p->message,"正在连接"); }
+    else if(error==ESP_ERR_INVALID_ARG && p->selected.password_required)
+        app_ui_label_text(p->password_notice,"密码需要 8–63 个字符");
+    else app_ui_label_fmt(p->password_notice,"连接失败：%s",esp_err_to_name(error));
 }
 static void password_event(lv_event_t *event)
 {
@@ -51,6 +51,13 @@ static void password_event(lv_event_t *event)
     else if(lv_event_get_code(event)==LV_EVENT_CANCEL || kind==2) close_password(p);
     else if(kind==3 && p->password) lv_textarea_set_password_mode(p->password,!lv_obj_has_state(p->show_password,LV_STATE_CHECKED));
 }
+
+static void password_layout(void *context, bool keyboard_visible)
+{
+    wifi_page_t *page=context;
+    lv_obj_set_y(page->panel,keyboard_visible ? 30 : 116);
+}
+
 static void password_dialog(wifi_page_t *p)
 {
     close_password(p);
@@ -59,7 +66,8 @@ static void password_dialog(wifi_page_t *p)
     lv_obj_set_style_radius(overlay,0,0); lv_obj_set_style_bg_color(overlay,lv_color_hex(0x070A12),0);
     lv_obj_set_style_bg_opa(overlay,LV_OPA_COVER,0); lv_obj_set_style_border_width(overlay,0,0); lv_obj_set_style_pad_all(overlay,0,0);
     lv_obj_remove_flag(overlay,LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *panel=lv_obj_create(overlay); lv_obj_set_pos(panel,18,p->selected.password_required ? 42 : 128); lv_obj_set_size(panel,444,220);
+    lv_obj_t *panel=lv_obj_create(overlay); p->panel=panel;
+    lv_obj_set_pos(panel,18,116); lv_obj_set_size(panel,444,244);
     lv_obj_set_style_bg_color(panel,lv_color_hex(0x18243A),0); lv_obj_set_style_border_width(panel,0,0); lv_obj_set_style_pad_all(panel,12,0);
     lv_obj_remove_flag(panel,LV_OBJ_FLAG_SCROLLABLE);
     app_ui_add_text(panel,"连接 Wi-Fi",LV_ALIGN_TOP_LEFT,0,0,0xEAF2FF,app_ui_chinese_font());
@@ -68,8 +76,11 @@ static void password_dialog(wifi_page_t *p)
     lv_obj_set_width(ssid,412); lv_label_set_long_mode(ssid,LV_LABEL_LONG_DOT);
     p->password=lv_textarea_create(panel); lv_obj_set_pos(p->password,0,60); lv_obj_set_size(p->password,420,44);
     lv_textarea_set_one_line(p->password,true); lv_textarea_set_password_mode(p->password,true); lv_textarea_set_max_length(p->password,63);
-    lv_obj_set_style_text_font(p->password,&lv_font_montserrat_16,0);
-    lv_textarea_set_placeholder_text(p->password,p->selected.password_required ? "Password" : "No password required");
+    lv_obj_set_style_text_font(p->password,app_ui_chinese_font(),0);
+    lv_textarea_set_password_show_time(p->password,0);
+    lv_textarea_set_placeholder_text(p->password,p->selected.password_required ? "网络密码" : "");
+    lv_obj_add_event_cb(p->password,password_event,LV_EVENT_READY,p->ui);
+    lv_obj_add_event_cb(p->password,password_event,LV_EVENT_CANCEL,p->ui);
     p->remember=lv_checkbox_create(panel); lv_obj_set_pos(p->remember,0,118); lv_checkbox_set_text(p->remember,"保存到本机"); lv_obj_add_state(p->remember,LV_STATE_CHECKED);
     p->show_password=lv_checkbox_create(panel); lv_obj_set_pos(p->show_password,230,118); lv_checkbox_set_text(p->show_password,"显示密码");
     lv_obj_set_user_data(p->show_password,(void *)3); lv_obj_add_event_cb(p->show_password,password_event,LV_EVENT_VALUE_CHANGED,p->ui);
@@ -80,12 +91,13 @@ static void password_dialog(wifi_page_t *p)
         lv_obj_set_user_data(b,(void *)(uintptr_t)(i+1)); lv_obj_add_event_cb(b,password_event,LV_EVENT_CLICKED,p->ui);
         app_ui_add_text(b,labels[i],LV_ALIGN_CENTER,0,0,0xFFFFFF,app_ui_chinese_font());
     }
-    if(p->selected.password_required) {
-        lv_obj_t *keyboard=lv_keyboard_create(overlay); lv_obj_set_pos(keyboard,0,274); lv_obj_set_size(keyboard,480,206);
-        lv_obj_set_style_text_font(keyboard,&lv_font_montserrat_16,LV_PART_ITEMS);
-        lv_keyboard_set_textarea(keyboard,p->password); lv_keyboard_set_mode(keyboard,LV_KEYBOARD_MODE_TEXT_LOWER);
-        lv_obj_add_event_cb(keyboard,password_event,LV_EVENT_READY,p->ui); lv_obj_add_event_cb(keyboard,password_event,LV_EVENT_CANCEL,p->ui);
-    } else { availability(p->password,false); availability(p->show_password,false); }
+    p->password_notice=app_ui_add_text(panel,"",LV_ALIGN_TOP_LEFT,0,204,0xFFB17A,app_ui_chinese_font());
+    if(p->selected.password_required)
+        app_text_input_show(app_text_input_create(overlay,p->password,false,password_layout,p),true);
+    else {
+        lv_obj_add_flag(p->password,LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(p->show_password,LV_OBJ_FLAG_HIDDEN);
+    }
     (void)app_usb_input_modal_open(overlay,p->selected.password_required?p->password:p->remember);
 }
 static void selected(lv_event_t *event)
@@ -180,7 +192,8 @@ void app_open_wifi(app_ui_t *ui)
     app_ui_add_text(content,"点选网络连接",LV_ALIGN_TOP_LEFT,214,130,0x9EB6D8,app_ui_chinese_font());
     p->message=app_ui_add_text(content,"扫描后输入密码即可连接",LV_ALIGN_TOP_LEFT,0,170,0xFFB17A,app_ui_chinese_font());
     lv_obj_set_width(p->message,402); lv_obj_set_height(p->message,38); lv_label_set_long_mode(p->message,LV_LABEL_LONG_DOT);
-    lv_obj_t *list=lv_obj_create(content); lv_obj_set_pos(list,0,216); lv_obj_set_size(list,404,300);
+    lv_obj_remove_flag(content,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *list=lv_obj_create(content); lv_obj_set_pos(list,0,211); lv_obj_set_size(list,404,143);
     lv_obj_set_style_bg_opa(list,LV_OPA_TRANSP,0); lv_obj_set_style_border_width(list,0,0); lv_obj_set_style_pad_all(list,0,0);
     lv_obj_set_style_pad_row(list,8,0); lv_obj_set_flex_flow(list,LV_FLEX_FLOW_COLUMN);
     for(unsigned i=0;i<AETHER_WIFI_MAX_APS;++i) {

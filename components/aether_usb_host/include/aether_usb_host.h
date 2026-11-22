@@ -28,9 +28,10 @@ typedef struct {
     uint16_t (*keyboard_map)(void *context, const uint8_t keys[32]);
     /* Optional nonblocking generic keyboard/mouse snapshot callback. */
     void (*hid_input)(void *context, const aether_usb_input_event_t *event);
-    /* Immutable static-lifetime array, at most3 classes. */
+    /* Immutable static-lifetime array, at most 3 classes. */
     const aether_usb_host_class_ops_t *classes;
     uint8_t class_count;
+    uint8_t camera_class_mask; /* Class clients that may run with camera FIFO sizing. */
 } aether_usb_host_config_t;
 typedef enum {
     AETHER_USB_HID_STAGE_NONE,
@@ -45,10 +46,11 @@ typedef enum {
 } aether_usb_hid_stage_t;
 
 typedef struct {
-    bool enabled, active, vbus_enabled, cleanup_pending;
+    bool enabled, active, vbus_enabled, cleanup_pending, camera_profile;
     aether_otg_state_t state;
     esp_err_t last_error;
     uint8_t hid_interfaces;
+    uint8_t keyboard_interfaces; /* Ready keyboard-capable interfaces, including idle keyboards. */
     uint16_t buttons;
     /* One coherent last HID event. A real hid_error latches this tuple until
      * a new Host session; later healthy/ignored interfaces cannot mask it. */
@@ -64,6 +66,9 @@ typedef struct {
 esp_err_t aether_usb_host_new(const aether_usb_host_config_t *, aether_usb_host_handle_t *);
 /* Nonblocking admission/command publication, safe from the GUI task. */
 esp_err_t aether_usb_host_set_enabled(aether_usb_host_handle_t, bool enabled);
+/* Request camera FIFO sizing. A running session drains through the same Host
+ * worker before re-enumeration. This does not change enabled or power policy. */
+esp_err_t aether_usb_host_set_camera_profile(aether_usb_host_handle_t, bool enabled);
 esp_err_t aether_usb_host_get_status(aether_usb_host_handle_t, aether_usb_host_status_t *);
 /* Stop admission and confirm host teardown plus VBUS off. Outside LVGL. */
 esp_err_t aether_usb_host_disable_wait(aether_usb_host_handle_t, uint32_t timeout_ms);

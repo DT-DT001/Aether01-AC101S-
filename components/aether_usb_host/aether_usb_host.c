@@ -39,6 +39,8 @@ struct aether_usb_host {
     TaskHandle_t task;
     aether_usb_host_status_t status;
     atomic_bool requested,reserved;
+    bool requested_camera_profile; /* Protected by lock. */
+    bool session_camera_profile; /* Host worker only. */
     bool installed,closing,policy_dirty,bus_fault;
     usb_host_client_handle_t client;
     usb_device_handle_t devices[DEVICE_SLOTS];
@@ -114,11 +116,12 @@ static void aggregate_generic(struct aether_usb_host *h,const aether_hid_input_t
     }
 }
 static uint16_t aggregate_motion(struct aether_usb_host *h,const aether_hid_input_t *motion) {
-    uint16_t b=0;unsigned count=0;uint8_t keys[32]={0};
+    uint16_t b=0;unsigned count=0,keyboards=0;uint8_t keys[32]={0};
     for(unsigned i=0;i<HID_SLOTS;++i)if(h->hid[i].used&&h->hid[i].ready&&!h->hid[i].closing){
         b|=h->config.keyboard_map ? h->hid[i].generic.non_keyboard_buttons : h->hid[i].buttons;
         if(h->config.keyboard_map)for(unsigned k=0;k<32;++k)keys[k]|=h->hid[i].generic.keys[k];
         ++count;
+        keyboards+=h->hid[i].parser.has_keyboard;
     }
     if(h->config.keyboard_map)b|=h->config.keyboard_map(h->config.context,keys);
     const uint16_t exit_chord=AETHER_HID_SELECT|AETHER_HID_START|AETHER_HID_UP;
@@ -127,7 +130,8 @@ static uint16_t aggregate_motion(struct aether_usb_host *h,const aether_hid_inpu
         if(!h->exit_combo_since)h->exit_combo_since=now?now:1;
         if(now-h->exit_combo_since>=1000000)b|=AETHER_HID_EXIT;
     }else h->exit_combo_since=0;
-    portENTER_CRITICAL(&h->lock);h->status.buttons=b;h->status.hid_interfaces=(uint8_t)count;portEXIT_CRITICAL(&h->lock);
+    portENTER_CRITICAL(&h->lock);h->status.buttons=b;h->status.hid_interfaces=(uint8_t)count;
+    h->status.keyboard_interfaces=(uint8_t)keyboards;portEXIT_CRITICAL(&h->lock);
     if(h->config.input)h->config.input(h->config.context,b);
     aggregate_generic(h,motion);
     return b;
@@ -318,18 +322,27 @@ static bool reap(struct aether_usb_host *h) {
     }
     return !busy;
 }
-static esp_err_t backend_start(struct aether_usb_host *h) {
+static esp_err_t backend_start(struct aether_usb_host *h,bool camera_profile) {
     reset_hid_diagnostics(h);
     esp_err_t e=gpio_set_level(AETHER_GPIO_USB_SELECT,AETHER_USB_MSC_SELECT_LEVEL);if(e!=ESP_OK)return e;
     /* Same measured OTG PHY path as MSC; Host role is selected by the official
      * S31 UTMI driver. Do not manipulate native-USJ pad/clock registers. */
-    const usb_host_config_t cfg={.skip_phy_setup=false,.root_port_unpowered=true,.intr_flags=ESP_INTR_FLAG_LOWMED,.peripheral_map=0};
-    e=usb_host_install(&cfg);if(e!=ESP_OK)return e;h->installed=true;
+    usb_host_config_t cfg={.skip_phy_setup=false,.root_port_unpowered=true,.intr_flags=ESP_INTR_FLAG_LOWMED,.peripheral_map=0};
+    if(camera_profile){
+        /* ESP32-S31 USB DMA: 896 words total. RX covers 3 x 1024 bytes per
+         * microframe, with room for status. NPTX is for EP0 in this profile. */
+        cfg.fifo_settings_custom.rx_fifo_lines=800;
+        cfg.fifo_settings_custom.nptx_fifo_lines=64;
+        cfg.fifo_settings_custom.ptx_fifo_lines=32;
+    }
+    e=usb_host_install(&cfg);if(e!=ESP_OK)return e;
+    h->installed=true;h->session_camera_profile=camera_profile;
     const usb_host_client_config_t client={.is_synchronous=false,.max_num_event_msg=8,
         .async={.client_event_callback=client_event,.callback_arg=h}};
     e=usb_host_client_register(&client,&h->client);
     if(e!=ESP_OK)return e;
     for(unsigned n=0;n<h->config.class_count;++n){
+        if(camera_profile&&!(h->config.camera_class_mask&(1U<<n)))continue;
         const aether_usb_host_class_ops_t *ops=&h->config.classes[n];
         e=ops->start(ops->context);
         if(e!=ESP_OK)return e; /* Failed start rolls back its own partial work. */
@@ -376,7 +389,7 @@ static bool stop_session(struct aether_usb_host *h) {
      * root port was disabled first; retain driver buffers/reservation to retry. */
     const esp_err_t off=power_off(h);
     const bool done=stop==ESP_OK&&off==ESP_OK;
-    portENTER_CRITICAL(&h->lock);h->status.active=false;h->status.cleanup_pending=!done;
+    portENTER_CRITICAL(&h->lock);h->status.active=false;h->status.camera_profile=false;h->status.cleanup_pending=!done;
     h->status.state=done?AETHER_OTG_WAIT_SINK:AETHER_OTG_STOPPING;
     if(off!=ESP_OK)h->status.last_error=off;
     else if(stop!=ESP_OK&&stop!=ESP_ERR_NOT_FINISHED)h->status.last_error=stop;
@@ -390,12 +403,14 @@ static void service(struct aether_usb_host *h,int64_t now) {
     const bool wanted=atomic_load(&h->requested);
     portENTER_CRITICAL(&h->lock);
     const bool cleanup_pending=h->status.cleanup_pending;
+    const bool camera_profile=h->requested_camera_profile;
     portEXIT_CRITICAL(&h->lock);
+    const bool change_profile=h->installed&&camera_profile!=h->session_camera_profile;
     /* An idle default-OFF host must not touch the mux owned by MSC/USJ. */
     if(!wanted&&!h->reserved&&!h->installed&&!h->policy_dirty&&!cleanup_pending)return;
-    if(!wanted||h->closing||h->bus_fault||cleanup_pending){
+    if(!wanted||h->closing||h->bus_fault||cleanup_pending||change_profile){
         bool done=stop_session(h);
-        if(done){h->sink_samples=0;if(wanted)h->retry_after=now+2000000;}
+        if(done){h->sink_samples=0;if(wanted)h->retry_after=now+(change_profile?100000:2000000);}
         portENTER_CRITICAL(&h->lock);
         if(done&&atomic_load(&h->requested)){
             h->status.state=AETHER_OTG_WAIT_SINK;h->status.cleanup_pending=false;
@@ -418,7 +433,7 @@ static void service(struct aether_usb_host *h,int64_t now) {
     if(now<h->retry_after||++h->sink_samples<3)return;
     if(aether_usb_bus_get_owner()!=AETHER_USB_BUS_HOST){snapshot_error(h,ESP_ERR_INVALID_STATE);return;}
     portENTER_CRITICAL(&h->lock);h->status.state=AETHER_OTG_STARTING;portEXIT_CRITICAL(&h->lock);
-    e=backend_start(h);
+    e=backend_start(h,camera_profile);
     if(e==ESP_OK){sink=false;e=h->config.query_sink(h->config.context,&sink);if(!sink&&e==ESP_OK)e=ESP_ERR_INVALID_STATE;}
     if(e==ESP_OK&&!atomic_load(&h->requested))e=ESP_ERR_INVALID_STATE;
     if(e==ESP_OK){h->policy_dirty=true;e=h->config.set_vbus(h->config.context,true);
@@ -427,6 +442,7 @@ static void service(struct aether_usb_host *h,int64_t now) {
     if(e==ESP_OK)e=usb_host_lib_set_root_port_power(true);
     if(e!=ESP_OK){snapshot_error(h,e);stop_session(h);h->retry_after=now+2000000;h->sink_samples=0;return;}
     portENTER_CRITICAL(&h->lock);h->status.active=true;h->status.state=AETHER_OTG_ACTIVE;
+    h->status.camera_profile=camera_profile;
     h->status.last_error=ESP_OK;h->status.cleanup_pending=false;portEXIT_CRITICAL(&h->lock);
 }
 static void worker(void *ctx) {
@@ -440,7 +456,7 @@ static void worker(void *ctx) {
 }
 esp_err_t aether_usb_host_new(const aether_usb_host_config_t *cfg,aether_usb_host_handle_t *out) {
     if(!cfg||!cfg->query_sink||!cfg->set_vbus||!out||cfg->class_count>CLASS_LIMIT||
-       (cfg->class_count&&!cfg->classes))return ESP_ERR_INVALID_ARG;
+       (cfg->class_count&&!cfg->classes)||(cfg->camera_class_mask>>cfg->class_count))return ESP_ERR_INVALID_ARG;
     for(unsigned n=0;n<cfg->class_count;++n)
         if(!cfg->classes[n].start||!cfg->classes[n].request_stop||!cfg->classes[n].poll_stopped)
             return ESP_ERR_INVALID_ARG;
@@ -464,6 +480,14 @@ esp_err_t aether_usb_host_set_enabled(aether_usb_host_handle_t h,bool enabled) {
     if(e==ESP_OK){atomic_store(&h->requested,enabled);h->status.enabled=enabled;
         if(enabled&&h->status.state==AETHER_OTG_OFF){h->status.state=AETHER_OTG_WAIT_SINK;h->status.last_error=ESP_OK;}}
     portEXIT_CRITICAL(&h->lock);if(e==ESP_OK)xTaskNotifyGive(h->task);return e;
+}
+esp_err_t aether_usb_host_set_camera_profile(aether_usb_host_handle_t h,bool enabled) {
+    if(!h||(enabled&&!h->config.camera_class_mask))return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&h->lock);
+    h->requested_camera_profile=enabled;
+    portEXIT_CRITICAL(&h->lock);
+    xTaskNotifyGive(h->task);
+    return ESP_OK;
 }
 esp_err_t aether_usb_host_get_status(aether_usb_host_handle_t h,aether_usb_host_status_t *s) {
     if(!h||!s)return ESP_ERR_INVALID_ARG;

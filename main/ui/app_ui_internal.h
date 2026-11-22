@@ -19,14 +19,17 @@ struct app_ui {
     lv_obj_t *screen;
     lv_obj_t *content;
     lv_obj_t *home_time;
-    lv_obj_t *home_sd;
-    lv_obj_t *home_date;
-    lv_obj_t *home_audio;
+    lv_indev_t *home_swipe_input;
+    lv_point_t home_swipe_origin;
+    int32_t drawer_scroll_y;
+    size_t drawer_focus_index;
     lv_obj_t *app_obj[12];
     char app_path[192];
     uint32_t app_value;
     lv_timer_t *timer;
     void (*page_cleanup)(app_ui_t *ui);
+    bool (*page_can_exit)(app_ui_t *ui, void (*destination)(app_ui_t *));
+    void (*page_back)(app_ui_t *ui);
     void *page_context;
     app_io_handle_t io;
     uint32_t page_generation;
@@ -48,6 +51,7 @@ struct app_ui {
     int64_t user_key_armed_at_us;
     uint32_t user_key_target_generation, user_key_requested_generation;
     lv_obj_t *media_release_notice;
+    uint32_t display_drops_seen, display_retry_at;
 };
 
 extern const lv_font_t font_16;
@@ -57,6 +61,8 @@ const lv_font_t *app_ui_chinese_font(void);
 const lv_font_t *app_ui_chinese_font_size(unsigned px);
 lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title);
 lv_obj_t *app_ui_new_screen(app_ui_t *ui);
+void app_ui_show_drawer(app_ui_t *ui);
+bool app_ui_go_back(app_ui_t *ui);
 lv_obj_t *app_ui_add_text(lv_obj_t *parent, const char *text,
                           lv_align_t align, int32_t x, int32_t y,
                           uint32_t color, const lv_font_t *font);
@@ -80,12 +86,17 @@ void app_open_nes_path(app_ui_t *ui, const char *path);
 
 void app_open_status(app_ui_t *ui);
 void app_open_clock(app_ui_t *ui);
+void app_open_notes(app_ui_t *ui);
+void app_open_calendar(app_ui_t *ui);
+void app_open_weather(app_ui_t *ui);
 void app_open_motion(app_ui_t *ui);
 void app_open_displacement(app_ui_t *ui);
 void app_open_gps(app_ui_t *ui);
 void app_open_barometer(app_ui_t *ui);
 void app_open_music(app_ui_t *ui);
 void app_open_video(app_ui_t *ui);
+void app_open_camera(app_ui_t *ui);
+void app_open_gallery(app_ui_t *ui);
 void app_open_reader(app_ui_t *ui);
 void app_open_files(app_ui_t *ui);
 void app_open_files_path(app_ui_t *ui, const char *path);

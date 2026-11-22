@@ -14,7 +14,12 @@ typedef struct {uint8_t bLength,bDescriptorType;uint16_t wTotalLength;} usb_conf
 typedef struct {uint8_t bMaxPacketSize0;uint16_t idVendor,idProduct;} usb_device_desc_t;
 typedef struct usb_transfer_s {uint8_t *data_buffer;size_t data_buffer_size;usb_device_handle_t device_handle;uint8_t bEndpointAddress;
  int num_bytes,actual_num_bytes,status;unsigned timeout_ms;void (*callback)(struct usb_transfer_s*);void *context;} usb_transfer_t;
-typedef struct {bool skip_phy_setup,root_port_unpowered;int intr_flags;unsigned peripheral_map;} usb_host_config_t;
+typedef struct {
+    bool skip_phy_setup,root_port_unpowered;
+    int intr_flags;
+    unsigned peripheral_map;
+    struct {unsigned rx_fifo_lines,nptx_fifo_lines,ptx_fifo_lines;} fifo_settings_custom;
+} usb_host_config_t;
 typedef enum {USB_HOST_CLIENT_EVENT_NEW_DEV,USB_HOST_CLIENT_EVENT_DEV_GONE} usb_host_client_event_t;
 typedef struct {usb_host_client_event_t event;union {struct {uint8_t address;} new_dev;struct {usb_device_handle_t dev_hdl;} dev_gone;};} usb_host_client_event_msg_t;
 typedef struct {bool is_synchronous;int max_num_event_msg;struct {void (*client_event_callback)(const usb_host_client_event_msg_t*,void*);void *callback_arg;} async;} usb_host_client_config_t;

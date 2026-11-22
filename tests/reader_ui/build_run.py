@@ -19,6 +19,7 @@ sources = list((lvgl / "src").rglob("*.c")) + [
 ]
 flags = ["gcc", "-std=c11", "-O0", "-g", "-Werror=implicit-function-declaration", "-ffunction-sections", "-fdata-sections",
          "-DLV_CONF_INCLUDE_SIMPLE", "-D_DEFAULT_SOURCE", "-I" + str(test / "stubs"),
+         "-I" + str(root / "tests/volume_ui/stubs"),
          "-I" + str(test), "-I" + str(root / "tests/reader/stubs"), "-I" + str(root / "main"), "-I" + str(lvgl),
          "-include", str(root / "tests/reader/stubs/ff.h")]
 
@@ -33,6 +34,7 @@ def compile_source(source: Path) -> Path:
     if lvgl not in source.parents and source.parent != root / "main/assets":
         dependencies += list((test / "stubs").glob("*.h")) + [
             root / "main/app_io.h", root / "main/app_reader_layout.h", root / "main/app_reader_file.h",
+            root / "main/ui/app_scroll_list.h",
             root / "components/aether_audio_player/include/aether_audio_player.h"]
     newest = max(path.stat().st_mtime for path in [source, *dependencies])
     if obj.exists() and obj.stat().st_mtime >= newest:

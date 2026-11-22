@@ -9,6 +9,7 @@ static bool mounted=true,held,usb_mounted;
 static bool usb_blocked,failed_fs;
 static unsigned retry_requests;
 static unsigned catalog_calls, usb_generation=1,tf_generation=1;
+static size_t catalog_entries=5;
 static lv_point_t point;
 static app_io_request_t request;
 static unsigned route;
@@ -43,7 +44,22 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 }
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t p){ui->timer=lv_timer_create(cb,p,ui);}
 void app_ui_request_io_ex(app_ui_t *ui,const app_io_request_t *r,void (*cb)(app_ui_t *,const app_io_result_t *)){++catalog_calls;request=*r;ui->io_complete=cb;}
-static void deliver(app_ui_t *ui,esp_err_t error){assert(ui->io_complete);app_io_result_t r={.operation=request.operation,.error=error,.entries=(app_io_entry_t*)entries,.count=5,.total_count=5};void(*cb)(app_ui_t*,const app_io_result_t*)=ui->io_complete;ui->io_complete=NULL;cb(ui,&r);}
+static void deliver(app_ui_t *ui,esp_err_t error)
+{
+    assert(ui->io_complete);
+    const size_t count = catalog_entries < request.limit ? catalog_entries : request.limit;
+    app_io_entry_t *items = calloc(count, sizeof(*items));
+    assert(items && count >= sizeof(entries) / sizeof(entries[0]));
+    memcpy(items, entries, sizeof(entries));
+    for (size_t i = sizeof(entries) / sizeof(entries[0]); i < count; ++i)
+        snprintf(items[i].path, sizeof(items[i].path), "/sdcard/track-%04u.m4a", (unsigned)i);
+    app_io_result_t r = {.operation=request.operation,.error=error,.entries=items,.count=count,
+        .total_count=catalog_entries,.truncated=count < catalog_entries};
+    void (*cb)(app_ui_t*,const app_io_result_t*) = ui->io_complete;
+    ui->io_complete = NULL;
+    cb(ui,&r);
+    free(items);
+}
 #define OPEN(kind,number) void app_open_##kind##_path(app_ui_t *u,const char *p){(void)u;route=number;strlcpy(opened,p,sizeof(opened));}
 OPEN(reader,1) OPEN(music,2) OPEN(video,3) OPEN(nes,4)
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p){uint16_t *v=(uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x)framebuffer[y*480+x]=*v++;lv_display_flush_ready(d);}
@@ -69,16 +85,28 @@ int main(int argc,char **argv)
         point=(lv_point_t){.x=250,.y=280};held=true;advance(60);
         for(int y=290;y<=370;y+=10){point.y=y;advance(30);}held=false;advance(1100);
         assert(!route&&!ui.io_complete);lv_obj_scroll_to_y(list,0,LV_ANIM_OFF);advance(80);
-        lv_obj_t *refresh=lv_obj_get_parent(find(ui.screen,"刷新"));tap(refresh);assert(ui.io_complete&&lv_obj_has_state(refresh,LV_STATE_DISABLED));
+        lv_obj_t *refresh=lv_obj_get_parent(find(ui.screen,LV_SYMBOL_REFRESH));tap(refresh);assert(ui.io_complete&&lv_obj_has_state(refresh,LV_STATE_DISABLED));
         deliver(&ui,ESP_ERR_TIMEOUT);advance(80);assert(find(ui.screen,"读取失败"));assert(!lv_obj_has_state(refresh,LV_STATE_DISABLED));snapshot(d,argv[1],"files-after-error");
-        assert(lv_obj_has_state(lv_obj_get_parent(find(ui.screen,"上一页")),LV_STATE_DISABLED));assert(lv_obj_has_state(lv_obj_get_parent(find(ui.screen,"下一页")),LV_STATE_DISABLED));
+        assert(!find(ui.screen,"上一页")&&!find(ui.screen,"下一页"));
+        catalog_entries=4100;
+        tap(refresh);
+        assert(request.limit==4096&&request.offset==0);
+        deliver(&ui,ESP_OK);advance(80);
+        assert(lv_obj_get_child_count(list)==13&&find(ui.screen,"部分项目未索引"));
+        const unsigned scans=catalog_calls;
+        lv_obj_scroll_to_y(list,INT32_MAX,LV_ANIM_OFF);advance(120);
+        lv_obj_t *last=find(ui.screen,"track-4095.m4a");
+        assert(last&&lv_obj_is_visible(last)&&catalog_calls==scans);
+        tap(lv_obj_get_parent(last));
+        assert(route==2&&!strcmp(opened,"/sdcard/track-4095.m4a"));
+        catalog_entries=5;
         tap(refresh);assert(ui.io_complete);deliver(&ui,ESP_OK);mounted=false;advance(550);assert(find(ui.screen,"存储设备已移除"));
         assert(lv_obj_has_state(refresh,LV_STATE_DISABLED));mounted=true;advance(550);assert(ui.io_complete);deliver(&ui,ESP_OK);assert(find(ui.screen,"Mysterious Nue.m4a"));
         lv_timer_delete(ui.timer);ui.page_cleanup(&ui);lv_obj_delete(ui.screen);ui=(app_ui_t){.storage=(void*)1};
         app_open_files_path(&ui,"/sdcard/Recordings");assert(!strcmp(request.path,"/sdcard/Recordings"));
-        deliver(&ui,ESP_ERR_NOT_FOUND);advance(80);refresh=lv_obj_get_parent(find(ui.screen,"刷新"));
+        deliver(&ui,ESP_ERR_NOT_FOUND);advance(80);refresh=lv_obj_get_parent(find(ui.screen,LV_SYMBOL_REFRESH));
         assert(!lv_obj_has_state(refresh,LV_STATE_DISABLED));tap(refresh);assert(ui.io_complete);deliver(&ui,ESP_OK);
-        tap(lv_obj_get_parent(find(ui.screen,"上级目录")));assert(!strcmp(request.path,"/sdcard"));deliver(&ui,ESP_OK);
+        tap(lv_obj_get_parent(find(ui.screen,LV_SYMBOL_UP)));assert(!strcmp(request.path,"/sdcard"));deliver(&ui,ESP_OK);
         mounted=false;usb_blocked=true;advance(550);const unsigned before_ready=catalog_calls;
         mounted=true;advance(550);assert(catalog_calls==before_ready&&!ui.io_complete&&lv_obj_has_state(refresh,LV_STATE_DISABLED));
         usb_blocked=false;advance(550);assert(catalog_calls==before_ready+1&&ui.io_complete);deliver(&ui,ESP_OK);
@@ -88,7 +116,7 @@ int main(int argc,char **argv)
         for(unsigned i=0;i<lv_obj_get_child_count(ui.content);++i){lv_obj_t *o=lv_obj_get_child(ui.content,i);if(lv_obj_check_type(o,&lv_dropdown_class))source=o;}
         assert(source);usb_mounted=true;lv_dropdown_set_selected(source,1);lv_obj_send_event(source,LV_EVENT_VALUE_CHANGED,NULL);
         assert(ui.io_complete&&!strcmp(request.path,"/usb"));deliver(&ui,ESP_OK);
-        assert(lv_obj_has_state(lv_obj_get_parent(find(ui.screen,"上级目录")),LV_STATE_DISABLED));
+        assert(lv_obj_has_state(lv_obj_get_parent(find(ui.screen,LV_SYMBOL_UP)),LV_STATE_DISABLED));
         ++usb_generation;advance(550);
         assert(ui.io_complete&&!strcmp(request.path,"/usb"));deliver(&ui,ESP_OK);
         usb_mounted=false;advance(550);assert(find(ui.screen,"USB U盘未就绪")&&lv_obj_has_state(refresh,LV_STATE_DISABLED));
@@ -103,7 +131,7 @@ int main(int argc,char **argv)
         failed_fs=false;mounted=true;advance(550);assert(ui.io_complete);deliver(&ui,ESP_OK);
         puts("PASS FAT32 mount failure shows cached format/layout, permits bounded manual retry without formatting, and refreshes after recovery");
         puts("PASS files auto-refresh waits for both remount and USB-gate release; exactly one fresh catalog replaces the blocked state");
-        puts("PASS actual file browser: M4A route, bidirectional pointer scrolling without launch, retryable error/boundary states, card removal/reinsert and Recordings direct-entry/missing-folder retry/parent route");
+        puts("PASS file browser pointer scrolling, catalog-tail selection with 12 recycled rows, error/retry, hotplug and parent navigation");
     }
     lv_timer_delete(ui.timer);ui.page_cleanup(&ui);lv_obj_delete(ui.screen);lv_indev_delete(in);assert(lv_mem_test()==LV_RESULT_OK);lv_display_delete(d);lv_deinit();
 }

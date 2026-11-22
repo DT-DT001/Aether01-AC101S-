@@ -66,6 +66,11 @@ esp_err_t ac101s_audio_new(const ac101s_audio_config_t *config,
  * Starting an already active codec returns ESP_ERR_INVALID_STATE. */
 esp_err_t ac101s_audio_start(ac101s_audio_handle_t handle, int volume, float mic_gain_db);
 
+/** Play up to 5760 frames of 48 kHz stereo PCM16 through the local speaker.
+ * Uses the master volume and never changes the selected output. Playback,
+ * recording and board-owned audio have priority over the one-shot alert. */
+esp_err_t ac101s_audio_play_alert(ac101s_audio_handle_t handle, const int16_t *pcm, size_t frames);
+
 /** Mute/close the selected output and force the PA enable GPIO low. A failed
  * external stop keeps its ownership for retry; do not destroy its transport. */
 esp_err_t ac101s_audio_stop(ac101s_audio_handle_t handle);

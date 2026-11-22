@@ -9,6 +9,6 @@ cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
 "$out/tools_test"
 cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -pthread \
     -I"$repo/tests/tools/stubs" -I"$repo/tests/player/stubs" \
-    -I"$repo/components/aether_audio_player/include" -I"$repo/main" \
+    -I"$repo/components/aether_audio_player/include" -I"$repo/components/aether_wifi/include" -I"$repo/main" \
     "$repo/tests/tools/tools_worker_test.c" "$repo/main/app_tools_math.c" -lm -o "$out/tools_worker_test"
 "$out/tools_worker_test"

@@ -23,6 +23,7 @@ static unsigned manager_tasks;
 static atomic_bool hold_deinit, hold_controller_disable;
 static bool hold_connect,fail_host_disable;
 static bool hold_disconnect,fail_disconnect,pin_accepted,cfm_accepted;
+static unsigned rejected_passkeys;
 static atomic_uint connect_calls,disconnect_calls;
 static atomic_uint scan_calls,media_start_calls;
 static _Atomic(SemaphoreHandle_t) watched_producer;
@@ -93,6 +94,12 @@ esp_err_t esp_bt_gap_start_discovery(esp_bt_inq_mode_t m,uint8_t len,uint8_t rsp
 esp_err_t esp_bt_gap_cancel_discovery(void){esp_bt_gap_cb_param_t p={0};p.disc_st_chg.state=ESP_BT_GAP_DISCOVERY_STOPPED;gap(ESP_BT_GAP_DISC_STATE_CHANGED_EVT,&p);return ESP_OK;}
 esp_err_t esp_bt_gap_pin_reply(esp_bd_addr_t a,bool accept,uint8_t len,esp_bt_pin_code_t pin){(void)a;pin_accepted=accept;assert(len==4&&pin[0]=='0');return ESP_OK;}
 esp_err_t esp_bt_gap_ssp_confirm_reply(esp_bd_addr_t a,bool accept){(void)a;cfm_accepted=accept;return ESP_OK;}
+esp_err_t esp_bt_gap_ssp_passkey_reply(esp_bd_addr_t peer, bool accept, uint32_t passkey)
+{
+    assert(peer[0] == 1 && !accept && passkey == 0);
+    ++rejected_passkeys;
+    return ESP_OK;
+}
 esp_err_t esp_bt_gap_get_bond_device_list(int *count, esp_bd_addr_t *devices)
 {
     assert(count&&devices&&*count>=0);
@@ -365,6 +372,9 @@ static void connection_checks(aether_bluetooth_handle_t h)
     memset(&gap_param,0,sizeof(gap_param));gap_param.cfm_req.bda[0]=1;
     gap(ESP_BT_GAP_CFM_REQ_EVT,&gap_param);assert(cfm_accepted);
     gap_param.cfm_req.bda[0]=2;gap(ESP_BT_GAP_CFM_REQ_EVT,&gap_param);assert(!cfm_accepted);
+    gap_param.key_req.bda[0]=1;
+    gap(ESP_BT_GAP_KEY_REQ_EVT, &gap_param);
+    assert(rejected_passkeys == 1);
     memset(&gap_param,0,sizeof(gap_param));gap_param.acl_conn_cmpl_stat.bda[0]=1;
     gap_param.acl_conn_cmpl_stat.stat=(esp_bt_status_t)0x09;
     gap(ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT,&gap_param);

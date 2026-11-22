@@ -74,7 +74,7 @@ uint16_t app_nes_controls_map(void *context, const uint8_t keys[32])
 esp_err_t aether_usb_host_new(const aether_usb_host_config_t *c, aether_usb_host_handle_t *out)
 {
     outside_cache_lock(); assert(c && out && c->query_sink && c->set_vbus && c->input && c->context);
-    assert(c->keyboard_map==app_nes_controls_map);
+    assert(c->keyboard_map==app_nes_controls_map && c->camera_class_mask==4);
     assert(!configure_calls && !cc_reads && !vbus_calls && !input_calls && !diagnostic_calls && !revokes);
     callbacks=*c; ++new_calls; *out=new_error ? NULL : HOST; return new_error;
 }
@@ -88,6 +88,8 @@ esp_err_t aether_usb_host_set_enabled(aether_usb_host_handle_t h, bool enabled)
     if(command_error==ESP_OK)host_state.enabled=enabled;
     return command_error;
 }
+esp_err_t aether_usb_host_set_camera_profile(aether_usb_host_handle_t h, bool enabled)
+{ outside_cache_lock(); assert(h==HOST); (void)enabled; return ESP_OK; }
 esp_err_t aether_usb_host_get_status(aether_usb_host_handle_t h, aether_usb_host_status_t *s)
 { outside_cache_lock(); assert(h==HOST && s); ++status_calls; if(status_error)return status_error; *s=host_state; return ESP_OK; }
 esp_err_t aether_usb_host_disable_wait(aether_usb_host_handle_t h, uint32_t timeout)

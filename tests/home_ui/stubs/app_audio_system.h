@@ -15,3 +15,4 @@ void app_audio_system_get_snapshot(app_audio_system_snapshot_t *);
 esp_err_t app_audio_system_set_volume(uint8_t, bool);
 esp_err_t app_audio_system_toggle_mute(bool);
 esp_err_t app_audio_system_set_output(app_audio_output_t);
+struct aether_bluetooth *app_audio_system_bluetooth(void);

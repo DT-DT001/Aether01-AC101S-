@@ -37,6 +37,7 @@ typedef struct {
 
 /* Nonblocking GUI commands and cached status only. */
 esp_err_t app_otg_set_enabled(bool enabled);
+esp_err_t app_otg_set_camera_profile(bool enabled);
 esp_err_t app_otg_set_manual_enabled(bool enabled);
 /* One accessory lease. Acquire from OFF starts a manual session; acquire on an
  * existing user manual session borrows it. AUTO/teardown are not taken over.

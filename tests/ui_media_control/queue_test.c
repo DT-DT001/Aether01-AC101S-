@@ -25,7 +25,8 @@ static bool intercom_busy;
 static esp_err_t release_error,power_error;
 static app_power_status_t power_status;
 static unsigned labels_created,labels_deleted,homes;
-static lv_font_t test_font;
+const lv_font_t lv_font_montserrat_20=20;
+int64_t esp_timer_get_time(void){return 1;}
 esp_err_t app_io_media_release_status(app_io_handle_t io,bool *pending,esp_err_t *error)
 {assert(io==(void *)4&&pthread_equal(pthread_self(),gui));*pending=release_pending;*error=release_error;return ESP_OK;}
 esp_err_t app_power_get_status(const app_power_t *power,app_power_status_t *status)
@@ -36,18 +37,17 @@ void app_ui_show_home(app_ui_t *ui)
 {assert(ui&&pthread_equal(pthread_self(),gui));++homes;++ui->page_generation;}
 const char *esp_err_to_name(esp_err_t error)
 {return error==ESP_OK?"ESP_OK":error==ESP_ERR_TIMEOUT?"ESP_ERR_TIMEOUT":"ESP_FAIL";}
-const lv_font_t *app_ui_chinese_font(void){return &test_font;}
 lv_obj_t *app_ui_add_text(lv_obj_t *parent,const char *text,lv_align_t align,int32_t x,int32_t y,uint32_t color,const lv_font_t *font)
 {
-    assert(pthread_equal(pthread_self(),gui)&&parent==(void *)6&&align==LV_ALIGN_BOTTOM_MID);
-    assert(x==0&&y==-8&&color==0xFFD180&&font==&test_font);
+    assert(pthread_equal(pthread_self(),gui)&&parent==(void *)6&&align==LV_ALIGN_BOTTOM_RIGHT);
+    assert(x==-12&&y==-8&&color==0xFFD180&&font==&lv_font_montserrat_20);
     lv_obj_t *obj=calloc(1,sizeof(*obj));assert(obj);snprintf(obj->text,sizeof(obj->text),"%s",text);++labels_created;return obj;
 }
 void app_ui_label_text(lv_obj_t *obj,const char *text)
 {assert(obj&&pthread_equal(pthread_self(),gui));snprintf(obj->text,sizeof(obj->text),"%s",text);}
 void app_ui_label_fmt(lv_obj_t *obj,const char *format,...)
 {assert(obj&&pthread_equal(pthread_self(),gui));va_list ap;va_start(ap,format);vsnprintf(obj->text,sizeof(obj->text),format,ap);va_end(ap);}
-void lv_obj_set_size(lv_obj_t *obj,int32_t w,int32_t h){assert(obj&&w==440&&h==24&&pthread_equal(pthread_self(),gui));}
+void lv_obj_set_size(lv_obj_t *obj,int32_t w,int32_t h){assert(obj&&w==32&&h==26&&pthread_equal(pthread_self(),gui));}
 void lv_obj_set_style_text_align(lv_obj_t *obj,int align,int selector){assert(obj&&align==LV_TEXT_ALIGN_CENTER&&selector==0&&pthread_equal(pthread_self(),gui));}
 void lv_obj_set_style_bg_color(lv_obj_t *obj,uint32_t color,int selector){assert(obj&&color==0x10192A&&selector==0&&pthread_equal(pthread_self(),gui));}
 void lv_obj_set_style_bg_opa(lv_obj_t *obj,int opa,int selector){assert(obj&&opa==LV_OPA_90&&selector==0&&pthread_equal(pthread_self(),gui));}
@@ -185,12 +185,12 @@ static void test_release_feedback(void)
     assert(app_ui_queue_media_control(&ui,AETHER_BT_REMOTE_PLAY)==ESP_OK);
     release_pending=true;test_service_timer(&ui);
     assert(ui.media_control_blocked&&dispatched==before&&ui.media_release_notice);
-    assert(labels_created==created+1&&strstr(ui.media_release_notice->text,"正在停止媒体"));
+    assert(labels_created==created+1&&!strcmp(ui.media_release_notice->text,LV_SYMBOL_REFRESH));
     assert(app_ui_queue_media_control(&ui,AETHER_BT_REMOTE_PLAY)==ESP_ERR_INVALID_STATE);
     lv_obj_t *notice=ui.media_release_notice;
     release_error=ESP_ERR_TIMEOUT;test_service_timer(&ui);
     assert(ui.media_release_notice==notice&&labels_created==created+1);
-    assert(strstr(notice->text,"资源释放重试")&&strstr(notice->text,"ESP_ERR_TIMEOUT"));
+    assert(!strcmp(notice->text,LV_SYMBOL_WARNING));
     app_io_request_t q={.operation=APP_IO_MUSIC};app_ui_request_io_ex(&ui,&q,complete);
     deliver(&ui);assert(ui.media_control_blocked&&dispatched==before&&ui.media_release_notice==notice);
     release_pending=false;release_error=ESP_OK;ui.io_media_pending=true;test_service_timer(&ui);
@@ -216,9 +216,9 @@ static void test_power_and_user_key_service(void)
     test_service_timer(&ui);assert(ui.media_control_blocked);
     power_error=ESP_OK;test_service_timer(&ui);assert(!ui.media_control_blocked);
     ui.user_key_exit_pending=true;ui.user_key_requested_generation=ui.page_generation-1;
-    test_service_timer(&ui);assert(homes==home_before&&!ui.user_key_exit_pending);
+    test_service_timer(&ui);assert(homes==home_before&&!ui.user_key_exit_pending&&!ui.user_key_exit_armed);
     ui.user_key_exit_pending=true;ui.user_key_requested_generation=ui.page_generation;ui.test_input_blocked=true;
-    test_service_timer(&ui);assert(homes==home_before&&!ui.user_key_exit_pending);
+    test_service_timer(&ui);assert(homes==home_before&&!ui.user_key_exit_pending&&ui.user_key_exit_armed);
     ui.test_input_blocked=false;ui.user_key_exit_pending=true;ui.user_key_requested_generation=ui.page_generation;
     test_service_timer(&ui);assert(homes==home_before+1&&!ui.user_key_exit_pending&&dispatched==before);
     test_service_timer(&ui);assert(homes==home_before+1);

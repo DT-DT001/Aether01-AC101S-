@@ -30,7 +30,8 @@ void app_motion_filter_zero(app_motion_filter_t *f) {
     if(!f || !f->initialized) return;
     memcpy(f->reference,f->q,sizeof(f->reference)); angles(f);
 }
-bool app_motion_filter_update(app_motion_filter_t *f,const float a[3],const float gyro[3],uint32_t stamp) {
+static bool update_attitude(app_motion_filter_t *f,const float a[3],const float gyro[3],
+                            uint32_t stamp,bool use_gyro) {
     if(!f || !a || !gyro) return false;
     for(unsigned i=0;i<3;++i) if(!isfinite(a[i]) || !isfinite(gyro[i]) || fabsf(a[i])>200 || fabsf(gyro[i])>2200) return false;
     if(f->initialized && stamp==f->stamp) return false;
@@ -38,6 +39,8 @@ bool app_motion_filter_update(app_motion_filter_t *f,const float a[3],const floa
     if(f->initialized && elapsed>0x7fffffffU) return false;
     float n=sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);
     float speed=sqrtf(gyro[0]*gyro[0]+gyro[1]*gyro[1]+gyro[2]*gyro[2]);
+    const bool gravity_valid = n > G * .75f && n < G * 1.25f;
+    if (!use_gyro && !gravity_valid) return false;
     if(!f->initialized || elapsed>250) {
         if(n<0.1f) return false;
         float roll=atan2f(a[1],a[2]),pitch=atan2f(-a[0],hypotf(a[1],a[2]));
@@ -51,12 +54,15 @@ bool app_motion_filter_update(app_motion_filter_t *f,const float a[3],const floa
     float gravity[3]={2*(x*z-w*y),2*(w*x+y*z),1-2*(x*x+y*y)};
     float lin[3]={a[0]-gravity[0]*G,a[1]-gravity[1]*G,a[2]-gravity[2]*G};
     float linear=sqrtf(lin[0]*lin[0]+lin[1]*lin[1]+lin[2]*lin[2]);
-    float rate[3];for(unsigned i=0;i<3;++i) rate[i]=gyro[i]*RAD;
-    if(n>G*.75f && n<G*1.25f) {
+    float rate[3] = {0};
+    if (use_gyro) for (unsigned i = 0; i < 3; ++i) rate[i] = gyro[i] * RAD;
+    if (gravity_valid) {
+        /* When bias is unknown, follow gravity quickly without integrating drift. */
+        const float correction = use_gyro ? 1.8f : fminf(22.0f, 0.9f / fmaxf(dt, 0.001f));
         float m[3]={a[0]/n,a[1]/n,a[2]/n};
-        rate[0]+=1.8f*(m[1]*gravity[2]-m[2]*gravity[1]);
-        rate[1]+=1.8f*(m[2]*gravity[0]-m[0]*gravity[2]);
-        rate[2]+=1.8f*(m[0]*gravity[1]-m[1]*gravity[0]);
+        rate[0]+=correction*(m[1]*gravity[2]-m[2]*gravity[1]);
+        rate[1]+=correction*(m[2]*gravity[0]-m[0]*gravity[2]);
+        rate[2]+=correction*(m[0]*gravity[1]-m[1]*gravity[0]);
     }
     float dx=rate[0]*dt*.5f,dy=rate[1]*dt*.5f,dz=rate[2]*dt*.5f;
     f->q[0]=w-x*dx-y*dy-z*dz; f->q[1]=x+w*dx+y*dz-z*dy;
@@ -82,6 +88,14 @@ bool app_motion_filter_update(app_motion_filter_t *f,const float a[3],const floa
     f->history[f->history_next]=clamp(f->linear,0,20);f->history_next=(f->history_next+1)%48;
     f->stamp=stamp;
     return true;
+}
+bool app_motion_filter_update(app_motion_filter_t *f,const float a[3],
+                              const float gyro[3],uint32_t stamp) {
+    return update_attitude(f,a,gyro,stamp,true);
+}
+bool app_motion_filter_update_tilt(app_motion_filter_t *f,const float a[3],
+                                   const float gyro[3],uint32_t stamp,bool gyro_bias_valid) {
+    return update_attitude(f,a,gyro,stamp,gyro_bias_valid);
 }
 const char *app_motion_action_name(app_motion_action_t action) {
     static const char *const names[]={"等待采样","静止","倾斜","旋转","移动","摇晃","冲击","失重"};

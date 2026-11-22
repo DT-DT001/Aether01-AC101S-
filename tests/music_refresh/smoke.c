@@ -1,15 +1,6 @@
-/* Reuse the existing hardware/service doubles without changing its shared
- * volume test. Replace only IO completion with a controllable async queue. */
-#define main volume_smoke_original_main
-#define app_ui_request_io_ex volume_immediate_io
-#pragma GCC diagnostic push
-/* The imported C main relies on its standard implicit return0; after renaming
- * it is an unused fixture function, discarded by --gc-sections. */
-#pragma GCC diagnostic ignored "-Wreturn-type"
+/* Reuse hardware/service doubles. Supply a controllable async IO queue. */
+#define APP_VOLUME_UI_DOUBLES_ONLY
 #include "../volume_ui/smoke.c"
-#pragma GCC diagnostic pop
-#undef app_ui_request_io_ex
-#undef main
 
 static unsigned io_requests;
 static void (*pending_complete)(app_ui_t *, const app_io_result_t *);
@@ -78,6 +69,9 @@ int main(void)
 {
     lv_init();lv_display_t *d=lv_display_create(480,480);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(d,buffer,NULL,sizeof(buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
+    lv_indev_t *input=lv_indev_create();lv_indev_set_type(input,LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(input,d);lv_indev_set_read_cb(input,read_pointer);
+    lv_group_t *group=lv_group_create();lv_group_set_default(group);
     app_ui_t ui={.storage=(void*)1,.audio_player=(void*)2,.io=(void*)4};
     app_open_music(&ui);assert(io_requests==1&&pending_complete);advance(20);
     lv_obj_t *label=find(ui.screen,"刷新");assert(label);lv_obj_t *refresh=lv_obj_get_parent(label);
@@ -102,13 +96,41 @@ int main(void)
     catalog_complete=pending_complete;pending_complete=NULL;catalog_complete(&ui,&prepared);
     assert(ui_playlist_copies==copies);
 
+    enum { LONG_CATALOG_COUNT = 96 };
+    app_io_entry_t long_catalog[LONG_CATALOG_COUNT] = {0};
+    for (size_t i=0;i<LONG_CATALOG_COUNT;++i)
+        snprintf(long_catalog[i].path,sizeof(long_catalog[i].path),"/sdcard/Music/track-%02u.mp3",(unsigned)i);
+    lv_obj_send_event(refresh,LV_EVENT_CLICKED,NULL);assert(pending_complete);
+    catalog_complete=pending_complete;pending_complete=NULL;
+    prepared.entries=long_catalog;prepared.count=prepared.total_count=LONG_CATALOG_COUNT;
+    catalog_complete(&ui,&prepared);
+    lv_obj_t *library_button=lv_obj_get_parent(find(ui.screen,"曲库"));
+    lv_obj_send_event(library_button,LV_EVENT_CLICKED,NULL);advance(120);
+    lv_obj_t *first=find(ui.screen,"track-00.mp3");assert(first&&lv_obj_is_visible(first));
+    lv_obj_t *list=lv_obj_get_parent(lv_obj_get_parent(first));
+    assert(lv_obj_get_child_count(list)==13&&!find(ui.screen,"上一页")&&!find(ui.screen,"下一页"));
+    const unsigned scans=io_requests;
+    lv_group_focus_obj(lv_obj_get_parent(first));
+    for (size_t i=1;i<LONG_CATALOG_COUNT;++i) {
+        uint32_t key=LV_KEY_DOWN;
+        lv_obj_send_event(lv_group_get_focused(group),LV_EVENT_KEY,&key);
+        assert((size_t)(uintptr_t)lv_obj_get_user_data(lv_group_get_focused(group))==i);
+    }
+    advance(120);
+    lv_obj_t *last=find(ui.screen,"track-95.mp3");assert(last&&lv_obj_is_visible(last));
+    lv_area_t bounds;lv_obj_get_coords(lv_obj_get_parent(last),&bounds);
+    pointer=(lv_point_t){(bounds.x1+bounds.x2)/2,(bounds.y1+bounds.y2)/2};
+    held=true;advance(80);held=false;advance(80);
+    assert(ui_playlist_selects==old_selects+1&&ui_playlist_selected_index==95&&io_requests==scans);
+    puts("PASS music catalog keyboard navigation reaches recycled offscreen rows and pointer selects the actual track index");
     assert(music.active&&music.state==AETHER_AUDIO_PLAYING&&music.volume==100&&!music_updates);
     test_music_eq(&ui);
     if(ui.timer)lv_timer_delete(ui.timer);
     const unsigned releases=music_page_releases;
     if(ui.page_cleanup)ui.page_cleanup(&ui);
     assert(music_page_releases==releases+1&&!music.active&&!music.track_count&&!music.path[0]);
-    lv_obj_delete(ui.screen);assert(lv_mem_test()==LV_RESULT_OK);lv_display_delete(d);lv_deinit();
+    lv_obj_delete(ui.screen);lv_group_delete(group);lv_indev_delete(input);
+    assert(lv_mem_test()==LV_RESULT_OK);lv_display_delete(d);lv_deinit();
     puts("PASS real music UI async catalog ownership: repeated Refresh never queues/overwrites a pending completion, failed and empty scans allow retry, existing playback is preserved only while open; IO-prepared catalogs avoid GUI playlist copies and page exit requests complete media release");
     return 0;
 }

@@ -90,6 +90,16 @@ static void *dma_worker(void *unused)
 }
 static void original_flush(lv_display_t *display,const lv_area_t *area,uint8_t *pixels)
 {
+    (void)display;(void)area;(void)pixels;
+    abort();
+}
+esp_err_t esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t panel,int x1,int y1,int x2,int y2,const void *data)
+{
+    assert(panel==(void*)2);
+    lv_display_t *display=registered_display;
+    lv_area_t coordinates={x1,y1,x2-1,y2-1};
+    const lv_area_t *area=&coordinates;
+    const uint8_t *pixels=data;
     assert(pixels==mirror && !atomic_exchange(&dma_active,true));
     assert(area->x1>=0&&area->y1>=0&&area->x2<480&&area->y2<480);
     assert(!(area->x1&1)&&!(area->y1&1)&&(area->x2&1)&&(area->y2&1));
@@ -97,17 +107,13 @@ static void original_flush(lv_display_t *display,const lv_area_t *area,uint8_t *
     const size_t bytes=(size_t)width*height*2;assert(bytes&&bytes<=CAPACITY);
     lv_draw_buf_t *source=lv_display_get_buf_active(display);
     assert(source&&source->data!=mirror&&source->header.stride==width*2&&source->header.w==width&&source->header.h>=height);
-    assert(!memcmp(source->data,pixels,bytes));
-    uint8_t source_snapshot[CAPACITY];memcpy(source_snapshot,source->data,bytes);
-    /* Same single in-place swap as the installed esp_lvgl_port flush. */
-    lv_draw_sw_rgb565_swap(pixels,width*height);
-    assert(!memcmp(source->data,source_snapshot,bytes));
-    for(size_t i=0;i<bytes;i+=2){assert(pixels[i]==source_snapshot[i+1]);assert(pixels[i+1]==source_snapshot[i]);}
+    for(size_t i=0;i<bytes;i+=2){assert(pixels[i]==source->data[i+1]);assert(pixels[i+1]==source->data[i]);}
     ++submissions;if(lv_display_flush_is_last(display))++final_submissions;
     if(height>20&&width<480)++tall_regions;
     copied_bytes+=bytes;
     pthread_mutex_lock(&job_lock);assert(!pending);memcpy(expected,pixels,bytes);expected_bytes=bytes;pending=true;
     pthread_cond_signal(&job_ready);pthread_mutex_unlock(&job_lock);
+    return ESP_OK;
 }
 static void round_event(lv_event_t *event){app_display_rounder(lv_event_get_param(event));}
 static void observe(lv_event_t *event)
@@ -134,7 +140,7 @@ int main(void)
     lv_display_set_buffers(display,source1,source2,CAPACITY,LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display,original_flush);
     lv_display_add_event_cb(display,round_event,LV_EVENT_INVALIDATE_AREA,NULL);
-    assert(app_display_metrics_attach_staged_rgb565((void*)1,display,CAPACITY)==ESP_OK);
+    assert(app_display_metrics_attach_staged_rgb565((void*)1,(void*)2,display,CAPACITY)==ESP_OK);
     assert(app_display_sync_attach(display,(void*)1)==ESP_OK);
     lv_display_add_event_cb(display,observe,LV_EVENT_ALL,NULL);app_display_metrics_set_active(true);
     pthread_t worker;assert(!pthread_create(&worker,NULL,dma_worker,NULL));

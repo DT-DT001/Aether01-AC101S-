@@ -15,11 +15,15 @@ static bool check_local_pcm;
 static uint32_t local_pcm;
 static TickType_t ticks, lock_ticks, local_write_ticks;
 static int local_write_error;
+static bool checking_alert, short_alert_write;
+static unsigned alert_writes;
+static size_t alert_bytes;
 esp_err_t gpio_input_enable(gpio_num_t pin) { assert(pin == 42); return ESP_OK; }
 esp_err_t gpio_set_direction(gpio_num_t pin, int mode) { assert(pin == 42 && mode == GPIO_MODE_OUTPUT); return ESP_OK; }
 int gpio_get_level(gpio_num_t pin) { assert(pin == 42); return pa; }
 TickType_t xTaskGetTickCount(void) { return ticks; }
 int64_t esp_timer_get_time(void) { return (int64_t)ticks * 1000; }
+void vTaskDelay(TickType_t duration) { ticks += duration; }
 
 BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t timeout)
 {
@@ -75,10 +79,15 @@ esp_err_t ac101s_codec_set_speaker(i2c_master_dev_handle_t dev, unsigned volume)
 
 int i2s_channel_write(i2s_chan_handle_t tx, const void *data, size_t size, size_t *sent, unsigned timeout)
 {
-    assert(tx && size == 4 && timeout <= 1000);
+    assert(tx && timeout <= 1000);
+    if (checking_alert) {
+        assert(size && size <= 240 * 4 && !(size % 4) && timeout <= 100 && pa);
+        ++alert_writes;
+        alert_bytes += size;
+    } else assert(size == 4);
     ticks += local_write_ticks;
     if (check_local_pcm) memcpy(&local_pcm, data, 4);
-    *sent = size;
+    *sent = checking_alert && short_alert_write ? 0 : size;
     return local_write_error;
 }
 
@@ -337,5 +346,48 @@ int main(void)
     assert(ac101s_audio_stop(&audio)==ESP_OK);peer_connected=true;
     assert(ac101s_audio_set_output(&audio,AC101S_OUTPUT_SPEAKER)==ESP_OK);
     puts("PASS USB removal while STOP is published during transport cleanup cannot reopen speaker or continue media PCM");
+
+    const int16_t chirp[480 * 2] = {250, -250};
+    assert(ac101s_audio_set_output(&audio,AC101S_OUTPUT_USB)==ESP_OK);
+    const unsigned previous_starts=sink_starts, previous_stops=sink_stops;
+    const int previous_volume=audio.requested_volume;
+    const float previous_gain=audio.mic_gain_db;
+    checking_alert=true;
+    stage=0;
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_OK);
+    assert(alert_writes==2&&alert_bytes==sizeof(chirp)&&actual_volume==60);
+    assert(!pa&&!codec_open&&!audio.started&&!audio.board_owner&&!mutex.locked);
+    assert(audio.output==AC101S_OUTPUT_USB&&sink_starts==previous_starts&&sink_stops==previous_stops);
+    assert(audio.requested_volume==previous_volume&&audio.mic_gain_db==previous_gain&&audio.master_volume==100);
+    assert(ac101s_audio_play_alert(&audio,chirp,0)==ESP_ERR_INVALID_ARG);
+    assert(ac101s_audio_play_alert(&audio,chirp,5761)==ESP_ERR_INVALID_ARG);
+    assert(ac101s_audio_start(&audio,100,24)==ESP_OK);
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_ERR_INVALID_STATE&&audio.external_started);
+    assert(ac101s_audio_stop(&audio)==ESP_OK);
+    audio.capture_active=true;
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_ERR_INVALID_STATE&&audio.capture_active);
+    audio.capture_active=false;
+    stage=0;
+    const int intercom=1;
+    assert(ac101s_audio_board_start(&audio,&intercom,false,65,24)==ESP_OK);
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_ERR_INVALID_STATE&&audio.board_owner==&intercom&&pa);
+    assert(ac101s_audio_board_stop(&audio,&intercom)==ESP_OK&&alert_writes==2);
+    mutex.locked=true;
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_ERR_INVALID_STATE&&mutex.locked);
+    mutex.locked=false;
+    stage=0;short_alert_write=true;
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_FAIL&&!pa&&!codec_open&&!audio.started);
+    short_alert_write=false;stage=0;fail_close=true;
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_FAIL&&!pa&&!audio.local_ready);
+    assert(audio.started&&audio.alert_cleanup_pending&&!audio.board_owner&&audio.output==AC101S_OUTPUT_USB);
+    const unsigned after_alert=sink_starts;
+    assert(ac101s_audio_start(&audio,100,24)==ESP_FAIL&&sink_starts==after_alert);
+    fail_close=false;
+    assert(ac101s_audio_start(&audio,100,24)==ESP_OK&&sink_starts==after_alert+1);
+    assert(!audio.alert_cleanup_pending&&audio.external_started&&ac101s_audio_stop(&audio)==ESP_OK);
+    assert(ac101s_audio_set_master_volume(&audio,0)==ESP_OK);
+    const unsigned before_muted=alert_writes;
+    assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_OK&&alert_writes==before_muted&&!codec_open);
+    puts("PASS alert chunks remain bounded, yield to playback/capture/intercom, preserve USB route, respect mute, and recover a retained codec");
     return 0;
 }

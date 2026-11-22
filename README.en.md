@@ -4,7 +4,21 @@ This standalone firmware demo targets the AC101S edition of Aether01, a handheld
 
 [中文说明](README.md) · [AC101S hardware](https://github.com/DT-DT001/Aether01-Hardware-AC101S) · [I/O and power map](docs/hardware/io-power-map.md)
 
-The firmware includes music playback with a live five-band EQ, video, recording, a TXT reader, NES emulation, USB OTG, Wi-Fi, Bluetooth controls, and ESP-NOW push-to-talk. Build from this checkout using an ESP-IDF 6.1 environment with ESP32-S31 support.
+## Interface previews
+
+![Aether01 desktop and app drawer](docs/images/01-desktop-drawer.png)
+
+![Everyday apps on Aether01](docs/images/02-daily-apps.png)
+
+![2048, Sokoban, Snake, and platform jumping](docs/images/03-built-in-games.png)
+
+The 480 × 480 previews use the current firmware's LVGL interface with demo content.
+
+Swipe up from the desktop to open the app drawer. Returning to the drawer restores its scroll position. The drawer's Home button or a two-second hold of the physical user button opens the desktop.
+
+The firmware includes music playback with a live five-band EQ, video, recording, a TXT reader, NES emulation, USB OTG, Wi-Fi, Bluetooth controls, and ESP-NOW push-to-talk. Everyday tools include alarms, notes, a calendar, and weather. 2048 supports swipe and tilt controls. Sokoban and Snake respond to directional touch regions, and Snake also supports tilt.
+
+Build from this checkout using an ESP-IDF 6.1 environment with ESP32-S31 support.
 
 ```sh
 idf.py --preview set-target esp32s31

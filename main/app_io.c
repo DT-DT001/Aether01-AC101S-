@@ -82,6 +82,7 @@ static bool matches(const char *name, app_io_operation_t filter)
     case APP_IO_VIDEO: return !strcasecmp(dot, ".mjpg") || !strcasecmp(dot, ".mjpeg") || !strcasecmp(dot, ".avi") || !strcasecmp(dot, ".mp4") || !strcasecmp(dot, ".m4v");
     case APP_IO_NES: return !strcasecmp(dot, ".nes");
     case APP_IO_BOOK: return !strcasecmp(dot, ".txt");
+    case APP_IO_IMAGES: return !strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".bmp");
     default: return false;
     }
 }
@@ -112,7 +113,7 @@ static esp_err_t scan_directory(app_io_handle_t io, const char *directory,
         struct stat info;
         if (stat(item.path, &info)) continue;
         item.directory = S_ISDIR(info.st_mode);
-        if (item.directory ? filter != APP_IO_FILES : !matches(entry->d_name, filter)) continue;
+        if (item.directory ? filter != APP_IO_FILES && filter != APP_IO_IMAGES : !matches(entry->d_name, filter)) continue;
         item.size = item.directory ? 0 : (uint64_t)info.st_size;
         ++r->total_count;
         if (r->count >= CATALOG_MAX) { r->truncated = true; continue; }
@@ -197,8 +198,15 @@ typedef struct {
     uint64_t offset;
     uint8_t dark;
     char path[192];
+    uint8_t turn_mode; /* Version 3 uses the byte before the existing encoding field. */
     uint32_t encoding_hint; /* Version 2 uses previous tail padding; version 1 defaults to auto. */
 } reader_bookmark_t;
+
+static app_reader_turn_mode_t bookmark_turn_mode(unsigned mode)
+{
+    return mode < APP_READER_TURN_MODE_COUNT ? (app_reader_turn_mode_t)mode :
+        APP_READER_TURN_SWIPE_HORIZONTAL;
+}
 
 static esp_err_t bookmark(const app_io_request_t *q, app_io_result_t *r)
 {
@@ -218,7 +226,8 @@ static esp_err_t bookmark(const app_io_request_t *q, app_io_result_t *r)
         if (error == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
     }
     if (error != ESP_OK) return error;
-    reader_bookmark_t value = {.version = 2, .font_px = q->font_px, .offset = q->offset, .dark = q->dark,
+    reader_bookmark_t value = {.version = 3, .font_px = q->font_px, .offset = q->offset, .dark = q->dark,
+                               .turn_mode = bookmark_turn_mode(q->turn_mode),
                                .encoding_hint = q->encoding_hint <= 4 ? q->encoding_hint : 0};
     strlcpy(value.path, q->path, sizeof(value.path));
     if (save) {
@@ -226,7 +235,8 @@ static esp_err_t bookmark(const app_io_request_t *q, app_io_result_t *r)
         size_t length = sizeof(old);
         if (nvs_get_blob(nvs, key, &old, &length) == ESP_OK && length == sizeof(old) &&
             old.version == value.version && old.font_px == value.font_px && old.offset == value.offset &&
-            old.dark == value.dark && old.encoding_hint == value.encoding_hint && !strncmp(old.path, value.path, sizeof(old.path))) {
+            old.dark == value.dark && old.encoding_hint == value.encoding_hint &&
+            old.turn_mode == value.turn_mode && !strncmp(old.path, value.path, sizeof(old.path))) {
             error = nvs_commit(nvs); nvs_close(nvs); return error;
         }
         error = nvs_set_blob(nvs, key, &value, sizeof(value));
@@ -235,10 +245,11 @@ static esp_err_t bookmark(const app_io_request_t *q, app_io_result_t *r)
         size_t length = sizeof(value);
         error = nvs_get_blob(nvs, key, &value, &length);
         if (error == ESP_ERR_NVS_NOT_FOUND) error = ESP_OK;
-        else if (error == ESP_OK && length == sizeof(value) && (value.version == 1 || value.version == 2) &&
+        else if (error == ESP_OK && length == sizeof(value) && value.version >= 1 && value.version <= 3 &&
                  !strncmp(value.path, q->path, sizeof(value.path))) {
             r->offset = value.offset; r->font_px = value.font_px == 16 ? 16 : 24; r->dark = value.dark != 0;
-            r->encoding_hint = value.version == 2 && value.encoding_hint <= 4 ? value.encoding_hint : 0;
+            r->encoding_hint = value.version >= 2 && value.encoding_hint <= 4 ? value.encoding_hint : 0;
+            if (value.version >= 3) r->turn_mode = bookmark_turn_mode(value.turn_mode);
         }
     }
     nvs_close(nvs);
@@ -348,6 +359,7 @@ static esp_err_t perform_request(app_io_handle_t io, const app_io_request_t *q, 
                 r->font_px = saved->font_px == 16 ? 16 : 24;
                 r->dark = saved->dark;
                 r->encoding_hint = saved->encoding_hint <= 4 ? saved->encoding_hint : 0;
+                r->turn_mode = bookmark_turn_mode(saved->turn_mode);
                 return ESP_OK;
             }
         }

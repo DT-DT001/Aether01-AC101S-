@@ -67,6 +67,13 @@ static uint32_t uptime_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
+static float median_pressure(const float samples[3])
+{
+    const float low = fminf(samples[0], samples[1]);
+    const float high = fmaxf(samples[0], samples[1]);
+    return fmaxf(low, fminf(high, samples[2]));
+}
+
 void app_telemetry_get(app_telemetry_snapshot_t *snapshot)
 {
     if (snapshot) {
@@ -149,6 +156,8 @@ static void telemetry_task(void *argument)
     const uint32_t warm_until = uptime_ms() + 12000;
     bool warm_imu = s_warm_imu && board->imu_ready;
     bool previous_measurement = false;
+    float pressures[3] = {0};
+    unsigned pressure_count = 0, pressure_index = 0;
     unsigned imu_reads = 0, still_reads = 0;
     float raw_squared = 0, corrected_squared = 0;
     for (;;) {
@@ -174,6 +183,7 @@ static void telemetry_task(void *argument)
             media_due = now + 5000;
         }
         if (paused) {
+            pressure_count = pressure_index = 0;
             if (consumer) consumer(NULL);
             if (measurement_consumer) measurement_consumer(NULL);
             previous_measurement = false;
@@ -186,7 +196,10 @@ static void telemetry_task(void *argument)
         previous_measurement = measurement;
         const uint32_t activated = generation != previous_generation ? interest : 0;
         if (activated & APP_TELEMETRY_IMU) due_imu = now;
-        if (activated & APP_TELEMETRY_BAROMETER) due_baro = now;
+        if (activated & APP_TELEMETRY_BAROMETER) {
+            due_baro = now;
+            pressure_count = pressure_index = 0;
+        }
         previous_generation = generation;
 
         if (warm_imu && (int32_t)(now - warm_until) >= 0) {
@@ -201,10 +214,9 @@ static void telemetry_task(void *argument)
         const bool read_imu = sample_imu && (int32_t)(now - due_imu) >= 0;
         bool waiting_for_frame = false;
         if (read_imu) {
-            const esp_err_t imu_error = !board->imu_ready ? ESP_ERR_NOT_FOUND :
-                (measurement ? qmi8658a_read_fresh(board->imu, &next.imu) :
-                               qmi8658a_read(board->imu, &next.imu));
-            waiting_for_frame = measurement && imu_error == ESP_ERR_NOT_FINISHED;
+            const esp_err_t imu_error = board->imu_ready
+                ? qmi8658a_read_fresh(board->imu, &next.imu) : ESP_ERR_NOT_FOUND;
+            waiting_for_frame = imu_error == ESP_ERR_NOT_FINISHED;
             if (!waiting_for_frame) next.imu_error = imu_error;
             if (imu_error == ESP_OK) {
                 next.imu_updated_ms = uptime_ms();
@@ -223,15 +235,31 @@ static void telemetry_task(void *argument)
             }
             /* Anchor the fast cadence to the start of the transaction. A
              * late read produces one sample, with its actual timestamp. */
-            if (waiting_for_frame) due_imu = uptime_ms() + MEASUREMENT_IMU_RETRY_MS;
+            if (waiting_for_frame)
+                due_imu = uptime_ms() + (measurement ? MEASUREMENT_IMU_RETRY_MS : 5U);
             else if (imu_error == ESP_OK && measurement) due_imu = now + MEASUREMENT_IMU_PERIOD_MS;
             else due_imu = uptime_ms() + (imu_error == ESP_OK ? 20U : 2000U);
         }
         if ((interest & APP_TELEMETRY_BAROMETER) && (int32_t)(now - due_baro) >= 0) {
-            next.barometer_error = board->barometer_ready
-                ? dps368_read(board->barometer, &next.barometer) : ESP_ERR_NOT_FOUND;
-            if (next.barometer_error == ESP_OK) next.barometer_updated_ms = uptime_ms();
-            due_baro = uptime_ms() + (next.barometer_error == ESP_OK ? 700 : 2000);
+            dps368_sample_t reading;
+            const esp_err_t error = board->barometer_ready
+                ? dps368_read(board->barometer, &reading) : ESP_ERR_NOT_FOUND;
+            if (error == ESP_OK) {
+                pressures[pressure_index] = reading.pressure_pa;
+                pressure_index = (pressure_index + 1) % 3;
+                if (pressure_count < 3) ++pressure_count;
+                if (pressure_count == 3) reading.pressure_pa = median_pressure(pressures);
+                next.barometer = reading;
+                next.barometer_updated_ms = uptime_ms();
+                next.barometer_error = ESP_OK;
+                due_baro = now + 250;
+            } else if (error == ESP_ERR_NOT_FINISHED) {
+                due_baro = uptime_ms() + 70;
+            } else {
+                next.barometer_error = error;
+                pressure_count = pressure_index = 0;
+                due_baro = uptime_ms() + 2000;
+            }
         }
         if ((int32_t)(now - due_rtc) >= 0) {
             next.rtc_error = board->rtc_ready

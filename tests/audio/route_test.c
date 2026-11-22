@@ -66,6 +66,13 @@ int i2s_channel_write(i2s_chan_handle_t tx, const void *data, size_t bytes, size
     return ESP_OK;
 }
 
+int i2s_channel_read(i2s_chan_handle_t rx, void *data, size_t bytes, size_t *received, unsigned timeout)
+{
+    (void)rx; (void)data; (void)bytes; (void)received; (void)timeout;
+    assert(!"playback route tests must not open I2S capture");
+    return ESP_ERR_INVALID_STATE;
+}
+
 static bool connected(void *context) { assert(context==(void*)1); return true; }
 static esp_err_t transport_stop(void *context)
 { assert(context==(void*)1);atomic_store(&sink_cancelled,true);return ESP_OK; }

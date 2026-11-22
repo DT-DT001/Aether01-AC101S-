@@ -51,16 +51,22 @@ lv_obj_t *app_ui_add_text(lv_obj_t *p,const char *s,lv_align_t a,int32_t x,int32
 {lv_obj_t *o=lv_label_create(p);lv_label_set_text(o,s);lv_obj_set_style_text_font(o,f?f:app_ui_chinese_font(),0);lv_obj_set_style_text_color(o,lv_color_hex(c),0);lv_obj_align(o,a,x,y);return o;}
 void app_ui_media_control_gate(app_ui_t *ui,bool blocked,bool invalidate)
 {(void)ui;gate_blocked=blocked;if(invalidate)++gate_invalidations;}
+static void header_back(lv_event_t *event)
+{(void)app_ui_go_back(lv_event_get_user_data(event));}
 lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 {
     ++ui->page_generation;ui->io_complete=NULL;
     if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}
     if(ui->page_cleanup){void(*cb)(app_ui_t*)=ui->page_cleanup;ui->page_cleanup=NULL;cb(ui);}
-    ui->page_context=NULL;
+    ui->page_context=NULL;ui->page_back=NULL;
     lv_obj_t *old=ui->screen;
     ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x070A12),0);
     lv_obj_set_style_text_font(ui->screen,app_ui_chinese_font(),0);
+    lv_obj_t *back=lv_button_create(ui->screen);
+    lv_obj_set_pos(back,14,12);lv_obj_set_size(back,48,44);
+    lv_obj_add_event_cb(back,header_back,LV_EVENT_CLICKED,ui);
+    app_ui_add_text(back,LV_SYMBOL_LEFT,LV_ALIGN_CENTER,0,0,0xBFD7FF,&lv_font_montserrat_16);
     app_ui_add_text(ui->screen,title,LV_ALIGN_TOP_MID,0,20,0xEAF2FF,app_ui_chinese_font_size(24));
     ui->content=lv_obj_create(ui->screen);lv_obj_set_size(ui->content,448,394);
     lv_obj_align(ui->content,LV_ALIGN_BOTTOM_MID,0,-14);lv_obj_set_style_pad_all(ui->content,20,0);
@@ -68,6 +74,12 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
     lv_obj_set_style_bg_color(ui->content,lv_color_hex(0x10192A),0);lv_screen_load(ui->screen);
     if(old)lv_obj_delete(old);
     return ui->content;
+}
+bool app_ui_go_back(app_ui_t *ui)
+{
+    if (ui->page_back) ui->page_back(ui);
+    else app_ui_begin_page(ui,"应用抽屉");
+    return true;
 }
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t ms)
 {ui->timer=lv_timer_create(cb,ms,ui);}
@@ -148,16 +160,22 @@ int main(int argc,char **argv)
     assert(!lv_obj_has_state(start,LV_STATE_DISABLED|LV_STATE_PRESSED));
     capture(d,argv[1],"recorder-saved");
     tap(control(&ui,"回放录音"));assert(route==1&&!strcmp(opened,"/sdcard/Recordings/REC0001.wav")&&stop_calls==1);
+    assert(ui.page_back==app_open_recorder);
+    tap(control(&ui,LV_SYMBOL_LEFT));
+    assert(!ui.page_back&&find(ui.screen,"录音机")&&find(ui.screen,"录音已保存"));
 
-    app_open_recorder(&ui);advance(120);tap(control(&ui,"录音文件"));
-    assert(route==2&&!strcmp(opened,"/sdcard/Recordings"));
+    tap(control(&ui,"录音文件"));
+    assert(route==2&&!strcmp(opened,"/sdcard/Recordings")&&ui.page_back==app_open_recorder);
+    tap(control(&ui,LV_SYMBOL_LEFT));
+    assert(!ui.page_back&&find(ui.screen,"录音机")&&find(ui.screen,"录音已保存"));
     status=(aether_recorder_status_t){0};app_open_recorder(&ui);advance(120);tap(control(&ui,"开始录音"));
     void(*stale)(app_ui_t*,const app_io_result_t*)=ui.io_complete;assert(stale);
     app_io_result_t stale_result={.generation=request.generation,.operation=APP_IO_RECORDER,.error=ESP_OK};
     app_ui_begin_page(&ui,"离开");stale(&ui,&stale_result);assert(start_calls==1&&!gate_blocked);
     status=(aether_recorder_status_t){.active=true,.state=AETHER_RECORDER_RECORDING};
-    app_open_recorder(&ui);advance(120);assert(gate_blocked);app_ui_begin_page(&ui,"离开");
-    assert(stop_calls==2&&status.state==AETHER_RECORDER_SAVING&&!gate_blocked&&!ui.page_context);
+    app_open_recorder(&ui);advance(120);assert(gate_blocked);tap(control(&ui,LV_SYMBOL_LEFT));
+    assert(stop_calls==2&&status.state==AETHER_RECORDER_SAVING&&!gate_blocked&&!ui.page_context&&find(ui.screen,"应用抽屉"));
+    puts("PASS playback and recordings folder Back returns to recorder; recorder Back stops active capture and opens drawer");
 
     status=(aether_recorder_status_t){0};mounted=false;app_open_recorder(&ui);advance(120);
     assert(find(ui.screen,"请插入 TF 卡")&&lv_obj_has_state(control(&ui,"开始录音"),LV_STATE_DISABLED));

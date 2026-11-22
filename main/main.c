@@ -24,12 +24,16 @@
 #include "app_pc_remote.h"
 #include "app_displacement.h"
 #include "app_intercom.h"
+#include "app_utilities.h"
 #include "app_media_control.h"
 #ifdef AETHER_VIDEO_AUTOPROBE
 #include "app_video_probe.h"
 #endif
 #ifdef AETHER_RADIO_SELFTEST
 #include "app_radio_diagnostic.h"
+#endif
+#ifdef AETHER_UI_SELFTEST
+#include "app_ui_selftest.h"
 #endif
 #ifdef AETHER_AUDIO_DIAGNOSTIC
 #include "app_audio_diagnostic.h"
@@ -174,6 +178,7 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
         if(bluetooth && aether_bluetooth_get_status(bluetooth,&bt)==ESP_OK) state->bluetooth_audio_requested=bt.audio_requested;
         /* UI/IO reserve the same command gate used by USB entry before closing
          * the current reader and requesting every media owner to stop. */
+        app_tools_set_clock_quiesced(true);
         app_tools_snapshot_t tools;app_tools_get_snapshot(&tools);state->clock_pending=tools.clock_pending;state->clock_revision=tools.clock_revision;
         const esp_err_t ui_error=app_ui_quiesce_storage_begin(s_ui);
         app_intercom_leave();
@@ -203,7 +208,7 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
             app_audio_system_snapshot_t audio={0};app_audio_system_get_snapshot(&audio);
             app_tools_snapshot_t tools={0};app_tools_get_snapshot(&tools);
             app_nes_controls_snapshot_t controls={0};app_nes_controls_get_snapshot(&controls);
-            bool pending=controls.pending || app_pc_remote_save_pending() || app_intercom_busy() ||
+            bool pending=controls.pending || app_pc_remote_save_pending() || app_intercom_busy() || app_utilities_save_pending() ||
                 (audio.ready && !audio.controls_quiesced) || audio.persistence_pending || tools.preferences_pending || tools.clock_pending;
             if(state->clock_pending && !tools.clock_pending && tools.clock_error!=ESP_OK) return tools.clock_error;
             if(s_audio_player) {
@@ -220,7 +225,12 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
                 aether_bluetooth_status_t bt;error=aether_bluetooth_get_status(bluetooth,&bt);if(error!=ESP_OK) return error;
                 pending=pending || bt.enabled || bt.state!=AETHER_BT_OFF;
             }
-            if(!pending) break;
+            if(!pending) {
+                const esp_err_t utilities_error = app_utilities_save_error();
+                if (utilities_error != ESP_OK)
+                    ESP_LOGW(TAG, "utility preferences: %s", esp_err_to_name(utilities_error));
+                break;
+            }
             if(shutdown_remaining(deadline)<20) return ESP_ERR_TIMEOUT;
             vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -249,6 +259,7 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
             state->lease_gate=false;
         }
         app_audio_system_quiesce_controls(false);
+        app_tools_set_clock_quiesced(false);
         if(state->bluetooth_audio_requested && bluetooth) {
             esp_err_t result=aether_bluetooth_set_enabled(bluetooth,true);
             if(result!=ESP_OK) ESP_LOGW(TAG,"shutdown cancel Bluetooth enable: %s",esp_err_to_name(result));
@@ -270,10 +281,9 @@ static bool nes_input_gate(void *context)
     return app_power_is_sleeping(power);
 }
 
-static void user_key_pressed(void *context, int64_t pressed_at_us)
+static void intercom_user_key_tap(void *context, int64_t pressed_at_us)
 {
-    if (app_ui_input_blocked(context)) return;
-    if (!app_intercom_user_key(pressed_at_us)) app_ui_queue_user_key(context, pressed_at_us);
+    if (!app_ui_input_blocked(context)) (void)app_intercom_user_key(pressed_at_us);
 }
 
 /* Generic GUI navigation stays isolated from gameplay HID shortcuts. */
@@ -319,6 +329,41 @@ static esp_err_t init_nvs(void)
     return err;
 }
 
+enum { BOOT_LOGO_WIDTH = 432, BOOT_LOGO_HEIGHT = 203 };
+extern const uint8_t boot_logo_data[] asm("_binary_boot_logo_rgb565_start");
+static const lv_image_dsc_t boot_logo = {
+    .header = {
+        .magic = LV_IMAGE_HEADER_MAGIC,
+        .cf = LV_COLOR_FORMAT_RGB565,
+        .w = BOOT_LOGO_WIDTH,
+        .h = BOOT_LOGO_HEIGHT,
+        .stride = BOOT_LOGO_WIDTH * 2,
+    },
+    .data_size = BOOT_LOGO_WIDTH * BOOT_LOGO_HEIGHT * 2,
+    .data = boot_logo_data,
+};
+
+static esp_err_t present_boot_frame(lv_display_t *display)
+{
+    lv_obj_t *screen = lv_display_get_screen_active(display);
+    lv_obj_remove_style_all(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_t *logo = lv_image_create(screen);
+    lv_image_set_src(logo, &boot_logo);
+    lv_obj_center(logo);
+    lv_refr_now(display);
+
+    /* The SPI panel's command path drains the last queued color transfer
+     * before issuing DISPON. TE starts only after the panel is visible. */
+    app_display_metrics_t metrics;
+    app_display_metrics_get(&metrics);
+    if (!metrics.submitted_sequence || metrics.dropped_regions ||
+        metrics.flush_wait_timeouts || metrics.staging_error != ESP_OK)
+        return ESP_ERR_INVALID_STATE;
+    return esp_lcd_panel_disp_on_off(s_board.display, true);
+}
+
 static lv_display_t *init_lvgl(void)
 {
     lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
@@ -349,7 +394,6 @@ static lv_display_t *init_lvgl(void)
         .flags = {
             .buff_dma = false,
             .buff_spiram = true,
-            .swap_bytes = true,
         },
     };
     /* The port uses a recursive mutex. Install completion/wait hooks before
@@ -362,7 +406,7 @@ static lv_display_t *init_lvgl(void)
         return NULL;
     }
     const esp_err_t metrics_error = app_display_metrics_attach_staged_rgb565(
-        s_board.display_io, display,
+        s_board.display_io, s_board.display, display,
         CONFIG_AETHER_LCD_H_RES * CONFIG_AETHER_LCD_BUFFER_LINES * sizeof(uint16_t));
     if (metrics_error != ESP_OK) {
         /* PSRAM draw buffers require our reserved internal DMA mirror. Never
@@ -370,6 +414,12 @@ static lv_display_t *init_lvgl(void)
         lvgl_port_remove_disp(display);
         lvgl_port_unlock();
         ESP_LOGE(TAG, "reserved display DMA transport unavailable: %s", esp_err_to_name(metrics_error));
+        return NULL;
+    }
+    const esp_err_t logo_error = present_boot_frame(display);
+    if (logo_error != ESP_OK) {
+        lvgl_port_unlock();
+        ESP_LOGE(TAG, "boot frame unavailable: %s", esp_err_to_name(logo_error));
         return NULL;
     }
     const esp_err_t sync_error = app_display_sync_attach(display, s_board.display_io);
@@ -380,6 +430,16 @@ static lv_display_t *init_lvgl(void)
 
 void app_main(void)
 {
+    const esp_err_t display_err = aether_board_init_display(&s_board);
+    if (display_err != ESP_OK) {
+        ESP_LOGE(TAG, "display bring-up failed: %s; startup halted",
+                 esp_err_to_name(display_err));
+        return;
+    }
+    ESP_RETURN_VOID_ON_FALSE(s_board.display_ready, TAG, "display is not available");
+    lv_display_t *display = init_lvgl();
+    ESP_RETURN_VOID_ON_FALSE(display, TAG, "LVGL display is not available");
+
     /* The software decoder logs its version on every lag-recovery reopen.
      * An unread native USB console can block that video task for50ms. */
     esp_log_level_set("H264_DEC.SW", ESP_LOG_WARN);
@@ -398,7 +458,7 @@ void app_main(void)
         ESP_LOGW(TAG, "expected 32 MiB PSRAM, detected %u bytes", (unsigned)psram_size);
     }
 #endif
-    const esp_err_t board_err = aether_board_init(&s_board);
+    const esp_err_t board_err = aether_board_init_peripherals(&s_board);
     if (board_err != ESP_OK) {
         /* Rebooting would immediately retry the same possibly faulty load.
          * The board/PMIC failure paths perform their shutdown attempts first. */
@@ -408,12 +468,8 @@ void app_main(void)
     }
     app_telemetry_warm_imu();
     ESP_ERROR_CHECK(app_telemetry_start(&s_board));
-    ESP_RETURN_VOID_ON_FALSE(s_board.display_ready, TAG,
-                             "display is not available");
 
     lv_indev_t *touch_indev = NULL;
-    lv_display_t *display = init_lvgl();
-    ESP_RETURN_VOID_ON_FALSE(display, TAG, "LVGL display is not available");
 
     ESP_ERROR_CHECK(aether_storage_new(&s_board, &s_storage));
     const esp_err_t wifi_error = aether_wifi_new(&s_wifi);
@@ -494,6 +550,9 @@ void app_main(void)
 
     ESP_ERROR_CHECK(app_tools_init(&s_board));
     app_tools_set_persistence_guard(media_flash_busy, NULL);
+    const esp_err_t utilities_error = app_utilities_init(&s_board, &s_power, media_flash_busy, NULL);
+    if (utilities_error != ESP_OK)
+        ESP_LOGW(TAG, "utilities services unavailable: %s", esp_err_to_name(utilities_error));
     ESP_RETURN_VOID_ON_FALSE(lvgl_port_lock(1000), TAG, "LVGL lock timeout");
     const esp_err_t input_error = app_usb_input_init(&s_power, display);
     if (input_error != ESP_OK) ESP_LOGW(TAG, "USB pointer/keypad unavailable: %s", esp_err_to_name(input_error));
@@ -503,13 +562,17 @@ void app_main(void)
                                     &s_power, &s_ui);
     lvgl_port_unlock();
     ESP_ERROR_CHECK(ui_err);
-    ESP_ERROR_CHECK(app_power_set_user_key_handler(&s_power, user_key_pressed, s_ui));
+    ESP_ERROR_CHECK(app_power_set_user_key_handler(&s_power, app_ui_queue_user_key, s_ui));
+    ESP_ERROR_CHECK(app_power_set_user_key_tap_handler(&s_power, intercom_user_key_tap));
     ESP_ERROR_CHECK(app_power_set_shutdown_hook(&s_power, prepare_shutdown, &s_shutdown));
 
     ESP_LOGI(TAG, "Aether01 UI ready: %u apps, TF hot-plug, screen idle power management",
              (unsigned)app_home_app_count());
 #ifdef AETHER_GPS_DIAGNOSTIC
     ESP_LOGI(TAG, "GPS one-shot input-only probe: %s", esp_err_to_name(app_gps_diagnostic_start()));
+#endif
+#ifdef AETHER_UI_SELFTEST
+    ESP_LOGI(TAG, "on-target UI self-test: %s", esp_err_to_name(app_ui_selftest_start(s_ui)));
 #endif
 #ifdef AETHER_VIDEO_AUTOPROBE
     void (*probe_followup)(void *) = NULL;

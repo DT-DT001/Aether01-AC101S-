@@ -19,6 +19,7 @@ static lv_indev_t *input;
 static bool held,touch_enabled=true,immediate_preview;
 static bool storage_mounted=true,usb_blocked;
 static unsigned catalog_calls;
+static size_t catalog_fixture_count;
 static lv_point_t point;
 static int64_t now_us;
 static const char *output;
@@ -80,23 +81,47 @@ void app_ui_label_text(lv_obj_t *o,const char *s){if(strcmp(lv_label_get_text(o)
 void app_ui_label_fmt(lv_obj_t *o,const char *fmt,...){char s[1024];va_list a;va_start(a,fmt);vsnprintf(s,sizeof(s),fmt,a);va_end(a);app_ui_label_text(o,s);}
 lv_obj_t *app_ui_add_text(lv_obj_t *p,const char *s,lv_align_t a,int32_t x,int32_t y,uint32_t c,const lv_font_t *f)
 {lv_obj_t *o=lv_label_create(p);lv_label_set_text(o,s);lv_obj_set_style_text_font(o,f?f:app_ui_chinese_font(),0);lv_obj_set_style_text_color(o,lv_color_hex(c),0);lv_obj_align(o,a,x,y);return o;}
-static void old_back(lv_event_t *e){app_ui_show_home(lv_event_get_user_data(e));}
+static void header_back(lv_event_t *e){(void)app_ui_go_back(lv_event_get_user_data(e));}
 lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 {
     ++ui->page_generation;ui->io_complete=NULL;if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}
     if(ui->page_cleanup){void(*c)(app_ui_t*)=ui->page_cleanup;ui->page_cleanup=NULL;c(ui);}
-    ui->page_context=NULL;memset(ui->app_obj,0,sizeof(ui->app_obj));ui->app_path[0]=0;ui->app_value=0;ui->media_started=false;
+    ui->page_context=NULL;ui->page_back=NULL;memset(ui->app_obj,0,sizeof(ui->app_obj));ui->app_path[0]=0;ui->app_value=0;ui->media_started=false;
     lv_obj_t *old=ui->screen;ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x070A12),0);lv_obj_set_style_text_font(ui->screen,app_ui_chinese_font(),0);
-    lv_obj_t *b=lv_button_create(ui->screen);lv_obj_set_pos(b,14,12);lv_obj_set_size(b,72,44);lv_obj_add_event_cb(b,old_back,LV_EVENT_CLICKED,ui);
-    app_ui_add_text(b,"<",LV_ALIGN_CENTER,0,0,0xFFFFFF,app_ui_chinese_font());app_ui_add_text(ui->screen,title,LV_ALIGN_TOP_MID,0,20,0xFFFFFF,app_ui_chinese_font_size(24));
+    lv_obj_t *b=lv_button_create(ui->screen);lv_obj_set_pos(b,14,12);lv_obj_set_size(b,72,44);lv_obj_add_event_cb(b,header_back,LV_EVENT_CLICKED,ui);
+    app_ui_add_text(b,LV_SYMBOL_LEFT,LV_ALIGN_CENTER,0,0,0xFFFFFF,&lv_font_montserrat_16);app_ui_add_text(ui->screen,title,LV_ALIGN_TOP_MID,0,20,0xFFFFFF,app_ui_chinese_font_size(24));
     ui->content=lv_obj_create(ui->screen);lv_obj_set_size(ui->content,448,394);lv_obj_align(ui->content,LV_ALIGN_BOTTOM_MID,0,-14);lv_obj_set_style_pad_all(ui->content,20,0);lv_obj_set_style_border_width(ui->content,0,0);
     lv_screen_load(ui->screen);if(old)lv_obj_delete(old);return ui->content;
 }
 void app_ui_show_home(app_ui_t *ui){app_ui_begin_page(ui,"主页");}
+bool app_ui_go_back(app_ui_t *ui)
+{
+    if (ui->page_back) ui->page_back(ui);
+    else app_ui_begin_page(ui,"应用抽屉");
+    return true;
+}
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t ms){if(ui->timer)lv_timer_delete(ui->timer);ui->timer=lv_timer_create(cb,ms,ui);}
 void app_ui_request_io_ex(app_ui_t *ui,const app_io_request_t *q,void(*c)(app_ui_t*,const app_io_result_t*)){assert(!ui->io_complete);if(q->operation==APP_IO_CATALOG)++catalog_calls;request=*q;ui->io_complete=c;}
-static void deliver(app_ui_t *ui,esp_err_t error){assert(ui->io_complete);void(*c)(app_ui_t*,const app_io_result_t*)=ui->io_complete;ui->io_complete=NULL;app_io_result_t r={.operation=request.operation,.error=error};strlcpy(r.path,request.path,sizeof(r.path));c(ui,&r);}
+static void deliver(app_ui_t *ui,esp_err_t error)
+{
+    assert(ui->io_complete);
+    void (*complete)(app_ui_t*,const app_io_result_t*)=ui->io_complete;
+    ui->io_complete=NULL;
+    app_io_result_t r={.operation=request.operation,.error=error};
+    strlcpy(r.path,request.path,sizeof(r.path));
+    if (request.operation == APP_IO_CATALOG && catalog_fixture_count) {
+        r.count=r.total_count=catalog_fixture_count;
+        r.entries=calloc(r.count,sizeof(*r.entries));
+        assert(r.entries);
+        const bool games=request.filter==APP_IO_NES;
+        for (size_t i=0;i<r.count;++i)
+            snprintf(r.entries[i].path,sizeof(r.entries[i].path),"/sdcard/%s/item-%03u.%s",
+                games?"ROMs":"Video",(unsigned)i,games?"nes":"mp4");
+    }
+    complete(ui,&r);
+    free(r.entries);
+}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *bytes)
 {
     if(measure_flush){++flush_calls;flushed_pixels+=(uint64_t)lv_area_get_width(a)*lv_area_get_height(a);if(a->y1<flush_ymin)flush_ymin=a->y1;if(a->y2>flush_ymax)flush_ymax=a->y2;}
@@ -193,6 +218,7 @@ static void test_errors(app_ui_t *ui)
     video.state=AETHER_VIDEO_ERROR;video.last_error=ESP_ERR_NOT_SUPPORTED;strlcpy(video.detail,"Unsupported JPEG dimensions 480x270: both dimensions must be multiples of 16. Full reason ends here.",sizeof(video.detail));advance(120);
     assert(lv_obj_has_flag(ui->app_obj[0],LV_OBJ_FLAG_HIDDEN)&&strstr(lv_label_get_text(ui->app_obj[1]),"Full reason ends here."));assert(lv_obj_get_self_height(ui->app_obj[1])<=260);capture(ui,"video-error");advance(3300);assert(!hidden(ui->app_obj[2]));
     unsigned stops=video_stops,releases=video_releases;click(ui,"返回");assert(video_stops==stops+1&&video_releases==releases+1&&!ui->media_active);
+    assert(find(ui->screen,"应用抽屉")&&!ui->page_back);
     app_open_video_path(ui,"/sdcard/Video/test.mp4");deliver(ui,ESP_OK);video.state=AETHER_VIDEO_ERROR;video.last_error=ESP_ERR_NOT_SUPPORTED;strlcpy(video.detail,"Unsupported H.264 Main profile. Use constrained-baseline avc1 video, progressive I420, no B frames.",sizeof(video.detail));advance(120);
     assert(strstr(lv_label_get_text(ui->app_obj[1]),"no B frames.")&&strstr(lv_label_get_text(ui->app_obj[1]),"受限基线"));capture(ui,"video-mp4-error");app_open_video(ui);deliver(ui,ESP_OK);capture(ui,"video-empty");
     puts("PASS prepare barrier retries, persistent complete errors, restored fullscreen, MJPEG native/fixed FPS without fake seek/duration");
@@ -218,7 +244,7 @@ static void test_storage_ready(app_ui_t *ui)
 {
     void(*openers[])(app_ui_t*)={app_open_video,app_open_nes};
     for(unsigned i=0;i<2;++i){
-        storage_mounted=false;usb_blocked=true;openers[i](ui);deliver(ui,ESP_ERR_INVALID_STATE);
+        storage_mounted=false;usb_blocked=true;openers[i](ui);assert(!ui->io_complete);
         unsigned before=catalog_calls;storage_mounted=true;advance(550);
         assert(catalog_calls==before&&!ui->io_complete);
         usb_blocked=false;advance(550);assert(catalog_calls==before+1&&ui->io_complete);
@@ -226,12 +252,62 @@ static void test_storage_ready(app_ui_t *ui)
     }
     puts("PASS video/NES catalogs wait for remount plus USB-gate release, then auto-refresh exactly once");
 }
+static void test_catalog_end(app_ui_t *ui)
+{
+    void (*openers[])(app_ui_t*)={app_open_video,app_open_nes};
+    catalog_fixture_count=96;
+    for (unsigned i=0;i<2;++i) {
+        const char *first=i?"item-000.nes":"item-000.mp4";
+        const char *last=i?"item-095.nes":"item-095.mp4";
+        const char *picker_title=i?"选择 NES 游戏":"选择视频";
+        const app_io_operation_t filter=i?APP_IO_NES:APP_IO_VIDEO;
+        openers[i](ui);
+        assert(ui->io_complete&&request.offset==0&&request.limit==4096);
+        deliver(ui,ESP_OK);
+        advance(120);
+        lv_obj_t *label=find(ui->screen,first);
+        assert(label&&lv_obj_is_visible(label));
+        lv_obj_t *list=lv_obj_get_parent(lv_obj_get_parent(label));
+        assert(lv_obj_get_child_count(list)==13&&!find(ui->screen,"下一页"));
+        const unsigned before=catalog_calls;
+        lv_obj_scroll_to_y(list,INT32_MAX,LV_ANIM_OFF);
+        advance(120);
+        click(ui,last);
+        assert(ui->io_complete&&catalog_calls==before&&request.operation==APP_IO_PREPARE&&
+               request.filter==filter&&strstr(request.path,last)&&ui->page_back==openers[i]);
+
+        deliver(ui,ESP_OK);
+        assert(ui->media_active && ui->media_started);
+        if (i) {
+            const unsigned stops=nes_stops;
+            assert(!touch_enabled);
+            nes.state=AETHER_NES_STOPPED;
+            advance(220);
+            assert(nes_stops==stops+1 && ui->touch_restore_pending);
+            touch_enabled=true;
+            ui->touch_restore_pending=false;
+        } else {
+            const unsigned stops=video_stops;
+            advance(120);
+            click(ui,"返回");
+            assert(video_stops==stops+1);
+        }
+        assert(!ui->media_active && !ui->page_back && find(ui->screen,picker_title));
+        assert(ui->io_complete&&catalog_calls==before+1&&request.operation==APP_IO_CATALOG&&request.filter==filter);
+        deliver(ui,ESP_OK);
+        advance(120);
+        click(ui,LV_SYMBOL_LEFT);
+        assert(!ui->io_complete && find(ui->screen,"应用抽屉"));
+    }
+    catalog_fixture_count=0;
+    puts("PASS Video/NES catalogs scroll to the correct offscreen source; video Back and NES stop return to their picker; picker Back opens drawer");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);output=argv[1];setbuf(stdout,NULL);lv_init();lv_display_t *d=lv_display_create(480,480);assert(d);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);lv_display_set_buffers(d,draw_buffer,NULL,sizeof(draw_buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
     input=lv_indev_create();lv_indev_set_type(input,LV_INDEV_TYPE_POINTER);lv_indev_set_display(input,d);lv_indev_set_read_cb(input,read_input);lv_timer_set_period(lv_indev_get_read_timer(input),8);
     app_ui_t ui={.storage=(void*)1,.io=(void*)2,.video_player=(void*)1,.nes=(void*)1,.touch_indev=input};assert(app_frames_new(&ui.frames)==ESP_OK);active_ui=&ui;
-    test_video(&ui);test_seek_feedback(&ui);test_errors(&ui);test_storage_ready(&ui);test_nes(&ui);
+    test_video(&ui);test_seek_feedback(&ui);test_errors(&ui);test_storage_ready(&ui);test_catalog_end(&ui);test_nes(&ui);
     for(unsigned i=0;i<100;++i){app_open_video_path(&ui,"/sdcard/Video/test.avi");deliver(&ui,ESP_OK);app_open_nes_path(&ui,"/sdcard/ROMs/test.nes");deliver(&ui,ESP_OK);app_ui_show_home(&ui);assert(!ui.media_active&&!ui.timer&&!ui.page_context&&lv_mem_test()==LV_RESULT_OK);}
     active_ui=NULL;lv_obj_delete(ui.screen);app_frames_delete(ui.frames);lv_indev_delete(input);lv_display_delete(d);assert(lv_mem_test()==LV_RESULT_OK);lv_deinit();puts("PASS 100 fullscreen video/NES/home rebuilds with actual app_frames and LVGL allocator integrity; synthetic clips are not board performance");return 0;
 }

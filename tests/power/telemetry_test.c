@@ -13,6 +13,9 @@ static atomic_uint imu_reads, baro_reads, rtc_reads;
 static atomic_uint display_diagnostic_polls;
 static atomic_bool block_imu, imu_inside, unblock, quiesce_done, fail_imu;
 static atomic_bool no_new_imu_frame;
+static atomic_bool scripted_pressure;
+static atomic_bool pressure_waiting_frame, pressure_allow_fault;
+static atomic_uint pressure_attempts;
 static atomic_bool measurement_requested;
 static atomic_uint measurement_samples, measurement_pauses;
 static atomic_int measurement_last_error;
@@ -51,7 +54,26 @@ esp_err_t qmi8658a_read_fresh(void *h, qmi8658a_sample_t *s)
     return atomic_load(&no_new_imu_frame) ? ESP_ERR_NOT_FINISHED : qmi8658a_read(h, s);
 }
 esp_err_t dps368_read(void *h, dps368_sample_t *s)
-{ (void)h; atomic_fetch_add(&baro_reads, 1); s->pressure_pa = 100000; return ESP_OK; }
+{
+    (void)h;
+    atomic_fetch_add(&baro_reads, 1);
+    if (!atomic_load(&scripted_pressure)) {
+        s->pressure_pa = 100000;
+        return ESP_OK;
+    }
+    if (atomic_load(&pressure_attempts) == 3 && !atomic_load(&pressure_allow_fault)) {
+        atomic_store(&pressure_waiting_frame, true);
+        return ESP_ERR_NOT_FINISHED;
+    }
+    switch (atomic_fetch_add(&pressure_attempts, 1)) {
+    case 0: s->pressure_pa = 100001; break;
+    case 1: s->pressure_pa = 108000; break;
+    case 2: s->pressure_pa = 100004; break;
+    case 3: return ESP_FAIL;
+    default: s->pressure_pa = 100020; break;
+    }
+    return ESP_OK;
+}
 esp_err_t pcf85063_get_time(void *h, pcf85063_time_t *s)
 { (void)h; atomic_fetch_add(&rtc_reads, 1); s->value = 123; return ESP_OK; }
 static bool request_measurement(void)
@@ -80,8 +102,44 @@ static void await(atomic_bool *flag)
 { for (unsigned n = 0; n < 2000 && !atomic_load(flag); ++n) vTaskDelay(1); assert(atomic_load(flag)); }
 static void *quiesce_task(void *unused)
 { (void)unused; quiesce_result = app_telemetry_quiesce(500); atomic_store(&quiesce_done, true); return NULL; }
+static app_telemetry_snapshot_t await_pressure(esp_err_t error, float pressure, unsigned delay_ms)
+{
+    app_telemetry_snapshot_t snap;
+    const uint32_t began = (uint32_t)(monotonic_us() / 1000);
+    do {
+        app_telemetry_get(&snap);
+        if (snap.barometer_error == error &&
+            (error != ESP_OK || snap.barometer.pressure_pa == pressure)) return snap;
+        vTaskDelay(1);
+    } while ((uint32_t)(monotonic_us() / 1000) - began < delay_ms);
+    assert(!"expected pressure sample was not published");
+    return snap;
+}
+
+static void test_pressure_filter_recovery(void)
+{
+    atomic_store(&scripted_pressure, true);
+    app_telemetry_set_interest(APP_TELEMETRY_BAROMETER);
+    const app_telemetry_snapshot_t filtered = await_pressure(ESP_OK, 100004, 1500);
+    assert(atomic_load(&pressure_attempts) == 3);
+    await(&pressure_waiting_frame);
+    app_telemetry_snapshot_t snap;
+    app_telemetry_get(&snap);
+    assert(snap.barometer_error == ESP_OK && snap.barometer.pressure_pa == 100004);
+    assert(snap.barometer_updated_ms == filtered.barometer_updated_ms);
+    atomic_store(&pressure_allow_fault, true);
+    (void)await_pressure(ESP_FAIL, 0, 1000);
+    assert(atomic_load(&pressure_attempts) == 4);
+    const app_telemetry_snapshot_t recovered = await_pressure(ESP_OK, 100020, 3000);
+    assert(recovered.barometer_updated_ms - filtered.barometer_updated_ms >= 2000);
+    puts("PASS pressure spike median rejection, missing-frame cache retention, fault backoff and clean recovery");
+}
+
 int main(void)
 {
+    assert(median_pressure((float[]){100001,109000,100000}) == 100001);
+    assert(median_pressure((float[]){100001,96000,100000}) == 100000);
+    assert(median_pressure((float[]){100001,100001,100001}) == 100001);
     aether_board_t board = {.imu_ready = true, .barometer_ready = true, .rtc_ready = true, .display_io=(void *)1};
     app_telemetry_set_imu_measurement(request_measurement, consume_measurement);
     assert(app_telemetry_start(&board) == ESP_OK);
@@ -170,6 +228,7 @@ int main(void)
     vTaskDelay(80); const unsigned after_error = atomic_load(&imu_reads); vTaskDelay(180);
     assert(atomic_load(&imu_reads) == after_error);
     app_telemetry_get(&snap); assert(snap.imu_error == ESP_FAIL);
+    test_pressure_filter_recovery();
     app_telemetry_set_interest(0); assert(app_telemetry_quiesce(500) == ESP_OK);
     atomic_store(&finish_worker, true); assert(!pthread_join(worker, NULL));
     puts("PASS timeout retains the sampling gate, later acknowledgement recovers and I2C failure retains 2s backoff");

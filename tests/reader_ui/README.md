@@ -17,14 +17,17 @@ per encoding. Convert to PNG for inspection using the
 existing bundled Python/Pillow environment if desired.
 
 The smoke actually renders the book shelf, 16/24-pixel day/night reader,
-restored bookmark, hot-unplug/reinsert states, and music player/library. It
-drives 100 page turns and 200 reader/music page rebuilds for each encoding, checks bitmap
-rendering/allocator integrity with LVGL, and exercises pause/resume, previous/
+restored bookmark, hot-unplug/reinsert states, and music player/library. Each
+encoding exercises all four turn modes with real LVGL pointer input. The
+toolbar stays hidden on entry, opens on long press, and hides at three seconds.
+The selected turn mode persists across reopening. The suite drives 100 more
+page turns and 200 reader/music page rebuilds, checks bitmap rendering and
+allocator integrity with LVGL, and exercises pause/resume, previous/
 next track, repeat mode, volume, seek, and library track selection. Each valid
 Chinese fixture must show zero missing glyphs and zero malformed codes. Manual
-encoding switching is saved and restored on reopen. Seeking to 100% and moving
-to the previous page after reopen exercise source-offset mapping and the 32KiB
-UTF-8 backscan output needed to cover a 16KiB GBK/UTF-16 source span. Busy/OOM
+encoding switching is saved and restored on reopen. Seeking to 100%, reopening,
+turning to the previous page and advancing again verify the exact source-byte
+boundary after a reverse scan without page history. Busy/OOM
 playlist refresh preserves usable old row indices, with automatic busy retry.
 File-browser direct playback also checks that a timeout, busy, missing-storage
 or allocation error cannot start a new playlist and bypass the media-owner stop

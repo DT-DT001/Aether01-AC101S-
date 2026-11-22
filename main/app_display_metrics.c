@@ -2,6 +2,7 @@
 #include "esp_lvgl_port.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_lcd_panel_ops.h"
 #include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -20,6 +21,7 @@ static uint32_t s_window_frames;
 static struct {
     SemaphoreHandle_t signal;
     lv_display_flush_cb_t original;
+    esp_lcd_panel_handle_t panel;
     uint64_t submitted, completed;
     uint32_t calls, timeouts, max_wait_us;
     bool waiting, stalled;
@@ -58,36 +60,62 @@ static bool packed_rgb565_region(lv_display_t *display, const lv_area_t *area,
     return true;
 }
 
+static void copy_rgb565(uint8_t *dest, const uint8_t *source, size_t bytes)
+{
+    /* Even width and height make every packed region a multiple of 4 bytes.
+     * memcpy keeps this valid for any LVGL source alignment and aliases. */
+    for (size_t offset = 0; offset < bytes; offset += sizeof(uint32_t)) {
+        uint32_t pair;
+        memcpy(&pair, source + offset, sizeof(pair));
+        pair = ((pair & UINT32_C(0x00FF00FF)) << 8) |
+               ((pair & UINT32_C(0xFF00FF00)) >> 8);
+        memcpy(dest + offset, &pair, sizeof(pair));
+    }
+}
+
 static void submit_flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
 {
-    if (s_wait.mirror) {
-        /* Flush-ready can expose the next render buffer before the previous
-         * ISR has finished publishing completion. The single DMA mirror must
-         * remain immutable through that old sequence, regardless of tokens. */
-        wait_for_dma(display);
-        size_t bytes;
-        if (!packed_rgb565_region(display, area, pixels, &bytes)) {
-            portENTER_CRITICAL(&s_lock);
-            ++s_wait.dropped_regions; s_wait.staging_error = ESP_ERR_INVALID_ARG;
-            portEXIT_CRITICAL(&s_lock);
-            /* No new DMA or sequence was submitted. Release only this invalid
-             * LVGL chunk, without fabricating an LCD transport completion. */
-            lvgl_port_flush_ready(display);
-            return;
-        }
-        memcpy(s_wait.mirror, pixels, bytes);
+    if (!s_wait.panel) {
         portENTER_CRITICAL(&s_lock);
-        s_wait.copied_bytes += bytes; s_wait.staging_error = ESP_OK;
+        ++s_wait.submitted;
         portEXIT_CRITICAL(&s_lock);
-        /* The original port owns the one RGB565 byte swap, now on internal
-         * mirror memory. LVGL's PSRAM render source is never modified. */
-        pixels = s_wait.mirror;
+        s_wait.original(display, area, pixels);
+        return;
     }
+
+    /* Flush-ready can expose the next buffer before the previous ISR
+     * publishes completion. The mirror cannot be reused during that gap. */
     portENTER_CRITICAL(&s_lock);
-    ++s_wait.submitted;
-    lv_display_flush_cb_t original = s_wait.original;
+    const bool pending = s_wait.submitted != s_wait.completed;
     portEXIT_CRITICAL(&s_lock);
-    original(display, area, pixels);
+    if (pending) wait_for_dma(display);
+    size_t bytes;
+    if (!packed_rgb565_region(display, area, pixels, &bytes)) {
+        portENTER_CRITICAL(&s_lock);
+        ++s_wait.dropped_regions;
+        s_wait.staging_error = ESP_ERR_INVALID_ARG;
+        portEXIT_CRITICAL(&s_lock);
+        lvgl_port_flush_ready(display);
+        return;
+    }
+    copy_rgb565(s_wait.mirror, pixels, bytes);
+    portENTER_CRITICAL(&s_lock);
+    s_wait.copied_bytes += bytes;
+    s_wait.staging_error = ESP_OK;
+    ++s_wait.submitted;
+    portEXIT_CRITICAL(&s_lock);
+    const esp_err_t error = esp_lcd_panel_draw_bitmap(s_wait.panel, area->x1, area->y1,
+        area->x2 + 1, area->y2 + 1, s_wait.mirror);
+    if (error != ESP_OK) {
+        /* BSP max_transfer_bytes is at least one mirror capacity, so the
+         * driver queues a single color transaction or returns without one. */
+        portENTER_CRITICAL(&s_lock);
+        --s_wait.submitted;
+        ++s_wait.dropped_regions;
+        s_wait.staging_error = error;
+        portEXIT_CRITICAL(&s_lock);
+        lvgl_port_flush_ready(display);
+    }
 }
 
 static void wait_for_dma(lv_display_t *display)
@@ -171,7 +199,8 @@ static bool color_done(esp_lcd_panel_io_handle_t io,
     return woken == pdTRUE;
 }
 
-static esp_err_t attach(esp_lcd_panel_io_handle_t io, lv_display_t *display, size_t capacity)
+static esp_err_t attach(esp_lcd_panel_io_handle_t io, esp_lcd_panel_handle_t panel,
+                        lv_display_t *display, size_t capacity)
 {
     if (!io || !display) return ESP_ERR_INVALID_ARG;
     /* Attach before the first refresh while holding the recursive LVGL lock.
@@ -194,6 +223,7 @@ static esp_err_t attach(esp_lcd_panel_io_handle_t io, lv_display_t *display, siz
         portENTER_CRITICAL(&s_lock);
         s_wait.signal = signal;
         s_wait.original = display->flush_cb;
+        s_wait.panel = panel;
         s_wait.mirror = mirror;
         s_wait.capacity = capacity;
         s_display = display;
@@ -214,10 +244,11 @@ static esp_err_t attach(esp_lcd_panel_io_handle_t io, lv_display_t *display, siz
 }
 
 esp_err_t app_display_metrics_attach(esp_lcd_panel_io_handle_t io, lv_display_t *display)
-{ return attach(io, display, 0); }
+{ return attach(io, NULL, display, 0); }
 
-esp_err_t app_display_metrics_attach_staged_rgb565(esp_lcd_panel_io_handle_t io, lv_display_t *display, size_t capacity)
-{ return capacity ? attach(io, display, capacity) : ESP_ERR_INVALID_ARG; }
+esp_err_t app_display_metrics_attach_staged_rgb565(esp_lcd_panel_io_handle_t io,
+    esp_lcd_panel_handle_t panel, lv_display_t *display, size_t capacity)
+{ return panel && capacity ? attach(io, panel, display, capacity) : ESP_ERR_INVALID_ARG; }
 
 void app_display_metrics_set_active(bool active)
 {

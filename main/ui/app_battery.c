@@ -8,9 +8,10 @@
 #define BATTERY_MAX_AGE_MS 7000U
 
 typedef struct {
-    lv_obj_t *icon, *label;
+    lv_obj_t *body, *tip, *fill, *charge, *label;
     lv_timer_t *timer;
     uint32_t color;
+    unsigned percent;
 } battery_badge_t;
 
 static esp_err_t snapshot_error(const app_tools_snapshot_t *snapshot)
@@ -32,17 +33,6 @@ static bool percentage_valid(const tg29_battery_state_t *battery)
     return present(battery) && battery->percentage_valid && battery->percentage <= 100;
 }
 
-static const char *charge_text(const tg29_battery_state_t *battery)
-{
-    if (!present(battery)) return battery->vbus_present ? "USB" : "";
-    if (battery->current_direction == 2) return "放电";
-    if (battery->charge_state_valid && battery->vbus_present) {
-        if (battery->charging) return "充电";
-        if (battery->charge_done) return "已满";
-    }
-    return battery->vbus_present ? "USB" : "";
-}
-
 static void update_badge(battery_badge_t *badge)
 {
     app_tools_snapshot_t snapshot;
@@ -50,27 +40,30 @@ static void update_badge(battery_badge_t *badge)
     const tg29_battery_state_t *battery = &snapshot.battery;
     const bool readable = snapshot_error(&snapshot) == ESP_OK;
     const bool valid = readable && percentage_valid(battery);
-    const char *suffix = readable ? charge_text(battery) : "";
-    const char *icon = LV_SYMBOL_BATTERY_EMPTY;
-    uint32_t color = 0x8299B8;
-    char text[40];
-    if (valid) {
-        const unsigned percent = battery->percentage;
-        icon = percent > 75 ? LV_SYMBOL_BATTERY_FULL : percent > 50 ? LV_SYMBOL_BATTERY_3 :
-               percent > 25 ? LV_SYMBOL_BATTERY_2 : percent ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
-        color = percent <= 15 ? 0xFF879A : 0xD6E5F5;
-        if (percent > 15 && battery->current_direction != 2 && battery->vbus_present && battery->charge_state_valid &&
-            (battery->charging || battery->charge_done)) color = 0x8FE0BA;
-        snprintf(text, sizeof(text), "%u%%%s%s", percent, suffix[0] ? " " : "", suffix);
-    } else {
-        if (readable && battery->vbus_present) { icon = LV_SYMBOL_USB; color = 0x9BBAD8; }
-        snprintf(text, sizeof(text), "--%%%s%s", suffix[0] ? " " : "", suffix);
+    const bool on_usb = readable && present(battery) && battery->vbus_present &&
+        battery->charge_state_valid && battery->current_direction != 2;
+    const bool charging = on_usb && battery->charging;
+    const unsigned percent = valid ? battery->percentage : 0;
+    uint32_t color = valid ? (percent <= 15 ? 0xFF899D : 0xD5DEFB) : 0x7984A2;
+    if (charging || (on_usb && battery->charge_done && valid)) color = 0x82EBC1;
+    if (charging == lv_obj_has_flag(badge->charge, LV_OBJ_FLAG_HIDDEN)) {
+        if (charging) lv_obj_remove_flag(badge->charge, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(badge->charge, LV_OBJ_FLAG_HIDDEN);
     }
-    app_ui_label_text(badge->icon, icon);
-    app_ui_label_text(badge->label, text);
+    if (valid) app_ui_label_fmt(badge->label, "%u", percent);
+    else app_ui_label_text(badge->label, "--");
+    if (badge->percent != percent) {
+        badge->percent = percent;
+        if (percent) {
+            lv_obj_set_width(badge->fill, (34 * percent + 99) / 100);
+            lv_obj_remove_flag(badge->fill, LV_OBJ_FLAG_HIDDEN);
+        } else lv_obj_add_flag(badge->fill, LV_OBJ_FLAG_HIDDEN);
+    }
     if (badge->color != color) {
         badge->color = color;
-        lv_obj_set_style_text_color(badge->icon, lv_color_hex(color), 0);
+        lv_obj_set_style_border_color(badge->body, lv_color_hex(color), 0);
+        lv_obj_set_style_bg_color(badge->tip, lv_color_hex(color), 0);
+        lv_obj_set_style_bg_color(badge->fill, lv_color_hex(color), 0);
         lv_obj_set_style_text_color(badge->label, lv_color_hex(color), 0);
     }
 }
@@ -87,21 +80,38 @@ static void battery_delete(lv_event_t *event)
     free(badge);
 }
 
+static lv_obj_t *badge_shape(lv_obj_t *parent, int32_t width, int32_t height)
+{
+    lv_obj_t *shape = lv_obj_create(parent);
+    lv_obj_remove_style_all(shape);
+    lv_obj_remove_flag(shape, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(shape, width, height);
+    return shape;
+}
+
 lv_obj_t *app_battery_create(lv_obj_t *parent, int32_t width)
 {
     battery_badge_t *badge = calloc(1, sizeof(*badge));
     if (!badge) return NULL;
-    lv_obj_t *object = lv_obj_create(parent);
-    lv_obj_remove_style_all(object);
-    lv_obj_set_size(object, width, 26);
-    lv_obj_remove_flag(object, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *object = badge_shape(parent, width, 26);
     lv_obj_add_event_cb(object, battery_delete, LV_EVENT_DELETE, badge);
-    badge->icon = app_ui_add_text(object, LV_SYMBOL_BATTERY_EMPTY, LV_ALIGN_LEFT_MID,
-                                   0, 0, 0x8299B8, &lv_font_montserrat_20);
-    badge->label = app_ui_add_text(object, "--%", LV_ALIGN_LEFT_MID, 31, 0,
-                                    0x8299B8, app_ui_chinese_font());
-    lv_obj_set_width(badge->label, width - 31);
-    lv_label_set_long_mode(badge->label, LV_LABEL_LONG_CLIP);
+    badge->body = badge_shape(object, 40, 23);
+    lv_obj_set_style_radius(badge->body, 5, 0);
+    lv_obj_set_style_border_width(badge->body, 2, 0);
+    lv_obj_align(badge->body, LV_ALIGN_RIGHT_MID, -4, 0);
+    badge->tip = badge_shape(object, 3, 9);
+    lv_obj_set_style_radius(badge->tip, 2, 0);
+    lv_obj_set_style_bg_opa(badge->tip, LV_OPA_COVER, 0);
+    lv_obj_align(badge->tip, LV_ALIGN_RIGHT_MID, 0, 0);
+    badge->fill = badge_shape(badge->body, 34, 17);
+    lv_obj_set_style_radius(badge->fill, 2, 0);
+    lv_obj_set_style_bg_opa(badge->fill, LV_OPA_20, 0);
+    lv_obj_align(badge->fill, LV_ALIGN_LEFT_MID, 1, 0);
+    lv_obj_add_flag(badge->fill, LV_OBJ_FLAG_HIDDEN);
+    badge->label = app_ui_add_text(badge->body, "--", LV_ALIGN_CENTER, 0, 0,
+                                   0x7984A2, &lv_font_montserrat_16);
+    badge->charge = app_ui_add_text(object, LV_SYMBOL_CHARGE, LV_ALIGN_RIGHT_MID,
+                                    -50, 0, 0x82EBC1, &lv_font_montserrat_16);
     badge->timer = lv_timer_create(battery_timer, 1000, badge);
     if (!badge->timer) { lv_obj_delete(object); return NULL; }
     update_badge(badge);

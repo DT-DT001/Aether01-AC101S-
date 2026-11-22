@@ -52,6 +52,7 @@ static inline lv_draw_buf_t *lv_display_get_buf_active(lv_display_t *d) { return
 void lv_display_set_flush_cb(lv_display_t *,lv_display_flush_cb_t);
 void lv_display_set_flush_wait_cb(lv_display_t *,lv_display_flush_wait_cb_t);
 typedef void *esp_lcd_panel_io_handle_t;
+typedef void *esp_lcd_panel_handle_t;
 typedef struct { int unused; } esp_lcd_panel_io_event_data_t;
 typedef struct { bool (*on_color_trans_done)(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t *, void *); } esp_lcd_panel_io_callbacks_t;
 esp_err_t esp_lcd_panel_io_register_event_callbacks(esp_lcd_panel_io_handle_t, const esp_lcd_panel_io_callbacks_t *, void *);

@@ -38,7 +38,15 @@ typedef struct {
     TickType_t hold_started;
 } power_key_t;
 
-/* A falling-edge latch preserves short taps between100ms power-service polls.
+typedef struct {
+    bool down;
+    bool consumed;
+    int64_t started_at_us;
+} user_key_t;
+
+#define USER_KEY_HOLD_US INT64_C(2000000)
+
+/* The falling-edge latch preserves taps for screen wake between worker polls.
  * The shared GPIO ISR service is never uninstalled by this application. */
 static void user_key_interrupt(void *context)
 {
@@ -59,26 +67,39 @@ static void user_key_interrupt(void *context)
     }
 }
 
-static void dispatch_user_key(app_power_t *manager, bool pressed, bool *was_down)
+static void dispatch_user_key(app_power_t *manager, bool pressed, user_key_t *key)
 {
+    const int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_settings_lock);
     const bool edge = manager->user_key_irq_pending;
-    const int64_t pressed_at_us = edge ? manager->user_key_irq_at_us : esp_timer_get_time();
+    const int64_t pressed_at_us = edge ? manager->user_key_irq_at_us : now;
     manager->user_key_irq_pending = false;
     const bool sleeping = manager->sleeping || manager->sleep_requested;
     const bool blocked = manager->shutdown_state == APP_POWER_SHUTDOWN_PREPARING ||
         manager->shutdown_state == APP_POWER_SHUTDOWN_REQUESTED ||
         manager->shutdown_cancel_error != ESP_OK || manager->sensor_restore_error != ESP_OK;
     void (*handler)(void *, int64_t) = manager->user_key_handler;
+    void (*tap_handler)(void *, int64_t) = manager->user_key_tap_handler;
     void *context = manager->user_key_context;
     portEXIT_CRITICAL(&s_settings_lock);
-    if (!*was_down && (pressed || edge) && !blocked) {
-        if (sleeping) {
-            ESP_LOGI(TAG, "wake from BOOT key; consume application action");
-            (void)app_power_wake(manager);
-        } else if (handler) handler(context,pressed_at_us);
+    const bool wake = !key->down && (pressed || edge) && sleeping && !blocked;
+    if (!pressed) {
+        const int64_t started = key->down ? key->started_at_us : pressed_at_us;
+        const bool tap = (key->down || edge) && !key->consumed && !sleeping && !blocked &&
+                         now - started < USER_KEY_HOLD_US;
+        *key = (user_key_t){0};
+        if (tap && tap_handler) tap_handler(context, started);
+    } else {
+        if (!key->down || (edge && !key->consumed))
+            key->started_at_us = pressed_at_us;
+        key->down = true;
+        if (sleeping || blocked) key->consumed = true;
+        if (!key->consumed && now - key->started_at_us >= USER_KEY_HOLD_US) {
+            key->consumed = true;
+            if (handler) handler(context, key->started_at_us);
+        }
     }
-    *was_down = pressed;
+    if (wake) (void)app_power_wake(manager);
 }
 
 /* A physically black screen keeps wake priority, even if another wake request
@@ -469,7 +490,7 @@ static void power_task(void *argument)
     TickType_t key_retry_due = 0;
     TickType_t sensor_retry_due = 0;
     TickType_t cancel_retry_due = 0;
-    bool boot_down = false;
+    user_key_t user_key = {0};
     power_key_t key = {0};
     esp_err_t previous_cc_error = ESP_OK;
     for (;;) {
@@ -527,7 +548,7 @@ static void power_task(void *argument)
             cc_poll_due = tick_now + pdMS_TO_TICKS(500);
         }
         const bool boot_pressed = gpio_get_level(AETHER_GPIO_BOOT_KEY) == 0;
-        dispatch_user_key(manager, boot_pressed, &boot_down);
+        dispatch_user_key(manager, boot_pressed, &user_key);
         if (display_backoff && (int32_t)(tick_now - display_retry_due) >= 0) {
             display_backoff = false;
         }
@@ -566,6 +587,10 @@ static void power_task(void *argument)
             const bool sampled = read_activity_tick(manager->display, &inactive, &activity);
             esp_err_t err = ESP_OK;
             (void)sampled; /* Activity controls idle timeout, never screen wake. */
+            if (boot_pressed && !manager->sleeping && !sleep_requested) {
+                lv_display_trigger_activity(manager->display);
+                inactive = 0;
+            }
             const bool allow_panel_io = !display_backoff ||
                                        request_revision != failed_request_revision;
             bool attempted_sleep = false;
@@ -825,6 +850,15 @@ esp_err_t app_power_set_user_key_handler(app_power_t *manager, void (*handler)(v
     portENTER_CRITICAL(&s_settings_lock);
     manager->user_key_handler = handler; manager->user_key_context = context;
     manager->user_key_irq_pending = false;
+    portEXIT_CRITICAL(&s_settings_lock);
+    return ESP_OK;
+}
+
+esp_err_t app_power_set_user_key_tap_handler(app_power_t *manager, void (*handler)(void *, int64_t))
+{
+    if (!manager || !manager->task) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_settings_lock);
+    manager->user_key_tap_handler = handler;
     portEXIT_CRITICAL(&s_settings_lock);
     return ESP_OK;
 }

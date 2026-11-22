@@ -19,6 +19,7 @@ static const char *TAG = "ac101s_audio";
 enum {
     AUDIO_DMA_FRAMES = 240,
     PCM16_STEREO_BYTES = 4,
+    ALERT_MAX_FRAMES = 5760,
 };
 
 struct ac101s_audio_dev_t {
@@ -29,6 +30,7 @@ struct ac101s_audio_dev_t {
     uint32_t sample_rate_hz;
     bool started;
     bool local_ready;
+    bool alert_cleanup_pending;
     bool external_started;
     bool external_ready;
     bool capture_active;
@@ -201,6 +203,13 @@ static esp_err_t start_locked(ac101s_audio_handle_t handle, int volume, float mi
     return ESP_OK;
 }
 
+static esp_err_t stop_locked(ac101s_audio_handle_t handle);
+
+static esp_err_t recover_alert_locked(ac101s_audio_handle_t handle)
+{
+    return handle->alert_cleanup_pending ? stop_locked(handle) : ESP_OK;
+}
+
 esp_err_t ac101s_audio_start(ac101s_audio_handle_t handle, int volume, float mic_gain_db)
 {
     ESP_RETURN_ON_FALSE(handle && handle->codec, ESP_ERR_INVALID_ARG, TAG, "invalid handle");
@@ -208,11 +217,13 @@ esp_err_t ac101s_audio_start(ac101s_audio_handle_t handle, int volume, float mic
                         mic_gain_db >= 0.0f && mic_gain_db <= 42.0f,
                         ESP_ERR_INVALID_ARG, TAG, "invalid volume or microphone gain");
     if (xSemaphoreTake(handle->mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    /* An explicit new session may acknowledge an earlier failed STOP only
-     * once the old session is already inactive under the codec mutex. */
-    if (!handle->started) atomic_store(&handle->stop_completed, atomic_load(&handle->stop_serial));
-    const esp_err_t error = handle->board_owner ? ESP_ERR_INVALID_STATE :
-        start_locked(handle, volume, mic_gain_db);
+    esp_err_t error = recover_alert_locked(handle);
+    if (error == ESP_OK) {
+        /* A new session may acknowledge an earlier STOP only once the old
+         * session is already inactive under the codec mutex. */
+        if (!handle->started) atomic_store(&handle->stop_completed, atomic_load(&handle->stop_serial));
+        error = handle->board_owner ? ESP_ERR_INVALID_STATE : start_locked(handle, volume, mic_gain_db);
+    }
     xSemaphoreGive(handle->mutex);
     return error;
 }
@@ -222,6 +233,7 @@ static esp_err_t stop_locked(ac101s_audio_handle_t handle)
     const esp_err_t pa_err = gpio_set_level(handle->pa_enable, 0);
     handle->local_ready = false;
     if (!handle->started) {
+        if (pa_err == ESP_OK) handle->alert_cleanup_pending = false;
         return pa_err;
     }
     if (handle->external_started) {
@@ -233,6 +245,7 @@ static esp_err_t stop_locked(ac101s_audio_handle_t handle)
     }
     const esp_err_t err = ac101s_codec_stop(handle->codec);
     if (err == ESP_OK) handle->started = false;
+    if (err == ESP_OK && pa_err == ESP_OK) handle->alert_cleanup_pending = false;
     return pa_err != ESP_OK ? pa_err : err;
 }
 
@@ -286,7 +299,9 @@ esp_err_t ac101s_audio_capture_start(ac101s_audio_handle_t handle, float gain_db
         return ESP_ERR_INVALID_ARG;
     if (handle->sample_rate_hz != 48000) return ESP_ERR_NOT_SUPPORTED;
     if (xSemaphoreTake(handle->mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    const esp_err_t err = handle->board_owner ? ESP_ERR_INVALID_STATE : capture_start_locked(handle, gain_db);
+    esp_err_t err = recover_alert_locked(handle);
+    if (err == ESP_OK)
+        err = handle->board_owner ? ESP_ERR_INVALID_STATE : capture_start_locked(handle, gain_db);
     xSemaphoreGive(handle->mutex);
     return err;
 }
@@ -329,6 +344,44 @@ static esp_err_t board_pcm_locked(ac101s_audio_handle_t handle, bool capture, vo
     return ESP_OK;
 }
 
+esp_err_t ac101s_audio_play_alert(ac101s_audio_handle_t handle, const int16_t *pcm, size_t frames)
+{
+    static const char alert_owner;
+    if (!handle || !handle->codec || !handle->tx || !pcm || !frames || frames > ALERT_MAX_FRAMES)
+        return ESP_ERR_INVALID_ARG;
+    if (handle->sample_rate_hz != 48000) return ESP_ERR_NOT_SUPPORTED;
+    if (xSemaphoreTake(handle->mutex, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t error = recover_alert_locked(handle);
+    if (error == ESP_OK && (handle->started || handle->capture_active || handle->board_owner ||
+        atomic_load(&handle->stop_serial) != atomic_load(&handle->stop_completed)))
+        error = ESP_ERR_INVALID_STATE;
+    if (error == ESP_OK && handle->master_volume) {
+        const int previous_volume = handle->requested_volume;
+        const float previous_gain = handle->mic_gain_db;
+        /* The local-only owner token keeps a configured USB/BT sink untouched.
+         * Holding the mutex over the burst makes ordinary starts serialize
+         * behind it instead of mistaking it for an active media session. */
+        handle->board_owner = &alert_owner;
+        error = start_locked(handle, 85, 24.0f);
+        if (error == ESP_OK) {
+            const size_t bytes = frames * PCM16_STEREO_BYTES;
+            error = board_pcm_locked(handle, false, (void *)pcm, bytes,
+                                     xTaskGetTickCount(), pdMS_TO_TICKS(200));
+            /* An accepted write still leaves up to one I2S DMA ring queued. */
+            if (error == ESP_OK) vTaskDelay(pdMS_TO_TICKS(40));
+        }
+        const esp_err_t stopped = stop_locked(handle);
+        handle->alert_cleanup_pending = stopped != ESP_OK;
+        if (error == ESP_OK) error = stopped;
+        handle->board_owner = NULL;
+        handle->requested_volume = previous_volume;
+        handle->mic_gain_db = previous_gain;
+    }
+    xSemaphoreGive(handle->mutex);
+    return error;
+}
+
 esp_err_t ac101s_audio_capture_read(ac101s_audio_handle_t handle, void *data, size_t bytes)
 {
     if (!handle || !data || !bytes || bytes > INT_MAX || bytes % 4U) return ESP_ERR_INVALID_ARG;
@@ -367,13 +420,13 @@ esp_err_t ac101s_audio_board_start(ac101s_audio_handle_t handle, const void *own
         return ESP_ERR_INVALID_ARG;
     if (handle->sample_rate_hz != 48000) return ESP_ERR_NOT_SUPPORTED;
     if (xSemaphoreTake(handle->mutex, pdMS_TO_TICKS(60)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    esp_err_t err = ESP_ERR_INVALID_STATE;
-    if (!handle->board_owner && !handle->capture_active && !handle->started) {
+    esp_err_t err = recover_alert_locked(handle);
+    if (err == ESP_OK && !handle->board_owner && !handle->capture_active && !handle->started) {
         handle->board_owner = owner;
         err = capture ? capture_start_locked(handle, gain_db) : start_locked(handle, volume, gain_db);
         handle->board_ready = err == ESP_OK;
         if (!handle->capture_active && !handle->started) handle->board_owner = NULL;
-    }
+    } else if (err == ESP_OK) err = ESP_ERR_INVALID_STATE;
     xSemaphoreGive(handle->mutex);
     return err;
 }
@@ -694,6 +747,11 @@ esp_err_t ac101s_audio_set_output(ac101s_audio_handle_t handle, ac101s_audio_out
         return ESP_ERR_INVALID_ARG;
     const unsigned stop_serial = atomic_load(&handle->stop_serial);
     if (xSemaphoreTake(handle->mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    const esp_err_t alert_recovery = recover_alert_locked(handle);
+    if (alert_recovery != ESP_OK) {
+        xSemaphoreGive(handle->mutex);
+        return alert_recovery;
+    }
     if (handle->board_owner || handle->capture_active) {
         const esp_err_t result = output == handle->output ? ESP_OK : ESP_ERR_INVALID_STATE;
         xSemaphoreGive(handle->mutex);

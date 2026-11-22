@@ -1,10 +1,12 @@
 #include "app_ui_modal.h"
 #include "app_ui_internal.h"
+#include "app_screen.h"
 #include "app_battery.h"
 #include "app_touch.h"
 #include "app_display_metrics.h"
 #include "app_telemetry.h"
 #include "app_intercom.h"
+#include "app_utilities.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -120,11 +122,26 @@ lv_obj_t *app_ui_add_text(lv_obj_t *parent, const char *text,
     return label;
 }
 
+static bool navigate(app_ui_t *ui, void (*destination)(app_ui_t *))
+{
+    if (ui->page_can_exit && !ui->page_can_exit(ui, destination)) return false;
+    destination(ui);
+    return true;
+}
+
+static bool request_home(app_ui_t *ui)
+{
+    return navigate(ui, app_ui_show_home);
+}
+
+bool app_ui_go_back(app_ui_t *ui)
+{
+    return navigate(ui, ui->page_back ? ui->page_back : app_ui_show_drawer);
+}
+
 static void back_event_cb(lv_event_t *event)
 {
-    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
-        app_ui_show_home(lv_event_get_user_data(event));
-    }
+    (void)app_ui_go_back(lv_event_get_user_data(event));
 }
 
 void app_ui_set_user_key_exit(app_ui_t *ui, bool enabled)
@@ -156,8 +173,9 @@ static void service_user_key(app_ui_t *ui)
     const uint32_t generation = ui->user_key_requested_generation;
     ui->user_key_exit_pending = false;
     portEXIT_CRITICAL(&ui->media_control_lock);
-    if (pending && generation == ui->page_generation && !app_ui_input_blocked(ui))
-        app_ui_show_home(ui);
+    if (pending && generation == ui->page_generation) {
+        if (app_ui_input_blocked(ui) || !request_home(ui)) app_ui_set_user_key_exit(ui, true);
+    }
 }
 
 lv_obj_t *app_ui_new_screen(app_ui_t *ui)
@@ -170,23 +188,27 @@ lv_obj_t *app_ui_new_screen(app_ui_t *ui)
     ui->io_media_pending = false;
     app_ui_media_control_gate(ui, false, true);
     app_telemetry_set_interest(0);
+    app_ui_clear_timer(ui);
     if (ui->page_cleanup) {
         void (*cleanup)(app_ui_t *) = ui->page_cleanup;
         ui->page_cleanup = NULL;
         cleanup(ui);
     }
     ui->page_context = NULL;
-    app_ui_clear_timer(ui);
+    ui->page_can_exit = NULL;
+    ui->page_back = NULL;
     for (size_t i = 0; i < sizeof(ui->app_obj) / sizeof(ui->app_obj[0]); ++i) {
         ui->app_obj[i] = NULL;
     }
     ui->app_path[0] = '\0';
     ui->app_value = 0;
+    ui->home_time = NULL;
+    ui->content = NULL;
     ui->media_started = false;
     ui->shutdown_overlay = NULL;
     lv_obj_t *screen = lv_obj_create(NULL);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x070A12), 0);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x101321), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(screen, app_ui_chinese_font(), 0);
     ui->screen = screen;
@@ -198,10 +220,10 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_t *screen = app_ui_new_screen(ui);
 
     lv_obj_t *back = lv_button_create(screen);
-    lv_obj_set_size(back, 72, 44);
+    lv_obj_set_size(back, 48, 44);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 12);
-    lv_obj_set_style_radius(back, 18, 0);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x18243A), 0);
+    lv_obj_set_style_radius(back, 14, 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(0x232842), 0);
     lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, ui);
     app_ui_add_text(back, LV_SYMBOL_LEFT, LV_ALIGN_CENTER, 0, 0, 0xBFD7FF,
                     &lv_font_montserrat_20);
@@ -209,7 +231,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     app_ui_add_text(screen, title, LV_ALIGN_TOP_MID, 0, 20, 0xEAF2FF,
                     app_ui_chinese_font_size(24));
 
-    lv_obj_t *battery = app_battery_create(screen, 116);
+    lv_obj_t *battery = app_battery_create(screen, 70);
     if (battery) lv_obj_align(battery, LV_ALIGN_TOP_RIGHT, -14, 20);
 
     lv_obj_t *content = lv_obj_create(screen);
@@ -222,7 +244,8 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
     ui->content = content;
 
-    lv_screen_load_anim(screen, LV_SCREEN_LOAD_ANIM_NONE, 0, 0, true);
+    app_ui_load_screen(screen);
+    app_ui_set_user_key_exit(ui, true);
     return content;
 }
 
@@ -349,21 +372,21 @@ static void service_timer(lv_timer_t *timer)
         app_io_usb_storage_blocked(ui->io), false);
     if (releasing && !power_blocked) {
         if (!ui->media_release_notice) {
-            ui->media_release_notice = app_ui_add_text(ui->screen,"",LV_ALIGN_BOTTOM_MID,0,-8,
-                0xFFD180,app_ui_chinese_font());
-            lv_obj_set_size(ui->media_release_notice,440,24);
+            ui->media_release_notice = app_ui_add_text(ui->screen, "", LV_ALIGN_BOTTOM_RIGHT, -12, -8,
+                0xFFD180, &lv_font_montserrat_20);
+            lv_obj_set_size(ui->media_release_notice, 32, 26);
             lv_obj_set_style_text_align(ui->media_release_notice,LV_TEXT_ALIGN_CENTER,0);
             lv_obj_set_style_bg_color(ui->media_release_notice,lv_color_hex(0x10192A),0);
             lv_obj_set_style_bg_opa(ui->media_release_notice,LV_OPA_90,0);
         }
-        if (release_error == ESP_OK) app_ui_label_text(ui->media_release_notice,"正在停止媒体并释放资源…");
-        else app_ui_label_fmt(ui->media_release_notice,"资源释放重试：%s",esp_err_to_name(release_error));
+        app_ui_label_text(ui->media_release_notice, release_error == ESP_OK ? LV_SYMBOL_REFRESH : LV_SYMBOL_WARNING);
     } else if (ui->media_release_notice) {
         lv_obj_delete(ui->media_release_notice);ui->media_release_notice=NULL;
     }
     app_ui_media_control_process(ui);
     bool measuring_media = false;
     app_ui_shutdown_service(ui);
+    app_utilities_alarm_ui(ui);
     if (ui->media_active) {
         aether_video_status_t video;
         aether_nes_status_t nes;
@@ -374,7 +397,16 @@ static void service_timer(lv_timer_t *timer)
              nes.state == AETHER_NES_RUNNING);
     }
     /* Intentional pauses/sleep are not display-stall samples. */
-    app_display_metrics_set_active(measuring_media && !app_power_is_sleeping(ui->power));
+    const bool asleep = app_power_is_sleeping(ui->power);
+    app_display_metrics_set_active(measuring_media && !asleep);
+    app_display_metrics_t display;
+    app_display_metrics_get(&display);
+    if (!asleep && !power_blocked && display.dropped_regions != ui->display_drops_seen &&
+        (!ui->display_retry_at || (int32_t)(lv_tick_get() - ui->display_retry_at) >= 0)) {
+        ui->display_drops_seen = display.dropped_regions;
+        ui->display_retry_at = lv_tick_get() + 250;
+        lv_obj_invalidate(ui->screen);
+    }
     if (ui->media_active) app_frames_present(ui->frames, ui->app_obj[0]);
     if (ui->touch_restore_pending &&
         (!ui->nes || aether_nes_stop_wait(ui->nes, 0) == ESP_OK)) {

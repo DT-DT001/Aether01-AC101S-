@@ -12,6 +12,10 @@ scan and an empty successful scan both allow a later retry, and existing music
 playback/stream volume remain unchanged. This verifies callback ownership and
 UI admission; it does not measure physical SD/USB scan throughput.
 
+The test also navigates through 96 catalog entries with keyboard events and
+taps the final recycled row using a real LVGL pointer. It verifies the track
+index, the fixed pool of 12 rows and absence of additional catalog requests.
+
 Prepared catalog delivery does not copy/rebuild the backend playlist on LVGL.
 While refresh owns the completion, old row indices cannot select a different
 song from the worker's new list. Page cleanup publishes a full session release

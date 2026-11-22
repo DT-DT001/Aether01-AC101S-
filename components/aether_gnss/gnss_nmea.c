@@ -11,7 +11,8 @@
 #define SYSTEM_COUNT ((unsigned)GNSS_SYSTEM_SBAS + 1U)
 
 typedef struct {
-    bool seen, valid;
+    bool seen, valid, clock_valid;
+    uint32_t utc_second;
     uint64_t received_ms;
     double latitude, longitude;
 } position_sample_t;
@@ -175,12 +176,27 @@ static gnss_system_t system_id(unsigned id)
     }
 }
 
+static bool earlier_epoch(const position_sample_t *older, const position_sample_t *newer)
+{
+    if (!older->clock_valid || !newer->clock_valid) return false;
+    /* GGA has a time of day but no date. Choose the nearest day across
+     * midnight; an exactly half-day difference leaves the order unknown. */
+    const uint32_t seconds_per_day = 86400U;
+    const uint32_t elapsed = (newer->utc_second + seconds_per_day - older->utc_second) %
+                             seconds_per_day;
+    return elapsed != 0 && elapsed < seconds_per_day / 2U;
+}
+
 static void update_position(gnss_nmea_parser_t *p, uint64_t now)
 {
     bool r = p->rmc.seen && fresh(now, p->rmc.received_ms, GNSS_NMEA_FIX_TIMEOUT_MS);
     bool g = p->gga.seen && fresh(now, p->gga.received_ms, GNSS_NMEA_FIX_TIMEOUT_MS);
-    /* Fresh explicit no-fix from either source vetoes an old valid position.
-     * It is safer to wait for a coherent next epoch than flash a false fix. */
+    /* A fresh same-epoch, newer or undated no-fix still vetoes a fix.
+     * A buffered older no-fix must not invalidate a newer position. */
+    if (r && g && p->rmc.valid != p->gga.valid) {
+        if (p->rmc.valid && earlier_epoch(&p->gga, &p->rmc)) g = false;
+        else if (p->gga.valid && earlier_epoch(&p->rmc, &p->gga)) r = false;
+    }
     bool valid = (r || g) && (!r || p->rmc.valid) && (!g || p->gga.valid);
     p->value.position_valid = valid;
     if (valid) {
@@ -209,7 +225,11 @@ static bool parse_rmc(gnss_nmea_parser_t *p, char **f, unsigned count, uint64_t 
     if (!coordinates(f, 3, valid, &lat, &lon) ||
         !optional_decimal(f[7], 0, 2000, &speed, &speed_present) ||
         !optional_decimal(f[8], 0, 360, &course, &course_present)) return false;
-    p->rmc = (position_sample_t){true, valid, now, lat, lon};
+    p->rmc = (position_sample_t){
+        .seen = true, .valid = valid, .clock_valid = clock_ok,
+        .utc_second = (uint32_t)h * 3600U + (uint32_t)m * 60U + s,
+        .received_ms = now, .latitude = lat, .longitude = lon,
+    };
     p->time_seen = valid && clock_ok && date_ok;
     p->value.time_valid = p->time_seen;
     p->value.date_valid = p->time_seen;
@@ -231,9 +251,10 @@ static bool parse_gga(gnss_nmea_parser_t *p, char **f, unsigned count, uint64_t 
 {
     if (count < 10) return false;
     unsigned quality, satellites;
-    uint8_t h, m, s;
+    uint8_t h = 0, m = 0, s = 0;
+    const bool clock_ok = *f[1] && clock_field(f[1], &h, &m, &s);
     if (!uint_field(f[6], 8, &quality) || !uint_field(f[7], 99, &satellites) ||
-        (*f[1] && !clock_field(f[1], &h, &m, &s))) return false;
+        (*f[1] && !clock_ok)) return false;
     bool valid = quality > 0 && quality < 6;
     if (valid && !*f[1]) return false;
     double lat = 0, lon = 0, hdop = 0, altitude = 0;
@@ -242,7 +263,11 @@ static bool parse_gga(gnss_nmea_parser_t *p, char **f, unsigned count, uint64_t 
         !optional_decimal(f[8], 0, 999, &hdop, &hdop_present) ||
         !optional_decimal(f[9], -20000, 100000, &altitude, &altitude_present)) return false;
     if (altitude_present && (count < 11 || strcmp(f[10], "M"))) return false;
-    p->gga = (position_sample_t){true, valid, now, lat, lon};
+    p->gga = (position_sample_t){
+        .seen = true, .valid = valid, .clock_valid = clock_ok,
+        .utc_second = (uint32_t)h * 3600U + (uint32_t)m * 60U + s,
+        .received_ms = now, .latitude = lat, .longitude = lon,
+    };
     p->value.fix_quality = (uint8_t)quality;
     p->value.satellites_used = valid ? (uint8_t)satellites : 0;
     p->hdop_seen = valid && hdop_present; p->hdop_ms = now;

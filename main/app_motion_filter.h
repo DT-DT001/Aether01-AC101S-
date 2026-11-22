@@ -18,5 +18,8 @@ typedef struct {
 void app_motion_filter_init(app_motion_filter_t *f);
 bool app_motion_filter_update(app_motion_filter_t *f, const float accel[3],
                               const float gyro[3], uint32_t timestamp_ms);
+bool app_motion_filter_update_tilt(app_motion_filter_t *f, const float accel[3],
+                                   const float gyro[3], uint32_t timestamp_ms,
+                                   bool gyro_bias_valid);
 void app_motion_filter_zero(app_motion_filter_t *f);
 const char *app_motion_action_name(app_motion_action_t action);

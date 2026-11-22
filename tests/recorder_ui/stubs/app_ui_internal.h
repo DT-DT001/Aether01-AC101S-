@@ -7,6 +7,7 @@ struct app_ui {
     lv_obj_t *screen, *content;
     void *page_context;
     void (*page_cleanup)(app_ui_t *);
+    void (*page_back)(app_ui_t *);
     aether_storage_handle_t storage;
     app_io_handle_t io;
     uint32_t page_generation;
@@ -16,6 +17,7 @@ struct app_ui {
 const lv_font_t *app_ui_chinese_font(void);
 const lv_font_t *app_ui_chinese_font_size(unsigned);
 lv_obj_t *app_ui_begin_page(app_ui_t *, const char *);
+bool app_ui_go_back(app_ui_t *);
 lv_obj_t *app_ui_add_text(lv_obj_t *, const char *, lv_align_t, int32_t, int32_t, uint32_t, const lv_font_t *);
 void app_ui_label_text(lv_obj_t *, const char *);
 void app_ui_label_fmt(lv_obj_t *, const char *, ...);

@@ -16,9 +16,12 @@ typedef struct {
     bool shutdown_recovering;
     app_power_shutdown_state_t shutdown_state;
 } app_power_status_t;
-#define LV_ALIGN_BOTTOM_MID 1
+#define LV_ALIGN_BOTTOM_RIGHT 1
 #define LV_TEXT_ALIGN_CENTER 2
 #define LV_OPA_90 230
+#define LV_SYMBOL_REFRESH "refresh"
+#define LV_SYMBOL_WARNING "warning"
+extern const lv_font_t lv_font_montserrat_20;
 typedef struct app_ui app_ui_t;
 struct app_ui {
     aether_audio_player_handle_t audio_player;
@@ -33,8 +36,10 @@ struct app_ui {
     lv_timer_t *service_timer;
     app_power_t *power;
     lv_obj_t *screen, *media_release_notice;
-    bool user_key_exit_pending;
-    uint32_t user_key_requested_generation;
+    bool user_key_exit_pending, user_key_exit_armed;
+    uint32_t user_key_requested_generation, user_key_target_generation;
+    int64_t user_key_armed_at_us;
+    bool (*page_can_exit)(app_ui_t *, void (*destination)(app_ui_t *));
     bool test_input_blocked;
 };
 esp_err_t app_ui_media_control_init(app_ui_t *);
@@ -52,6 +57,7 @@ esp_err_t app_power_get_status(const app_power_t *,app_power_status_t *);
 bool app_ui_input_blocked(const app_ui_t *);
 bool app_intercom_busy(void);
 void app_ui_show_home(app_ui_t *);
+int64_t esp_timer_get_time(void);
 lv_obj_t *app_ui_add_text(lv_obj_t *,const char *,lv_align_t,int32_t,int32_t,uint32_t,const lv_font_t *);
 const lv_font_t *app_ui_chinese_font(void);
 void app_ui_label_text(lv_obj_t *,const char *);

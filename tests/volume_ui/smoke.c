@@ -1,4 +1,5 @@
 #include "app_ui_modal.h"
+#include "app_screen.h"
 #include "aether_usb_audio.h"
 #include "aether_usb_storage.h"
 #include "app_ui_internal.h"
@@ -10,7 +11,9 @@
 #include <string.h>
 extern const lv_font_t font_16,font_24;
 static uint16_t buffer[480*40],framebuffer[480*480];
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
 static const char *output_directory;
+#endif
 static lv_point_t pointer;
 static bool held;
 static int64_t now_us;
@@ -82,36 +85,44 @@ lv_obj_t *app_ui_add_text(lv_obj_t *p,const char *s,lv_align_t a,int32_t x,int32
 lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 {
     (void)title;if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}if(ui->page_cleanup){ui->page_cleanup(ui);ui->page_cleanup=NULL;}
-    lv_obj_t *old=ui->screen;ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
+    ui->page_can_exit=NULL;
+    ui->page_back=NULL;
+    ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x070A12),0);lv_obj_set_style_bg_opa(ui->screen,LV_OPA_COVER,0);
     lv_obj_set_style_text_font(ui->screen,&font_16,0);
     ui->content=lv_obj_create(ui->screen);lv_obj_set_size(ui->content,448,394);lv_obj_align(ui->content,LV_ALIGN_BOTTOM_MID,0,-14);
     lv_obj_set_style_pad_all(ui->content,20,0);lv_obj_set_style_border_width(ui->content,0,0);
     lv_obj_set_style_bg_color(ui->content,lv_color_hex(0x10192A),0);
-    lv_screen_load(ui->screen);if(old)lv_obj_delete(old);return ui->content;
+    app_ui_load_screen(ui->screen);return ui->content;
 }
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t ms){ui->timer=lv_timer_create(cb,ms,ui);}
 void app_ui_show_home(app_ui_t *ui){assert(lvgl_locked);app_ui_begin_page(ui,"主页");}
 void app_open_nes_controls(app_ui_t *ui){(void)ui;}
 static unsigned music_page_releases;
 esp_err_t app_io_release_media(app_io_handle_t io){assert(io);++music_page_releases;music.active=false;music.state=AETHER_AUDIO_STOPPED;music.track_count=0;music.path[0]=0;return ESP_OK;}
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
 void app_ui_request_io_ex(app_ui_t *ui,const app_io_request_t *q,void (*cb)(app_ui_t *,const app_io_result_t *))
 {app_io_result_t r={.operation=q->operation,.error=ESP_OK};cb(ui,&r);}
+#endif
 esp_err_t aether_audio_player_get_status(aether_audio_player_handle_t h,aether_audio_player_status_t *s){assert(h);*s=music;return ESP_OK;}
 esp_err_t aether_audio_player_set_volume(aether_audio_player_handle_t h,int v){assert(h&&v>=0&&v<=100);music.volume=(uint8_t)v;++music_updates;return ESP_OK;}
 static unsigned ui_playlist_copies,ui_playlist_selects;
+static size_t ui_playlist_selected_index;
 esp_err_t aether_audio_player_set_playlist(aether_audio_player_handle_t h,const char *const *p,size_t n){(void)h;(void)p;(void)n;++ui_playlist_copies;return ESP_OK;}
-esp_err_t aether_audio_player_select(aether_audio_player_handle_t h,size_t n){(void)h;(void)n;++ui_playlist_selects;return ESP_OK;}
+esp_err_t aether_audio_player_select(aether_audio_player_handle_t h,size_t n)
+{(void)h;ui_playlist_selected_index=n;++ui_playlist_selects;return ESP_OK;}
 esp_err_t aether_audio_player_set_paused(aether_audio_player_handle_t h,bool p){(void)h;music.state=p?AETHER_AUDIO_PAUSED:AETHER_AUDIO_PLAYING;return ESP_OK;}
 esp_err_t aether_audio_player_stop(aether_audio_player_handle_t h){(void)h;return ESP_OK;}
 esp_err_t aether_audio_player_next(aether_audio_player_handle_t h,int d){(void)h;(void)d;return ESP_OK;}
 esp_err_t aether_audio_player_set_repeat(aether_audio_player_handle_t h,aether_audio_repeat_t r){(void)h;(void)r;return ESP_OK;}
+static esp_err_t eq_submit_error;
 esp_err_t aether_audio_player_set_eq(aether_audio_player_handle_t h, const aether_audio_eq_t *eq)
-{ assert(h && eq); music.eq = *eq; return ESP_OK; }
+{ assert(h && eq); if (eq_submit_error) return eq_submit_error; music.eq = *eq; return ESP_OK; }
 esp_err_t aether_audio_player_seek(aether_audio_player_handle_t h,uint32_t p){(void)h;(void)p;return ESP_OK;}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p){const uint16_t *s=(const uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*s++;}lv_display_flush_ready(d);}
 static void read_pointer(lv_indev_t *i,lv_indev_data_t *d){(void)i;d->point=pointer;d->state=held?LV_INDEV_STATE_PRESSED:LV_INDEV_STATE_RELEASED;}
 static void advance(unsigned ms){for(unsigned i=0;i<ms;++i){lv_tick_inc(1);now_us+=1000;lv_timer_handler();}}
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
 static void capture(const char *name)
 {
     if(!output_directory)return;
@@ -119,12 +130,15 @@ static void capture(const char *name)
     FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n480 480\n255\n");
     for(unsigned i=0;i<480*480;++i){uint16_t p=framebuffer[i];uint8_t rgb[]={((p>>11)&31)*255/31,((p>>5)&63)*255/63,(p&31)*255/31};assert(fwrite(rgb,1,3,f)==3);}assert(!fclose(f));
 }
+#endif
 static lv_obj_t *find(lv_obj_t *p,const char *text)
 {if(lv_obj_check_type(p,&lv_label_class)&&!strcmp(lv_label_get_text(p),text))return p;for(unsigned i=0;i<lv_obj_get_child_count(p);++i){lv_obj_t *o=find(lv_obj_get_child(p,i),text);if(o)return o;}return NULL;}
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
 static lv_obj_t *switch_control(lv_obj_t *p)
 {if(lv_obj_check_type(p,&lv_switch_class))return p;for(unsigned i=0;i<lv_obj_get_child_count(p);++i){lv_obj_t *o=switch_control(lv_obj_get_child(p,i));if(o)return o;}return NULL;}
 static lv_obj_t *switch_y(lv_obj_t *p,int y)
 {if(lv_obj_check_type(p,&lv_switch_class)&&lv_obj_get_y(p)==y)return p;for(unsigned i=0;i<lv_obj_get_child_count(p);++i){lv_obj_t *o=switch_y(lv_obj_get_child(p,i),y);if(o)return o;}return NULL;}
+#endif
 static aether_usb_audio_status_t usb_audio_status;
 static aether_usb_storage_status_t usb_storage_status;
 esp_err_t aether_usb_audio_get_status(aether_usb_audio_status_t *s){*s=usb_audio_status;return ESP_OK;}
@@ -132,6 +146,7 @@ bool aether_usb_audio_playback_connected(void){return usb_audio_status.playback_
 bool aether_usb_audio_capture_connected(void){return usb_audio_status.capture_connected;}
 aether_usb_storage_handle_t aether_usb_storage_default(void){return (void*)1;}
 esp_err_t aether_usb_storage_get_status(aether_usb_storage_handle_t h,aether_usb_storage_status_t *s){(void)h;*s=usb_storage_status;return ESP_OK;}
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
 static void test_otg(app_ui_t *ui)
 {
     usb=(app_io_usb_status_t){.media_present=true};otg=(aether_usb_host_status_t){0};
@@ -364,6 +379,10 @@ static void test_usb(app_ui_t *ui)
     usb.pending=false;usb.active=usb.blocked=usb.host_connected=true;usb.host_ejected=false;advance(350);
     usb.usb_speed_mbps=480;usb.usb_clock_khz=40000;usb.capacity_bytes=8ULL*1024*1024*1024;
     app_open_usb(ui);advance(350);
+    assert(ui->page_can_exit && !ui->page_can_exit(ui, app_open_settings));
+    assert(find(ui->screen,"电脑已安全弹出？"));
+    click(ui,"返回");
+    assert(!find(ui->screen,"电脑已安全弹出？")&&usb.active&&!usb.pending);
     assert(find(ui->screen,"USB：电脑已连接 / 高速480Mb/s\nTF：已就绪 / 40.0MHz\n容量：8192 MiB"));
     capture("usb-active");
     usb.usb_speed_mbps=12;usb.usb_clock_khz=32000;usb.usb_high_speed_fallback=true;advance(350);
@@ -381,8 +400,14 @@ static void test_usb(app_ui_t *ui)
         click(ui,"退出并恢复");assert(find(ui->screen,"电脑已安全弹出？"));
         click(ui,"返回");assert(!find(ui->screen,"电脑已安全弹出？")&&usb.active&&!usb.pending);
     }
+    assert(!ui->page_can_exit(ui, app_open_settings));
+    click(ui,"已安全弹出，退出");
+    assert(usb.pending && switch_control(ui->content));
+    assert(!find(ui->screen,"电脑已安全弹出？") && !ui->page_can_exit);
+    usb.pending=false;
+    app_open_usb(ui);advance(350);
     usb.host_ejected=true;commands=usb_commands;
-    click(ui,"退出并恢复");
+    assert(ui->page_can_exit(ui, app_open_settings));
     assert(usb.pending&&usb_commands==commands+1&&!find(ui->screen,"电脑已安全弹出？"));
     usb=(app_io_usb_status_t){.media_present=true};
     app_open_settings(ui);advance(350);s=switch_control(ui->content);
@@ -436,6 +461,33 @@ static void drag(lv_obj_t *s,unsigned target,int y_offset)
     advance(700);assert(abs(lv_slider_get_value(s)-(int)target)<=1);
     held=false;advance(100);assert(abs(lv_slider_get_value(s)-(int)target)<=1);
 }
+static void test_music_eq(app_ui_t *ui)
+{
+    click(ui,"均衡器");
+    lv_obj_t *band_label=find(ui->screen,"100 Hz");assert(band_label);
+    lv_obj_t *panel=lv_obj_get_parent(band_label);
+    assert(!lv_obj_has_flag(panel,LV_OBJ_FLAG_HIDDEN));
+    unsigned seen=0;
+    lv_obj_t *band=slider(panel,0,&seen);assert(band);
+    lv_slider_set_value(band,5,LV_ANIM_OFF);
+    lv_obj_send_event(band,LV_EVENT_VALUE_CHANGED,NULL);
+    assert(music.eq.enabled&&music.eq.bands_db[0]==5&&find(panel,"+5 dB"));
+    click(ui,"对比原声");
+    assert(!music.eq.enabled&&music.eq.bands_db[0]==5);
+    click(ui,"启用 EQ");
+    assert(music.eq.enabled);
+    eq_submit_error=ESP_ERR_TIMEOUT;
+    lv_slider_set_value(band,-3,LV_ANIM_OFF);
+    lv_obj_send_event(band,LV_EVENT_VALUE_CHANGED,NULL);
+    assert(lv_slider_get_value(band)==5&&music.eq.bands_db[0]==5&&find(panel,"调整失败：ESP_ERR_TIMEOUT"));
+    eq_submit_error=ESP_OK;
+    click(ui,"恢复默认");
+    assert(!music.eq.enabled&&!music.eq.bands_db[0]&&find(panel,"已恢复默认值"));
+    lv_obj_t *close=find(panel,"返回");assert(close);
+    lv_obj_send_event(lv_obj_get_parent(close),LV_EVENT_CLICKED,NULL);
+    assert(lv_obj_has_flag(panel,LV_OBJ_FLAG_HIDDEN));
+    puts("PASS AC101S Music EQ actual LVGL: open, band edit, bypass/re-enable, backend rollback, defaults and close");
+}
 static void modal_underlying(lv_event_t *event)
 { ++*(unsigned*)lv_event_get_user_data(event); }
 static void modal_pointer_tap(void)
@@ -482,6 +534,7 @@ int main(int argc,char **argv)
     assert(master_persist==before_persist+1&&music_updates==0&&music.volume==100);
     advance(1500);assert(lv_slider_get_value(s)==70&&master.master_volume==70);
     printf("PASS actual music pointer y%+d 10->70: global-request=%u persist-request=%u; stream-gain=%u unchanged; hold+timer stable\n",offset,requested_master,saved_master,music.volume);
+    test_music_eq(&ui);
     app_open_settings(&ui);advance(200);seen=0;s=slider(ui.content,0,&seen);assert(s&&lv_slider_get_value(s)==70);
     assert(master_persist==before_persist+1); /* Reopening pages never writes preferences. */
     puts("PASS settings -> music -> external volume update -> settings share master and reopening does not persist");
@@ -494,3 +547,4 @@ int main(int argc,char **argv)
     if(ui.page_cleanup)ui.page_cleanup(&ui);
     lv_obj_delete(ui.screen);lv_indev_delete(in);lv_display_delete(d);lv_deinit();
 }
+#endif

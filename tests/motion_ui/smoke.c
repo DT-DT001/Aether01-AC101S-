@@ -13,13 +13,13 @@ static uint16_t framebuffer[480*480],draw_buffer[480*40];
 static int64_t now_us=1000000;
 static app_telemetry_snapshot_t sample;
 static uint32_t interest;
-static unsigned interest_updates,gets,dirty_calls;
+static unsigned interest_updates,telemetry_reads,dirty_calls;
 static const char *output;
 
 int64_t esp_timer_get_time(void) {return now_us;}
 const char *esp_err_to_name(esp_err_t e) {return e==ESP_OK?"ESP_OK":e==ESP_ERR_TIMEOUT?"ESP_ERR_TIMEOUT":"ESP_ERR_NOT_FOUND";}
 bool app_power_is_sleeping(const app_power_t *p) {return p&&p->sleeping;}
-void app_telemetry_get(app_telemetry_snapshot_t *s) {++gets;*s=sample;}
+void app_telemetry_get(app_telemetry_snapshot_t *s) {++telemetry_reads;*s=sample;}
 void app_telemetry_set_interest(uint32_t mask) {interest=mask;++interest_updates;}
 const lv_font_t *app_ui_chinese_font_size(unsigned px)
 {
@@ -167,8 +167,8 @@ static void test_invalid_and_sleep(app_ui_t *ui)
     advance(120);assert(find(ui->screen,"数据异常")&&model_hash(ui)==hash);layout(ui);
     input(0,0,G,0,0,INFINITY);advance(120);assert(find(ui->screen,"数据异常")&&model_hash(ui)==hash);
     unsigned before=interest_updates;ui->power->sleeping=true;advance(40);
-    assert(interest==0&&interest_updates==before+1);const unsigned stopped_gets=gets;
-    feed(0,0,G,0,0,180,50);assert(interest==0&&interest_updates==before+1&&gets==stopped_gets&&model_hash(ui)==hash);
+    assert(interest==0&&interest_updates==before+1);const unsigned stopped_reads=telemetry_reads;
+    feed(0,0,G,0,0,180,50);assert(interest==0&&interest_updates==before+1&&telemetry_reads==stopped_reads&&model_hash(ui)==hash);
     ui->power->sleeping=false;sample.imu_error=ESP_ERR_TIMEOUT;advance(40);
     assert(interest==APP_TELEMETRY_IMU&&interest_updates==before+2&&find(ui->screen,"等待采样"));
     pose(0,0,20);assert(find(ui->screen,"静止"));layout(ui);

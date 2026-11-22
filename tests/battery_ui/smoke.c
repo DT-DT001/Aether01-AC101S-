@@ -20,11 +20,24 @@ const lv_font_t *app_ui_chinese_font_size(unsigned px)
 const lv_font_t *app_ui_chinese_font(void) {return app_ui_chinese_font_size(16);}
 void app_ui_label_text(lv_obj_t *object,const char *text)
 {if(strcmp(lv_label_get_text(object),text))lv_label_set_text(object,text);}
+void app_ui_label_fmt(lv_obj_t *object,const char *format,...)
+{
+    char text[64];
+    va_list args;
+    va_start(args,format);
+    vsnprintf(text,sizeof(text),format,args);
+    va_end(args);
+    app_ui_label_text(object,text);
+}
 lv_obj_t *app_ui_add_text(lv_obj_t *parent,const char *text,lv_align_t align,int32_t x,int32_t y,uint32_t color,const lv_font_t *font)
 {lv_obj_t *o=lv_label_create(parent);lv_label_set_text(o,text);lv_obj_set_style_text_font(o,font?font:app_ui_chinese_font(),0);lv_obj_set_style_text_color(o,lv_color_hex(color),0);lv_obj_align(o,align,x,y);return o;}
 lv_obj_t *app_ui_new_screen(app_ui_t *ui)
 {ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x070A12),0);lv_obj_set_style_text_font(ui->screen,app_ui_chinese_font(),0);return ui->screen;}
-void app_ui_show_home(app_ui_t *ui) {app_ui_begin_page(ui,"首页");}
+void app_ui_show_drawer(app_ui_t *ui) {app_ui_begin_page(ui,"应用列表");}
+static void show_parent(app_ui_t *ui) {app_ui_begin_page(ui,"上一级");}
+static bool gate_back(app_ui_t *ui, void (*destination)(app_ui_t *))
+{assert(ui && destination == show_parent);return false;}
+void app_ui_set_user_key_exit(app_ui_t *ui,bool armed) {(void)ui;assert(armed);}
 static void flush(lv_display_t *display,const lv_area_t *area,uint8_t *pixels)
 {++flushes;uint16_t *s=(uint16_t*)pixels;for(int y=area->y1;y<=area->y2;++y)for(int x=area->x1;x<=area->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*s++;}lv_display_flush_ready(display);}
 static void advance(unsigned ms)
@@ -61,48 +74,50 @@ int main(int argc,char **argv)
     lv_display_set_buffers(display,draw_buffer,NULL,sizeof(draw_buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display,flush);app_ui_t ui={0};
     app_ui_begin_page(&ui,"反应力小游戏");advance(200);
-    assert(find(ui.screen,"--%"));capture(display,argv[1],"battery-unknown");
+    assert(find(ui.screen,"--"));capture(display,argv[1],"battery-unknown");
     tools=(app_tools_snapshot_t){.ready=true,.battery={.presence_valid=true,.battery_present=true,
         .percentage_valid=true,.voltage_valid=true,.voltage_mv=3975,.charge_state_valid=true}};
     static const unsigned levels[]={0,1,15,16,20,50,99,100};
     for(unsigned i=0;i<sizeof(levels)/sizeof(levels[0]);++i){
-        tools.battery.percentage=(uint8_t)levels[i];fresh();char text[20];snprintf(text,sizeof(text),"%u%%",levels[i]);
+        tools.battery.percentage=(uint8_t)levels[i];fresh();char text[20];snprintf(text,sizeof(text),"%u",levels[i]);
         lv_obj_t *label=expect(&ui,text);lv_color_t color=lv_obj_get_style_text_color(label,LV_PART_MAIN);
-        assert(lv_color_eq(color,lv_color_hex(levels[i]<=15?0xFF879A:0xD6E5F5)));
+        assert(lv_color_eq(color,lv_color_hex(levels[i]<=15?0xFF899D:0xD5DEFB)));
     }
-    tools.battery.percentage=12;fresh();expect(&ui,"12%");capture(display,argv[1],"battery-low");
+    tools.battery.percentage=12;fresh();expect(&ui,"12");capture(display,argv[1],"battery-low");
     tools.battery.percentage=100;tools.battery.vbus_present=true;tools.battery.charging=true;fresh();
-    lv_obj_t *charge=expect(&ui,"100% 充电");detail_contains("100%（TG29估计）","3975 mV");
+    lv_obj_t *charge=expect(&ui,"100");detail_contains("100%（TG29估计）","3975 mV");
+    lv_obj_t *bolt=find(ui.screen,LV_SYMBOL_CHARGE);
+    assert(bolt&&!lv_obj_has_flag(bolt,LV_OBJ_FLAG_HIDDEN));
     lv_obj_t *badge=lv_obj_get_parent(charge),*title=find(ui.screen,"反应力小游戏");
     lv_area_t b,t;lv_obj_get_coords(badge,&b);lv_obj_get_coords(title,&t);
-    assert(b.x1==350&&b.x2==465&&b.y1==20&&t.x2<b.x1);
-    assert(lv_obj_get_width(lv_obj_get_child(ui.screen,0))==72);capture(display,argv[1],"battery-charging");
+    assert(b.x1==422&&b.x2==461&&t.x2<b.x1);
+    assert(lv_obj_get_width(lv_obj_get_child(ui.screen,0))==48);capture(display,argv[1],"battery-charging");
     fresh();advance(200);unsigned before=flushes;advance(2000);assert(flushes==before);
 
     tools.battery.percentage=85;tools.battery.charging=false;tools.battery.charge_done=true;fresh();
-    expect(&ui,"85% 已满");detail_contains("充电完成",NULL);
-    tools.battery.current_direction=2;fresh();expect(&ui,"85% 放电");detail_contains("电池放电",NULL);
+    expect(&ui,"85");assert(lv_obj_has_flag(bolt,LV_OBJ_FLAG_HIDDEN));detail_contains("充电完成",NULL);
+    tools.battery.current_direction=2;fresh();expect(&ui,"85");detail_contains("电池放电",NULL);
     tools.battery.current_direction=0;tools.battery.charge_state_valid=false;fresh();
-    expect(&ui,"85% USB");detail_contains("充电状态未知",NULL);
-    tools.battery.percentage_valid=false;fresh();expect(&ui,"--% USB");detail_contains("--%（不可用）",NULL);
-    tools.battery.percentage_valid=true;tools.battery.percentage=255;fresh();expect(&ui,"--% USB");
+    expect(&ui,"85");detail_contains("充电状态未知",NULL);
+    tools.battery.percentage_valid=false;fresh();expect(&ui,"--");detail_contains("--%（不可用）",NULL);
+    tools.battery.percentage_valid=true;tools.battery.percentage=255;fresh();expect(&ui,"--");
 
     tools.battery.percentage=87;tools.battery.presence_valid=false;tools.battery.charge_state_valid=true;
-    tools.battery.charging=true;fresh();expect(&ui,"--% USB");detail_contains("存在性未知","VBAT 未知");
+    tools.battery.charging=true;fresh();expect(&ui,"--");detail_contains("存在性未知","VBAT 未知");
     tools.battery.presence_valid=true;tools.battery.battery_present=false;fresh();
-    expect(&ui,"--% USB");detail_contains("未接电池","无有效电池");capture(display,argv[1],"battery-usb-no-battery");
+    expect(&ui,"--");detail_contains("未接电池","无有效电池");capture(display,argv[1],"battery-usb-no-battery");
     tools.battery.battery_present=true;tools.battery_error=ESP_FAIL;fresh();
-    expect(&ui,"--%");detail_contains("电池 未知","ESP_FAIL");
+    expect(&ui,"--");detail_contains("电池 未知","ESP_FAIL");
     tools.battery_error=ESP_OK;fresh();tools.battery_updated_ms=(uint32_t)now_ms-6000U;
-    expect(&ui,"87% 充电");expect(&ui,"--%");detail_contains("数据过期",NULL);capture(display,argv[1],"battery-stale");
+    expect(&ui,"87");expect(&ui,"--");detail_contains("数据过期",NULL);capture(display,argv[1],"battery-stale");
 
     now_ms=(uint64_t)UINT32_MAX-100U;tools.battery.percentage=42;fresh();
-    expect(&ui,"42% 充电");assert((uint32_t)now_ms<1000U);
-    advance(7000);assert(find(ui.screen,"--%"));detail_contains("数据过期",NULL);
+    expect(&ui,"42");assert((uint32_t)now_ms<1000U);
+    advance(7000);assert(find(ui.screen,"--"));detail_contains("数据过期",NULL);
     fresh();tools.battery.voltage_mv=0;detail_contains("VBAT 未知",NULL);
     tools.battery.voltage_mv=0x3FFF;detail_contains("VBAT 未知",NULL);
     tools.battery.voltage_mv=3900;tools.battery.voltage_valid=false;detail_contains("VBAT 未知",NULL);
-    tools.ready=false;fresh();expect(&ui,"--%");detail_contains("等待就绪",NULL);
+    tools.ready=false;fresh();expect(&ui,"--");detail_contains("等待就绪",NULL);
     char tiny[3]={1,2,3};app_battery_format_detail(NULL,tiny,1);assert(!tiny[0]&&tiny[1]==2&&tiny[2]==3);
 
     tools.ready=true;tools.battery.voltage_valid=true;tools.battery.charging=false;tools.battery.charge_done=false;fresh();
@@ -110,6 +125,19 @@ int main(int argc,char **argv)
     app_battery_format_detail(&tools,description,sizeof(description));
     lv_obj_t *details=app_ui_add_text(ui.content,description,LV_ALIGN_TOP_LEFT,0,0,0xC9DCF8,app_ui_chinese_font());
     lv_obj_set_width(details,402);lv_label_set_long_mode(details,LV_LABEL_LONG_WRAP);capture(display,argv[1],"battery-details");
+    lv_obj_t *previous=ui.screen;
+    ui.page_back=show_parent;
+    ui.page_can_exit=gate_back;
+    lv_obj_send_event(lv_obj_get_child(ui.screen,0),LV_EVENT_CLICKED,NULL);
+    assert(ui.screen==previous);
+    ui.page_can_exit=NULL;
+    lv_obj_send_event(lv_obj_get_child(ui.screen,0),LV_EVENT_CLICKED,NULL);
+    assert(find(ui.screen,"上一级"));
+    ui.page_back=NULL;
+    lv_obj_send_event(lv_obj_get_child(ui.screen,0),LV_EVENT_CLICKED,NULL);
+    assert(find(ui.screen,"应用列表"));
+    advance(50);
+    puts("PASS common Back dispatch: exit denial, parent page and application drawer");
     unsigned count=timers();fprintf(stderr,"battery UI: replacing 24 active pages\n");
     for(unsigned i=0;i<24;++i){fresh();app_ui_begin_page(&ui,"设备状态");advance(50);assert(timers()==count);assert(lv_mem_test()==LV_RESULT_OK);}
     fprintf(stderr,"battery UI: page replacement timer/heap checks passed\n");

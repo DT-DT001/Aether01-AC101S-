@@ -5,13 +5,11 @@ and existing icons run through real LVGL input/rendering; filesystem and app
 launches are mocked. Existing `host_reader_ui` objects are read only. All new
 objects and snapshots stay in `build/host_files_ui`.
 
-Actual pointer tests cover opening M4A through the music page, upward/downward
-list scrolling without launching a file, busy controls, restoring Refresh after
-a timeout, page boundaries, and removal/reinsertion. Allocator integrity is
-checked at teardown. The list now uses 32 entries per page to keep the maximum
-widget count comparable to the previous 64 plain rows, while showing native
-48px existing icons, fixed filenames and size/type metadata without circular
-scroll animations.
+Actual pointer tests cover opening M4A through the music page, bidirectional
+scrolling without launching a file, busy controls, refresh recovery and volume
+removal/reinsertion. A 4,100-entry directory fixture verifies the 4,096-entry
+index cap, a successful tap on the last indexed file, and the fixed pool of
+12 rows throughout scrolling. Allocator integrity is checked at teardown.
 
 The saved baseline was rendered before the production change with identical
 file data. Compare `files-before.png` and `files-after.png`; error and scrolling

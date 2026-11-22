@@ -622,9 +622,10 @@ static int test_worker_shutdown(void)
     return 0;
 }
 
-static unsigned user_actions, user_irq_notifies;
+static unsigned user_actions, user_taps, user_irq_notifies;
 static int64_t user_pressed_at;
 static void user_action(void *context,int64_t at_us){(void)context;user_pressed_at=at_us; ++user_actions;}
+static void user_tap(void *context,int64_t at_us){(void)context;(void)at_us; ++user_taps;}
 TickType_t xTaskGetTickCountFromISR(void){return clock_ms;}
 int64_t esp_timer_get_time(void){return (int64_t)clock_ms*1000;}
 void vTaskNotifyGiveFromISR(TaskHandle_t task,BaseType_t *higher){(void)task;*higher=pdFALSE;++user_irq_notifies;}
@@ -636,23 +637,34 @@ static int test_user_key_dispatch(void)
 {
     reset();user_actions=user_irq_notifies=0;
     CHECK(app_power_set_user_key_handler(&manager,user_action,&manager)==ESP_OK);
-    bool down=false;
-    dispatch_user_key(&manager,true,&down);dispatch_user_key(&manager,true,&down);
-    CHECK(user_actions==1);dispatch_user_key(&manager,false,&down);
+    CHECK(app_power_set_user_key_tap_handler(&manager,user_tap)==ESP_OK);
+    user_key_t key={0};
     clock_ms=100;user_key_interrupt(&manager);clock_ms=105;user_key_interrupt(&manager);
-    dispatch_user_key(&manager,false,&down);CHECK(user_actions==2&&user_irq_notifies==1&&user_pressed_at==100000);
-    dispatch_user_key(&manager,false,&down);CHECK(user_actions==2);
-    manager.sleeping=true;clock_ms=200;user_key_interrupt(&manager);
-    dispatch_user_key(&manager,true,&down);CHECK(user_actions==2&&manager.wake_requested);
+    dispatch_user_key(&manager,false,&key);CHECK(user_actions==0&&user_taps==1&&user_irq_notifies==1);
+    clock_ms=200;user_key_interrupt(&manager);
+    dispatch_user_key(&manager,true,&key);
+    clock_ms=2199;dispatch_user_key(&manager,true,&key);CHECK(user_actions==0);
+    clock_ms=2200;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&user_pressed_at==200000);
+    clock_ms=3200;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1);
+    dispatch_user_key(&manager,false,&key);
+    manager.sleeping=true;clock_ms=4000;user_key_interrupt(&manager);
+    dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&manager.wake_requested);
     manager.sleeping=false;manager.wake_requested=false;
-    dispatch_user_key(&manager,true,&down);CHECK(user_actions==2);
-    dispatch_user_key(&manager,false,&down);
-    manager.shutdown_cancel_error=ESP_ERR_TIMEOUT;clock_ms=300;user_key_interrupt(&manager);
-    dispatch_user_key(&manager,false,&down);CHECK(user_actions==2);
-    manager.shutdown_cancel_error=ESP_OK;clock_ms=400;user_key_interrupt(&manager);
-    dispatch_user_key(&manager,false,&down);CHECK(user_actions==3);
+    clock_ms=6500;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1);
+    dispatch_user_key(&manager,false,&key);
+    manager.shutdown_cancel_error=ESP_ERR_TIMEOUT;clock_ms=7000;
+    dispatch_user_key(&manager,true,&key);
+    manager.shutdown_cancel_error=ESP_OK;clock_ms=9500;
+    dispatch_user_key(&manager,true,&key);CHECK(user_actions==1);
+    dispatch_user_key(&manager,false,&key);
+    clock_ms=10000;dispatch_user_key(&manager,true,&key);
+    clock_ms=11999;dispatch_user_key(&manager,false,&key);CHECK(user_actions==1);
+    clock_ms=13000;dispatch_user_key(&manager,true,&key);
+    clock_ms=15000;dispatch_user_key(&manager,true,&key);CHECK(user_actions==2&&user_pressed_at==13000000);
+    dispatch_user_key(&manager,false,&key);
+    CHECK(user_taps==2);
     CHECK(app_power_set_user_key_handler(NULL,user_action,NULL)==ESP_ERR_INVALID_ARG);
-    puts("PASS user-key short IRQ latch/bounce/hold, sleep wake consumption, cancellation gate and task-only application dispatch");
+    puts("PASS separate AC101S intercom taps and one-shot two-second exit, with wake and shutdown consumption");
     return 0;
 }
 int main(void)

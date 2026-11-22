@@ -16,6 +16,8 @@ static bool mounted = true;
 static bool usb_blocked;
 static unsigned book_catalog_calls,music_catalog_calls,text_calls;
 static int64_t now_us;
+static lv_point_t pointer;
+static bool pointer_down;
 static app_io_request_t saved;
 static bool has_saved;
 static aether_audio_player_status_t audio_status = {
@@ -51,6 +53,7 @@ esp_err_t app_io_bookmark_status(app_io_handle_t io) { (void)io; return ESP_OK; 
 bool app_io_bookmark_pending(app_io_handle_t io) { (void)io; return false; }
 esp_err_t app_io_submit_request(app_io_handle_t io, const app_io_request_t *q)
 { (void)io; assert(q->operation == APP_IO_READER_SAVE); saved = *q; has_saved = true; return ESP_OK; }
+esp_err_t app_io_release_media(app_io_handle_t io) { (void)io; return ESP_OK; }
 
 void app_ui_request_io_ex(app_ui_t *ui, const app_io_request_t *q,
                           void (*complete)(app_ui_t *, const app_io_result_t *))
@@ -71,11 +74,17 @@ void app_ui_request_io_ex(app_ui_t *ui, const app_io_request_t *q,
         strlcpy(r.entries->path, q->filter == APP_IO_MUSIC ?
                 "/sdcard/Music/海边的风.mp3" : book_path, sizeof(r.entries->path));
         r.entries->size = (uint64_t)info.st_size;
-        if (r.count == 2) strlcpy(r.entries[1].path, "/sdcard/Music/远方的故事.wav", sizeof(r.entries[1].path));
+        if (r.count == 2) {
+            strlcpy(r.entries[1].path, "/sdcard/Music/远方的故事.wav", sizeof(r.entries[1].path));
+            const char *paths[] = {r.entries[0].path, r.entries[1].path};
+            r.error = aether_audio_player_set_playlist(ui->audio_player, paths, r.count);
+            r.playlist_prepared = r.error == ESP_OK;
+        }
     } else if (q->operation == APP_IO_READER_LOAD) {
         r.font_px = has_saved ? saved.font_px : 24; r.dark = has_saved ? saved.dark : true;
         r.offset = has_saved ? saved.offset : 0;
         r.encoding_hint = has_saved ? saved.encoding_hint : 0;
+        r.turn_mode = has_saved ? saved.turn_mode : APP_READER_TURN_SWIPE_HORIZONTAL;
     } else if (q->operation == APP_IO_READ_TEXT) {
         app_reader_chunk_t chunk;
         r.error = app_reader_file_read_ex(q->path, q->offset, q->limit, q->source_boundary, q->encoding_hint, &chunk);
@@ -177,6 +186,41 @@ static void tick(void)
     for (unsigned i = 0; i < 5; ++i) { lv_tick_inc(100); now_us += 100000; lv_timer_handler(); }
     lv_refr_now(NULL);
 }
+static void read_pointer(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    (void)indev;
+    data->point = pointer;
+    data->state = pointer_down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+static void advance(unsigned ms)
+{
+    for (unsigned i = 0; i < ms; i += 10) {
+        lv_tick_inc(10);
+        now_us += 10000;
+        lv_timer_handler();
+    }
+}
+
+static void gesture(int x, int y, int end_x, int end_y, unsigned hold_ms)
+{
+    pointer = (lv_point_t){x, y};
+    pointer_down = true;
+    advance(hold_ms);
+    if (x != end_x || y != end_y) {
+        for (int i = 1; i <= 5; ++i) {
+            pointer.x = x + (end_x - x) * i / 5;
+            pointer.y = y + (end_y - y) * i / 5;
+            advance(30);
+        }
+    }
+    pointer_down = false;
+    advance(70);
+}
+
+static void show_reader_toolbar(void) { gesture(220, 145, 220, 145, 700); }
+static void swipe_next(void) { gesture(385, 150, 85, 150, 60); }
+static void swipe_previous(void) { gesture(85, 150, 385, 150, 60); }
 static void snapshot(const char *directory, const char *name)
 {
     tick(); char path[512]; snprintf(path, sizeof(path), "%s/%s.ppm", directory, name);
@@ -229,14 +273,44 @@ int main(int argc, char **argv)
     lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(display, draw_buffer, NULL, sizeof(draw_buffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display, flush);
+    lv_indev_t *input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(input, display);
+    lv_indev_set_read_cb(input, read_pointer);
     app_ui_t ui = {0}; app_open_reader(&ui); snapshot(argv[2], "reader-shelf");
     app_open_reader_path(&ui, book_path); snapshot(argv[2], "reader-24-night");
+    lv_obj_t *toolbar = lv_obj_get_parent(lv_obj_get_parent(find_text(ui.screen, "左右滑动")));
+    assert(lv_obj_has_flag(toolbar, LV_OBJ_FLAG_HIDDEN));
+    assert(!find_text(ui.screen, "下一页") && !find_text(ui.screen, "上一页"));
+    const unsigned before_modes = text_calls;
+    show_reader_toolbar();
+    assert(!lv_obj_has_flag(toolbar, LV_OBJ_FLAG_HIDDEN) && text_calls == before_modes);
     assert(find_text_contains(ui.screen,"缺字0/坏码0"));
+    click(&ui, "左右滑动");
+    gesture(400, 160, 400, 160, 60);
+    gesture(70, 160, 70, 160, 60);
+    assert(text_calls == before_modes + 2);
+    swipe_next();
+    assert(text_calls == before_modes + 2);
+    click(&ui, "左右点击");
+    gesture(220, 310, 220, 110, 60);
+    gesture(220, 110, 220, 310, 60);
+    assert(text_calls == before_modes + 4);
+    click(&ui, "上下滑动");
+    gesture(220, 310, 220, 310, 60);
+    gesture(220, 110, 220, 110, 60);
+    assert(text_calls == before_modes + 6);
+    advance(3200);
+    assert(lv_obj_has_flag(toolbar, LV_OBJ_FLAG_HIDDEN));
+    app_open_reader_path(&ui, book_path);
+    assert(saved.turn_mode == APP_READER_TURN_TAP_VERTICAL && find_text(ui.screen, "上下点击"));
+    show_reader_toolbar();
+    click(&ui, "上下点击");
     click(&ui, "24号字"); snapshot(argv[2], "reader-16-night");
     click(&ui, "日间"); snapshot(argv[2], "reader-16-day");
     click(&ui, "16号字"); snapshot(argv[2], "reader-24-day");
-    for (unsigned i = 0; i < 50; ++i) { click(&ui, "下一页"); click(&ui, "上一页"); }
-    click(&ui, "下一页"); tick(); tick(); tick(); tick();
+    for (unsigned i = 0; i < 50; ++i) { swipe_next(); swipe_previous(); }
+    swipe_next(); tick(); tick(); tick(); tick();
     assert(has_saved && saved.offset > 3);
     const uint64_t resume = saved.offset;
     app_open_reader_path(&ui, book_path); tick(); tick(); tick(); tick();
@@ -248,8 +322,10 @@ int main(int argc, char **argv)
     tick(); tick(); tick(); tick();
     assert(find_text_contains(ui.screen,"  完") && !find_text(ui.screen,"已到书末"));
     const uint64_t last_page=saved.offset;
-    app_open_reader_path(&ui,book_path); click(&ui,"上一页"); tick(); tick(); tick(); tick();
+    app_open_reader_path(&ui,book_path); advance(100); swipe_previous(); tick(); tick(); tick(); tick();
     assert(saved.offset<last_page && last_page-saved.offset<4096 && !find_text(ui.screen,"已到书末"));
+    swipe_next(); tick(); tick(); tick(); tick();
+    assert(saved.offset==last_page);
     click(&ui, "自动编码");
     app_open_reader_path(&ui, book_path);
     assert(has_saved && saved.encoding_hint == 1 && find_text(ui.screen,"UTF-8"));
@@ -318,6 +394,7 @@ int main(int argc, char **argv)
     if (ui.timer) lv_timer_delete(ui.timer);
     if (ui.page_cleanup) ui.page_cleanup(&ui);
     lv_obj_delete(ui.screen);
+    lv_indev_delete(input);
     assert(lv_mem_test() == LV_RESULT_OK);
     lv_deinit();
     puts("PASS actual LVGL reader/music rendering, source-offset resume, manual encoding persistence, 100 turns, 200 page rebuilds, hot-unplug/reinsert and allocator integrity");

@@ -248,7 +248,7 @@ static esp_err_t probe_system_power_bus(aether_board_t *board)
     return pmic_err;
 }
 
-esp_err_t aether_board_init(aether_board_t *board)
+esp_err_t aether_board_init_display(aether_board_t *board)
 {
     ESP_RETURN_ON_FALSE(board, ESP_ERR_INVALID_ARG, TAG, "invalid board pointer");
     memset(board, 0, sizeof(*board));
@@ -278,7 +278,36 @@ esp_err_t aether_board_init(aether_board_t *board)
              charge.fast_charge_ma, charge.precharge_ma, charge_changed);
     ESP_RETURN_ON_ERROR(cc_error, TAG, "default USB sink and boost OFF policy");
 
-    /* Before GUI/Host tasks exist, test the ADC against an external USB input.
+    const tg29_power_profile_t profile = {
+        .aldo2_mv = CONFIG_AETHER_POWER_ALDO2_MV,
+        .aldo4_mv = CONFIG_AETHER_POWER_ALDO4_MV,
+        .bldo1_mv = CONFIG_AETHER_POWER_BLDO1_MV,
+        .cldo1_mv = CONFIG_AETHER_POWER_CLDO1_MV,
+        .cldo3_mv = CONFIG_AETHER_POWER_CLDO3_MV,
+        /* Sensor I/O remains on the PMIC's system I2C bus even when sampling
+         * is disabled. Keep ALDO2 powered so those pins cannot clamp the bus. */
+        .enable_sensor_rail = true,
+        .enable_codec_rail = CONFIG_AETHER_ENABLE_AUDIO,
+        .enable_sd_rail = false,
+        .enable_touch_rail = CONFIG_AETHER_ENABLE_TOUCH,
+        .enable_display_rail = CONFIG_AETHER_ENABLE_DISPLAY,
+    };
+    ESP_RETURN_ON_ERROR(tg29_apply_power_profile(board->pmic, &profile), TAG,
+                        "apply TG29 power policy");
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (CONFIG_AETHER_ENABLE_DISPLAY) {
+        ESP_RETURN_ON_ERROR(init_display(board), TAG, "initialize CO5300AF");
+        board->display_ready = true;
+        board->display_brightness = 100;
+    }
+    return ESP_OK;
+}
+
+esp_err_t aether_board_init_peripherals(aether_board_t *board)
+{
+    ESP_RETURN_ON_FALSE(board && board->pmic, ESP_ERR_INVALID_ARG, TAG, "board power unavailable");
+    /* Before USB host or power tasks exist, test the ADC against an external USB input.
      * This probe never enables the boost and restores its temporary channel. */
     tg29_vbus_input_probe_result_t input_probe = {0};
     const esp_err_t input_error = tg29_probe_vbus_input(board->pmic, 2000, &input_probe);
@@ -313,25 +342,6 @@ esp_err_t aether_board_init(aether_board_t *board)
         ESP_LOGW(TAG, "USB input ADC restore=%s; retry checked OFF=%s",
                  esp_err_to_name(input_probe.cleanup_error), esp_err_to_name(cleanup));
     }
-
-
-    const tg29_power_profile_t profile = {
-        .aldo2_mv = CONFIG_AETHER_POWER_ALDO2_MV,
-        .aldo4_mv = CONFIG_AETHER_POWER_ALDO4_MV,
-        .bldo1_mv = CONFIG_AETHER_POWER_BLDO1_MV,
-        .cldo1_mv = CONFIG_AETHER_POWER_CLDO1_MV,
-        .cldo3_mv = CONFIG_AETHER_POWER_CLDO3_MV,
-        /* Sensor I/O remains on the PMIC's system I2C bus even when sampling
-         * is disabled. Keep ALDO2 powered so those pins cannot clamp the bus. */
-        .enable_sensor_rail = true,
-        .enable_codec_rail = CONFIG_AETHER_ENABLE_AUDIO,
-        .enable_sd_rail = false,
-        .enable_touch_rail = CONFIG_AETHER_ENABLE_TOUCH,
-        .enable_display_rail = CONFIG_AETHER_ENABLE_DISPLAY,
-    };
-    ESP_RETURN_ON_ERROR(tg29_apply_power_profile(board->pmic, &profile), TAG,
-                        "apply TG29 power policy");
-    vTaskDelay(pdMS_TO_TICKS(10));
 
     const gpio_config_t board_inputs = {
         .pin_bit_mask = (1ULL << AETHER_GPIO_DPS368_INT) |
@@ -371,11 +381,6 @@ esp_err_t aether_board_init(aether_board_t *board)
             hold_failed_output_low(AETHER_GPIO_PA_ENABLE, "PA_ENABLE");
             disable_failed_rail(board, TG29_RAIL_ALDO4);
         }
-    }
-    if (CONFIG_AETHER_ENABLE_DISPLAY) {
-        ESP_RETURN_ON_ERROR(init_display(board), TAG, "initialize CO5300AF");
-        board->display_ready = true;
-        board->display_brightness = 100;
     }
     if (CONFIG_AETHER_ENABLE_TOUCH) {
         esp_err_t err = init_touch(board);

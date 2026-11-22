@@ -105,14 +105,18 @@ static void replay_event(lv_event_t *event)
         aether_recorder_get_status(page->recorder, &status) != ESP_OK || status.active ||
         status.state != AETHER_RECORDER_FINISHED || !status.path[0] || !status.data_bytes) return;
     /* The next page owns its copy; no recorder-page pointer crosses navigation. */
-    app_open_music_path(page->ui, status.path);
+    app_ui_t *ui = page->ui;
+    app_open_music_path(ui, status.path);
+    ui->page_back = app_open_recorder;
 }
 
 static void browse_event(lv_event_t *event)
 {
     recorder_page_t *page = event_page(event);
     if (page && !page->pending && !page->gated) {
-        app_open_files_path(page->ui, AETHER_STORAGE_MOUNT_POINT "/Recordings");
+        app_ui_t *ui = page->ui;
+        app_open_files_path(ui, AETHER_STORAGE_MOUNT_POINT "/Recordings");
+        ui->page_back = app_open_recorder;
     }
 }
 

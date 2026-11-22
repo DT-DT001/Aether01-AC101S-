@@ -19,7 +19,16 @@ typedef enum {
     APP_IO_READER_LOAD,
     APP_IO_READER_SAVE,
     APP_IO_RECORDER,
+    APP_IO_IMAGES, /* Catalog filter for image files and navigable folders. */
 } app_io_operation_t;
+
+typedef enum {
+    APP_READER_TURN_SWIPE_HORIZONTAL,
+    APP_READER_TURN_TAP_HORIZONTAL,
+    APP_READER_TURN_SWIPE_VERTICAL,
+    APP_READER_TURN_TAP_VERTICAL,
+    APP_READER_TURN_MODE_COUNT,
+} app_reader_turn_mode_t;
 
 typedef struct {
     char path[192];
@@ -38,6 +47,7 @@ typedef struct {
     bool dark;
     bool source_boundary;
     unsigned encoding_hint;
+    app_reader_turn_mode_t turn_mode;
 } app_io_request_t;
 
 typedef struct {
@@ -50,6 +60,7 @@ typedef struct {
     app_reader_encoding_t encoding;
     uint32_t invalid_count;
     unsigned encoding_hint;
+    app_reader_turn_mode_t turn_mode;
     app_io_entry_t *entries;
     size_t count;
     size_t total_count;

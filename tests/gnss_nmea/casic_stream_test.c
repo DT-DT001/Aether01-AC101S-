@@ -137,17 +137,34 @@ static void contradictory_no_fix_policy(gnss_nmea_parser_t *p)
     }
     body(p, good_gga, 29300); assert(status(p, 29300).position_valid);
     puts("PASS characterized policy: repeated RMC A plus GGA quality0 vetoes fix indefinitely; consistent GGA immediately restores fix");
-    /* The implementation compares receive freshness, not NMEA UTC epochs.
-     * An old-but-newly-received no-fix therefore has the same veto effect. */
+    /* Repeated old no-fix packets can arrive after current fix reports. */
     gnss_nmea_reset(p);
     for (unsigned second = 0; second < 15; ++second) {
         uint64_t now = (uint64_t)second * 1000;
         make_epoch(good_rmc, sizeof(good_rmc), good_gga, sizeof(good_gga), second, true, "GN");
         body(p, good_rmc, now);
         body(p, "GNGGA,115959.000,,,,,0,00,99.99,,,,,,", now + 100);
-        assert(!status(p, now + 200).position_valid);
+        gnss_nmea_snapshot_t s = status(p, now + 200);
+        assert(s.position_valid && s.time_valid && s.last_fix_ms == now);
     }
-    puts("PASS characterized limitation: repeated stale-epoch no-fix also vetoes current RMC because freshness uses arrival time");
+    puts("PASS repeated stale-epoch no-fix GGA cannot veto current RMC");
+
+    gnss_nmea_reset(p);
+    body(p, "GNRMC,235959,A,3112.00000,N,12130.00000,E,0,0,211126,,,A", 100);
+    body(p, "GNGGA,000000,,,,,0,00,99.99,,,,,,", 200);
+    assert(!status(p, 200).position_valid); /* Newer no-fix across midnight. */
+    body(p, "GNRMC,000001,A,3112.00000,N,12130.00000,E,0,0,221126,,,A", 300);
+    body(p, "GNGGA,235959,,,,,0,00,99.99,,,,,,", 400);
+    assert(status(p, 400).position_valid); /* Stale no-fix across midnight. */
+    body(p, "GNGGA,,,,,,0,00,99.99,,,,,,", 450);
+    assert(!status(p, 450).position_valid); /* No clock to order; conservative veto. */
+
+    gnss_nmea_reset(p);
+    body(p, "GNGGA,120000,3112.00000,N,12130.00000,E,1,08,1.2,12.3,M,4.5,M,,", 100);
+    body(p, "GNRMC,115959,V,,,,,,,211126,,,N", 120);
+    assert(status(p, 120).position_valid);
+    assert(!status(p, 5101).position_valid); /* Arrival still bounds freshness. */
+    puts("PASS no-fix ordering across midnight, undated veto, RMC/GGA symmetry and expiry");
 }
 
 int main(void)

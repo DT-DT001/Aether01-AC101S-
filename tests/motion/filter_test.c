@@ -8,6 +8,42 @@ static void unit(const app_motion_filter_t *f) {
     assert(fabsf(n-1)<.0002f);
     assert(isfinite(f->roll) && isfinite(f->pitch) && isfinite(f->yaw));
 }
+static void uncalibrated_game_tilt(void)
+{
+    app_motion_filter_t filter;
+    app_motion_filter_init(&filter);
+    const float raw_gyro[3] = {8.05f, 1.92f, -.09f};
+    const float neutral[3] = {0, 0, 8.9f};
+    assert(app_motion_filter_update_tilt(&filter, neutral, raw_gyro, 0, false));
+    app_motion_filter_zero(&filter);
+    uint32_t time = 0;
+    for (unsigned i = 0; i < 200; ++i) {
+        time += 20;
+        assert(app_motion_filter_update_tilt(&filter, neutral, raw_gyro, time, false));
+    }
+    assert(fabsf(filter.roll) < .1f && fabsf(filter.pitch) < .1f);
+
+    const float poses[][3] = {{-2.453f, 0, 8.555f}, {2.453f, 0, 8.555f},
+                              {0, -2.453f, 8.555f}, {0, 2.453f, 8.555f}};
+    for (unsigned axis = 0; axis < 4; ++axis) {
+        for (unsigned i = 0; i < 5; ++i) {
+            time += 20;
+            assert(app_motion_filter_update_tilt(&filter, poses[axis], raw_gyro, time, false));
+        }
+        const float angle = axis < 2 ? filter.pitch : -filter.roll;
+        assert(axis % 2 ? angle < -12.0f : angle > 12.0f);
+        for (unsigned i = 0; i < 6; ++i) {
+            time += 20;
+            assert(app_motion_filter_update_tilt(&filter, neutral, raw_gyro, time, false));
+        }
+        assert(fabsf(filter.roll) < 1.0f && fabsf(filter.pitch) < 1.0f);
+        unit(&filter);
+    }
+    const float freefall[3] = {0, 0, 0};
+    assert(!app_motion_filter_update_tilt(&filter, freefall, raw_gyro, time + 20, false));
+    assert(!app_motion_filter_update_tilt(&filter, neutral, raw_gyro, time, false));
+    puts("PASS unqualified IMU game filter: raw-bias rejection, four-way response, neutral recovery and invalid frames");
+}
 int main(void) {
     app_motion_filter_t f;app_motion_filter_init(&f);
     float a[3]={0,0,G},w[3]={0,0,0};
@@ -42,5 +78,6 @@ int main(void) {
     w[0]=140;w[1]=-80;w[2]=25;
     for(unsigned i=2;i<20000;++i) {assert(app_motion_filter_update(&f,a,w,i*20));unit(&f);}
     puts("PASS invalid samples preserve orientation; tick wrap and20k updates remain normalized");
+    uncalibrated_game_tilt();
     return 0;
 }

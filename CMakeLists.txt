@@ -7,6 +7,11 @@ option(AETHER_H264_HP_ALLOCATOR "Confine S31 H264 allocations to HP/PSRAM" ON)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(aether01_ac101s)
 
+include(components/aether_usb_host/high_bandwidth/s31_usb_iso_in.cmake)
+aether_enable_s31_usb_iso_in()
+include(components/aether_usb_camera/s31_uvc_rx.cmake)
+aether_enable_s31_uvc_rx()
+
 # External library BSS relies on the board's existing cache-on PSRAM XIP mode.
 if(CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY AND
    (NOT CONFIG_SPIRAM_FETCH_INSTRUCTIONS OR NOT CONFIG_SPIRAM_RODATA))

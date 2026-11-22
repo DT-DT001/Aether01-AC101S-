@@ -8,11 +8,16 @@ typedef struct {
     bool preferences_pending;
     bool preferences_deferred;
     bool clock_pending;
+    bool network_clock_pending;
+    bool network_clock_received;
     uint32_t best_score;
     float reference_pressure_pa;
     esp_err_t preferences_error;
     esp_err_t clock_error;
     uint32_t clock_revision;
+    esp_err_t network_clock_error;
+    uint32_t network_clock_revision;
+    pcf85063_time_t clock_verified;
     tg29_power_state_t power;
     esp_err_t power_error;
     uint32_t power_updated_ms;
@@ -28,5 +33,10 @@ void app_tools_set_audio_player(aether_audio_player_handle_t audio);
 void app_tools_set_persistence_guard(bool (*busy)(void *), void *context);
 void app_tools_get_snapshot(app_tools_snapshot_t *snapshot);
 esp_err_t app_tools_set_clock(const pcf85063_time_t *time);
+/* The clock app stores local Beijing time (UTC+8) in the RTC. The system
+ * epoch remains UTC. These commands never wait for I2C or the network. */
+bool app_tools_clock_network_ready(void);
+esp_err_t app_tools_sync_clock(void);
+void app_tools_set_clock_quiesced(bool quiesced);
 esp_err_t app_tools_set_reference_pressure(float pressure_pa);
 void app_tools_record_score(uint32_t score);

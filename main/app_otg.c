@@ -1,6 +1,7 @@
 #include "app_nes_controls.h"
 #include "app_otg.h"
 #include "aether_usb_audio.h"
+#include "aether_usb_camera.h"
 #include "aether_usb_storage.h"
 #include "app_usb_input.h"
 #include <limits.h>
@@ -517,11 +518,14 @@ static void input(void *context, uint16_t buttons)
     if (state->nes) (void)aether_nes_set_external_input(state->nes, buttons);
 }
 
+enum { OTG_CAMERA_CLASS = 2 };
 static const aether_usb_host_class_ops_t s_classes[] = {
     {.start=aether_usb_storage_class_start, .request_stop=aether_usb_storage_class_request_stop,
      .poll_stopped=aether_usb_storage_class_poll_stopped},
     {.start=aether_usb_audio_class_start, .request_stop=aether_usb_audio_class_request_stop,
      .poll_stopped=aether_usb_audio_class_poll_stopped},
+    [OTG_CAMERA_CLASS] = {.start=aether_usb_camera_class_start, .request_stop=aether_usb_camera_class_request_stop,
+     .poll_stopped=aether_usb_camera_class_poll_stopped},
 };
 
 esp_err_t app_otg_init(aether_board_t *board, aether_nes_handle_t nes, app_power_t *power)
@@ -536,6 +540,7 @@ esp_err_t app_otg_init(aether_board_t *board, aether_nes_handle_t nes, app_power
     const aether_usb_host_config_t config = {
         .context = &s_otg, .query_sink = query_sink, .set_vbus = set_vbus, .input = input,
         .hid_input = app_usb_input_publish, .keyboard_map=app_nes_controls_map, .classes=s_classes, .class_count=sizeof(s_classes)/sizeof(s_classes[0]),
+        .camera_class_mask=1U<<OTG_CAMERA_CLASS,
     };
     s_otg.init_error = aether_usb_host_new(&config, &s_otg.host);
     return s_otg.init_error;
@@ -617,6 +622,13 @@ static esp_err_t set_source_mode(otg_source_mode_t mode)
 esp_err_t app_otg_set_enabled(bool enabled)
 {
     return set_source_mode(enabled ? OTG_SOURCE_AUTO : OTG_SOURCE_OFF);
+}
+
+esp_err_t app_otg_set_camera_profile(bool enabled)
+{
+    if (!s_otg.host) return s_otg.init_error;
+    if (enabled && atomic_load(&s_otg.source_mode) == OTG_SOURCE_MANUAL) return ESP_ERR_INVALID_STATE;
+    return aether_usb_host_set_camera_profile(s_otg.host, enabled);
 }
 
 esp_err_t app_otg_set_manual_enabled(bool enabled)

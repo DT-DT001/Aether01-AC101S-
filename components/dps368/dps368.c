@@ -1,6 +1,7 @@
 #include "dps368.h"
 
 #include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_check.h"
@@ -152,9 +153,12 @@ esp_err_t dps368_read(dps368_handle_t handle, dps368_sample_t *sample)
     const float t = t_raw / handle->temperature_scale;
     const dps368_calib_t *c = &handle->calib;
 
-    sample->temperature_c = c->c0 * 0.5f + c->c1 * t;
-    sample->pressure_pa = c->c00 + p * (c->c10 + p * (c->c20 + p * c->c30)) +
-                          t * c->c01 + t * p * (c->c11 + p * c->c21);
+    const float temperature = c->c0 * 0.5f + c->c1 * t;
+    const float pressure = c->c00 + p * (c->c10 + p * (c->c20 + p * c->c30)) +
+                           t * c->c01 + t * p * (c->c11 + p * c->c21);
+    if (!isfinite(temperature) || !isfinite(pressure) || pressure <= 0)
+        return ESP_ERR_INVALID_RESPONSE;
+    *sample = (dps368_sample_t){.temperature_c = temperature, .pressure_pa = pressure};
     return ESP_OK;
 }
 

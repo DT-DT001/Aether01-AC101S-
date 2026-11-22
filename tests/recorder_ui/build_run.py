@@ -1,11 +1,11 @@
 """Own output directory; the existing reader LVGL/font cache is read only."""
 from pathlib import Path
-import struct, subprocess, zlib
+import os, struct, subprocess, zlib
 root = Path(__file__).resolve().parents[2]
 test = root / 'tests/recorder_ui'
 out = root / 'build/host_recorder_ui'
 out.mkdir(parents=True, exist_ok=True)
-cached = root / 'build/host_reader_ui'
+cached = Path(os.environ.get('AETHER_LVGL_CACHE', root / 'build/host_reader_ui'))
 lvgl = root / 'managed_components/lvgl__lvgl'
 objects = sorted(cached.glob('managed_components_lvgl__lvgl_src_*.c.o'))
 objects += [cached / 'main_assets_font_16.c.o', cached / 'main_assets_font_24.c.o']

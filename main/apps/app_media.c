@@ -8,19 +8,15 @@
 #include <strings.h>
 #include <stdlib.h>
 #include "app_text.h"
+#include "ui/app_scroll_list.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 
 static const char *base_name(const char *path)
 {
     const char *slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
-}
-
-static bool media_storage_ready(app_ui_t *ui)
-{
-    /* Remount precedes USB teardown completion; remember only usable states. */
-    return aether_media_fs_path_ready(ui->storage, aether_media_fs_default_root(ui->storage)) && !app_io_usb_storage_blocked(ui->io);
 }
 
 static void present_media_frame(app_ui_t *ui, const uint16_t *pixels,
@@ -91,7 +87,7 @@ static void media_contain_ext_draw(lv_event_t *event)
 
 static void media_back(lv_event_t *event)
 {
-    app_ui_show_home(lv_event_get_user_data(event));
+    (void)app_ui_go_back(lv_event_get_user_data(event));
 }
 
 static lv_obj_t *media_button(lv_obj_t *parent, const char *text, int x, int y,
@@ -535,7 +531,7 @@ static void nes_status_timer(lv_timer_t *timer)
         lv_display_trigger_activity(lv_display_get_default());
     if (status.state == AETHER_NES_RUNNING || status.state == AETHER_NES_PAUSED) {
         /* A running game is only the viewport. HID owns joypad input; the
-         * invisible upper-left hold gesture and HID EXIT still return home. */
+         * invisible upper-left hold gesture and HID EXIT leave the game. */
         lv_obj_add_flag(ui->app_obj[1], LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ui->app_obj[2], LV_OBJ_FLAG_HIDDEN);
     } else if (status.state == AETHER_NES_ERROR) {
@@ -559,7 +555,7 @@ static void nes_status_timer(lv_timer_t *timer)
             esp_err_to_name(status.last_error), status.detail[0] ? status.detail : "读取或模拟器初始化失败");
     } else if (status.state == AETHER_NES_STOPPED && ui->media_started) {
         ui->media_started = false;
-        app_ui_show_home(ui);
+        (void)app_ui_go_back(ui);
     }
 }
 
@@ -621,87 +617,130 @@ void app_open_nes_path(app_ui_t *ui, const char *path)
 typedef struct {
     app_io_operation_t filter;
     app_io_entry_t *entries;
-    size_t count, total;
-    uint64_t offset;
+    size_t count;
+    app_scroll_list_t rows;
+    const char *root;
+    uint32_t generation;
     bool mounted;
-    lv_obj_t *list, *info;
+    lv_obj_t *info;
 } media_picker_t;
 static void picker_load(app_ui_t *ui);
+
 static void picker_cleanup(app_ui_t *ui)
 {
     media_picker_t *p = ui->page_context;
-    if (p) { free(p->entries); free(p); }
+    if (p) {
+        app_scroll_list_deinit(&p->rows);
+        free(p->entries);
+        free(p);
+    }
     ui->page_context = NULL;
 }
+
+static bool picker_storage_changed(app_ui_t *ui, const media_picker_t *p)
+{
+    const char *root = aether_media_fs_default_root(ui->storage);
+    const bool ready = aether_media_fs_path_ready(ui->storage, root) && !app_io_usb_storage_blocked(ui->io);
+    return strcmp(p->root, root) || p->mounted != ready ||
+        p->generation != aether_media_fs_generation(ui->storage, root);
+}
+
 static void picker_select(lv_event_t *event)
 {
     app_ui_t *ui = lv_event_get_user_data(event);
     media_picker_t *p = ui->page_context;
     size_t i = (size_t)(uintptr_t)lv_obj_get_user_data(lv_event_get_target_obj(event));
     if (!p || ui->io_complete || i >= p->count) return;
+    if (picker_storage_changed(ui, p)) { picker_load(ui); return; }
     char path[192]; strlcpy(path, p->entries[i].path, sizeof(path));
-    if (p->filter == APP_IO_VIDEO) app_open_video_path(ui, path);
-    else app_open_nes_path(ui, path);
+    if (p->filter == APP_IO_VIDEO) {
+        app_open_video_path(ui, path);
+        ui->page_back = app_open_video;
+    } else {
+        app_open_nes_path(ui, path);
+        ui->page_back = app_open_nes;
+    }
 }
+
+static lv_obj_t *create_picker_row(lv_obj_t *parent, void *context)
+{
+    lv_obj_t *row = lv_button_create(parent);
+    lv_obj_set_size(row, 400, 44);
+    lv_obj_set_style_radius(row, 12, 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x18243A), 0);
+    lv_obj_t *label = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 0, 0, 0xEAF2FF, NULL);
+    lv_obj_set_width(label, 360);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_add_event_cb(row, picker_select, LV_EVENT_CLICKED, context);
+    return row;
+}
+
+static void bind_picker_row(lv_obj_t *row, size_t index, void *context)
+{
+    const app_ui_t *ui = context;
+    const media_picker_t *p = ui->page_context;
+    char name[sizeof(p->entries[index].path)];
+    strlcpy(name, base_name(p->entries[index].path), sizeof(name));
+    app_text_sanitize_utf8(name, strlen(name));
+    app_ui_label_text(lv_obj_get_child(row, 0), name);
+}
+
 static void picker_loaded(app_ui_t *ui, const app_io_result_t *r)
 {
     media_picker_t *p = ui->page_context;
     if (!p) return;
-    free(p->entries); p->entries = NULL; p->count = 0;
-    lv_obj_clean(p->list);
-    lv_obj_set_height(p->list, 260);
-    lv_obj_set_y(p->info, 268);
+    if (picker_storage_changed(ui, p)) { picker_load(ui); return; }
+    if (!p->mounted) return;
     if (r->error != ESP_OK) {
         app_ui_label_fmt(p->info, "读取失败：%s；插卡后刷新", esp_err_to_name(r->error)); return;
     }
-    p->entries = malloc(r->count * sizeof(*p->entries));
+    if (r->count) p->entries = heap_caps_malloc(r->count * sizeof(*p->entries),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (r->count && !p->entries) { app_ui_label_text(p->info, "内存不足"); return; }
     if (r->count) memcpy(p->entries, r->entries, r->count * sizeof(*p->entries));
-    p->count = r->count; p->total = r->total_count;
-    for (size_t i = 0; i < p->count; ++i) {
-        char text[192]; strlcpy(text, base_name(p->entries[i].path), sizeof(text));
-        app_text_sanitize_utf8(text, strlen(text));
-        lv_obj_t *b = lv_list_add_button(p->list, NULL, text);
-        lv_obj_set_style_bg_color(b, lv_color_hex(0x18243A), 0);
-        lv_obj_set_style_text_color(b, lv_color_hex(0xEAF2FF), 0);
-        lv_obj_set_style_min_height(b, 44, 0);
-        lv_obj_set_user_data(b, (void *)(uintptr_t)i);
-        lv_obj_add_event_cb(b, picker_select, LV_EVENT_CLICKED, ui);
-    }
-    app_ui_label_fmt(p->info, "%u 个文件 · 第 %llu 页%s", (unsigned)p->total,
-        (unsigned long long)(p->offset / 32 + 1), p->total > 4096 ? "，仅索引前4096个" : "");
+    p->count = r->count;
+    app_scroll_list_set_count(&p->rows, p->count);
+    app_ui_label_fmt(p->info, "%u 个文件%s", (unsigned)r->total_count, r->truncated ? " · 部分文件未索引" : "");
     if (!p->count) {
         if (p->filter == APP_IO_VIDEO) {
-            lv_obj_set_height(p->list, 224);
-            lv_obj_set_y(p->info, 232);
+            lv_obj_set_height(p->rows.viewport, 210);
+            lv_obj_set_y(p->info, 264);
             app_ui_label_text(p->info,
-                "MP4：H.264受限基线/AAC-LC\n尺寸≤480x480、源帧率≤30fps\nMJPEG：≤480x480，宽高16倍数\n视频放入 Video；可先在电脑转换");
+                "Video 文件夹和根目录没有视频\n支持 H.264/AAC-LC MP4 和 MJPEG，最高 480×480");
         } else app_ui_label_text(p->info,
-            "将 iNES 游戏放入 ROMs 文件夹；其他目录可从文件浏览打开");
+            "ROMs 文件夹和根目录没有 iNES 游戏");
     }
 }
+
 static void picker_load(app_ui_t *ui)
 {
     media_picker_t *p = ui->page_context;
-    app_io_request_t q = {.operation = APP_IO_CATALOG, .filter = p->filter, .offset = p->offset, .limit = 32};
-    app_ui_label_text(p->info, "正在读取…"); app_ui_request_io_ex(ui, &q, picker_loaded);
+    p->root = aether_media_fs_default_root(ui->storage);
+    p->generation = aether_media_fs_generation(ui->storage, p->root);
+    p->mounted = aether_media_fs_path_ready(ui->storage, p->root) && !app_io_usb_storage_blocked(ui->io);
+    app_scroll_list_set_count(&p->rows, 0);
+    free(p->entries);
+    p->entries = NULL;
+    p->count = 0;
+    lv_obj_set_height(p->rows.viewport, 260);
+    lv_obj_set_y(p->info, 316);
+    if (!p->mounted) { app_ui_label_text(p->info, "存储设备未就绪"); return; }
+    const app_io_request_t q = {.operation = APP_IO_CATALOG, .filter = p->filter, .limit = 4096};
+    app_ui_label_text(p->info, "正在读取…");
+    app_ui_request_io_ex(ui, &q, picker_loaded);
 }
 static void picker_action(lv_event_t *event)
 {
     app_ui_t *ui = lv_event_get_user_data(event);
     media_picker_t *p = ui->page_context;
     if (!p || ui->io_complete) return;
-    intptr_t action = (intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(event));
-    if (action < 0 && p->offset >= 32) p->offset -= 32;
-    else if (action > 0 && p->offset + p->count < p->total && p->offset + p->count < 4096) p->offset += 32;
     picker_load(ui);
 }
 static void picker_timer(lv_timer_t *timer)
 {
     app_ui_t *ui = lv_timer_get_user_data(timer);
     media_picker_t *p = ui->page_context;
-    bool mounted = media_storage_ready(ui);
-    if (p && mounted != p->mounted) { p->mounted = mounted; picker_load(ui); }
+    if (p && picker_storage_changed(ui, p)) picker_load(ui);
 }
 static void media_picker(app_ui_t *ui, app_io_operation_t filter)
 {
@@ -709,20 +748,23 @@ static void media_picker(app_ui_t *ui, app_io_operation_t filter)
     media_picker_t *p = calloc(1, sizeof(*p));
     if (!p) { app_ui_add_text(content, "内存不足", LV_ALIGN_CENTER, 0, 0, 0xFF8888, NULL); return; }
     ui->page_context = p; ui->page_cleanup = picker_cleanup;
-    p->filter = filter; p->mounted = media_storage_ready(ui);
-    p->list = lv_list_create(content); lv_obj_set_size(p->list, 408, 260);
-    lv_obj_set_style_bg_color(p->list, lv_color_hex(0x10192A), 0);
-    lv_obj_set_style_border_width(p->list, 0, 0);
-    p->info = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 0, 268, 0xAFC6E9, NULL);
+    p->filter = filter;
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *list = lv_obj_create(content);
+    lv_obj_set_pos(list, 0, 48);
+    lv_obj_set_size(list, 408, 260);
+    lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    app_scroll_list_init(&p->rows, list, 50, create_picker_row, bind_picker_row, ui);
+    p->info = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 0, 316, 0xAFC6E9, NULL);
     lv_obj_set_width(p->info, 405);
-    static const char *const names[] = {"上一页", "刷新", "下一页"};
-    for (int i = 0; i < 3; ++i) {
-        lv_obj_t *b = lv_button_create(content);
-        lv_obj_set_pos(b, i * 140, 316); lv_obj_set_size(b, 128, 38);
-        lv_obj_set_user_data(b, (void *)(intptr_t)(i - 1));
-        lv_obj_add_event_cb(b, picker_action, LV_EVENT_CLICKED, ui);
-        app_ui_add_text(b, names[i], LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, NULL);
-    }
+    lv_obj_t *refresh = lv_button_create(content);
+    lv_obj_set_pos(refresh, 350, 0);
+    lv_obj_set_size(refresh, 54, 40);
+    lv_obj_set_style_bg_color(refresh, lv_color_hex(0x20334F), 0);
+    lv_obj_add_event_cb(refresh, picker_action, LV_EVENT_CLICKED, ui);
+    app_ui_add_text(refresh, LV_SYMBOL_REFRESH, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, &lv_font_montserrat_24);
     app_ui_set_timer(ui, picker_timer, 500); picker_load(ui);
 }
 void app_open_video(app_ui_t *ui) { media_picker(ui, APP_IO_VIDEO); }

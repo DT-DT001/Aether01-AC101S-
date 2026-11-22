@@ -29,6 +29,9 @@ The real 480x480 RGB565 display and pointer gestures verify:
 - Prepare retry repeats the preparation barrier; startup/format errors remain
   readable in full and preserve back/stop/retry. MJPEG native/fixed rate controls
   retain their actual API wiring.
+- Video and NES each scroll through a 96-entry catalog using 12 reused rows.
+  A real pointer tap on the last entry submits its source path to preparation
+  without an extra directory scan.
 - NES receives a producer-expanded480x420 RGB565 frame with anti-aliasing off.
   The real LVGL image remains480x420 and needs no software scaling. During RUNNING
   and PAUSED, only the viewport is visible: no joypad, translucent panels, title

@@ -4,25 +4,32 @@
 #include "wait_test.c"
 #undef main
 #include "esp_heap_caps.h"
+#include "esp_lcd_panel_ops.h"
 #include <string.h>
 
 static uint8_t source_a[32000],source_b[32000],source_snapshot[32000],expected[19200];
-static uint8_t *dma_pixels;
+static const uint8_t *dma_pixels;
 static size_t dma_bytes;
 static atomic_bool dma_live,submit_done;
 static atomic_uint stage_calls;
 static lv_draw_buf_t active;
 static lv_area_t next_area;
 static lv_display_t *staged_display;
+static bool fail_draw;
 static void stage_flush(lv_display_t *d,const lv_area_t *a,uint8_t *p)
 {
-    assert(d==staged_display&&!atomic_load(&dma_live));
+    (void)d;(void)a;(void)p;
+    abort();
+}
+static esp_err_t stage_draw(esp_lcd_panel_handle_t panel,int x1,int y1,int x2,int y2,const void *p)
+{
+    assert(panel==staged_display&&!atomic_load(&dma_live));
     assert(!((uintptr_t)p%64)&&p!=source_a&&p!=source_b);
-    dma_bytes=(size_t)(a->x2-a->x1+1)*(size_t)(a->y2-a->y1+1)*2;
+    if (fail_draw) return ESP_FAIL;
+    dma_bytes=(size_t)(x2-x1)*(size_t)(y2-y1)*2;
     assert(dma_bytes<=sizeof(expected));
-    /* Same single in-place swap as the real port. */
-    for(size_t i=0;i<dma_bytes;i+=2) { uint8_t v=p[i];p[i]=p[i+1];p[i+1]=v; }
     dma_pixels=p;memcpy(expected,p,dma_bytes);atomic_store(&dma_live,true);++stage_calls;
+    return ESP_OK;
 }
 static void prepare(lv_display_t *d,uint8_t *source,const lv_area_t *a)
 {
@@ -54,23 +61,31 @@ int main(void)
 {
     lv_display_t d={.flush_cb=stage_flush,.color_format=LV_COLOR_FORMAT_RGB565,.render_mode=LV_DISPLAY_RENDER_MODE_PARTIAL,.hres=480,.vres=480};
     staged_display=&d;
-    assert(app_display_metrics_attach_staged_rgb565(&d,&d,0)==ESP_ERR_INVALID_ARG);
-    assert(app_display_metrics_attach_staged_rgb565(&d,&d,7)==ESP_ERR_INVALID_ARG);
-    assert(app_display_metrics_attach_staged_rgb565(&d,&d,SIZE_MAX)==ESP_ERR_INVALID_ARG);
-    d.render_mode=LV_DISPLAY_RENDER_MODE_FULL;assert(app_display_metrics_attach_staged_rgb565(&d,&d,19200)==ESP_ERR_NOT_SUPPORTED);d.render_mode=LV_DISPLAY_RENDER_MODE_PARTIAL;
-    d.color_format=LV_COLOR_FORMAT_RGB888;assert(app_display_metrics_attach_staged_rgb565(&d,&d,19200)==ESP_ERR_NOT_SUPPORTED);d.color_format=LV_COLOR_FORMAT_RGB565;
-    test_heap_fail=true;assert(app_display_metrics_attach_staged_rgb565(&d,&d,19200)==ESP_ERR_NO_MEM);test_heap_fail=false;
+    test_panel_draw=stage_draw;
+    assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,0)==ESP_ERR_INVALID_ARG);
+    assert(app_display_metrics_attach_staged_rgb565(&d,NULL,&d,19200)==ESP_ERR_INVALID_ARG);
+    assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,7)==ESP_ERR_INVALID_ARG);
+    assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,SIZE_MAX)==ESP_ERR_INVALID_ARG);
+    d.render_mode=LV_DISPLAY_RENDER_MODE_FULL;assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,19200)==ESP_ERR_NOT_SUPPORTED);d.render_mode=LV_DISPLAY_RENDER_MODE_PARTIAL;
+    d.color_format=LV_COLOR_FORMAT_RGB888;assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,19200)==ESP_ERR_NOT_SUPPORTED);d.color_format=LV_COLOR_FORMAT_RGB565;
+    test_heap_fail=true;assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,19200)==ESP_ERR_NO_MEM);test_heap_fail=false;
     assert(!test_heap_live&&!semaphore_live&&d.flush_cb==stage_flush&&!d.flush_wait_cb);
-    fail_semaphore=true;assert(app_display_metrics_attach_staged_rgb565(&d,&d,19200)==ESP_ERR_NO_MEM);fail_semaphore=false;
+    fail_semaphore=true;assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,19200)==ESP_ERR_NO_MEM);fail_semaphore=false;
     assert(!test_heap_live&&!semaphore_live&&d.flush_cb==stage_flush&&!d.flush_wait_cb);
-    register_error=ESP_FAIL;assert(app_display_metrics_attach_staged_rgb565(&d,&d,19200)==ESP_FAIL);register_error=ESP_OK;
+    register_error=ESP_FAIL;assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,19200)==ESP_FAIL);register_error=ESP_OK;
     assert(!test_heap_live&&!semaphore_live&&d.flush_cb==stage_flush&&!d.flush_wait_cb);
-    assert(app_display_metrics_attach_staged_rgb565(&d,&d,19200)==ESP_OK);
+    assert(app_display_metrics_attach_staged_rgb565(&d,&d,&d,19200)==ESP_OK);
     assert(test_heap_live==1&&semaphore_live==1&&snapshot().staging_capacity==19200&&snapshot().staging_available);
     puts("PASS staged allocation is 64B-aligned internal DMA; mirror/sem OOM and callback failure free all temporaries with unchanged hooks");
 
     app_display_metrics_set_active(true);
     lv_area_t full={0,0,479,19};prepare(&d,source_a,&full);memcpy(source_snapshot,source_a,sizeof(source_a));
+    fail_draw=true;staged_submit(&d,&full,source_a);fail_draw=false;
+    const app_display_metrics_t failed=snapshot();
+    assert(!failed.submitted_sequence&&!failed.completed_sequence&&failed.dropped_regions==1&&
+           failed.staging_error==ESP_FAIL&&!atomic_load(&d.flushing)&&!atomic_load(&dma_live));
+    d.flush_wait_cb(&d);
+    puts("PASS synchronous panel submission failure leaves no phantom transfer or blocked LVGL buffer");
     staged_submit(&d,&full,source_a);assert(!memcmp(source_a,source_snapshot,sizeof(source_a)));
     for(size_t i=0;i<19200;i+=2)assert(dma_pixels[i]==source_a[i+1]&&dma_pixels[i+1]==source_a[i]);
     /* Rendering into the other PSRAM buffer while physical DMA reads this
@@ -136,7 +151,7 @@ int main(void)
     }
     app_display_metrics_t m=snapshot();assert(m.submitted_sequence==before+24&&m.completed_sequence==m.submitted_sequence);
     assert(m.completed_regions==24&&m.completed_refreshes==1&&m.staging_error==ESP_OK&&m.dropped_regions);
-    assert(m.staging_copied_bytes==19200ULL*28+1912&&test_heap_live==1);
+    assert(m.staging_copied_bytes==19200ULL*29+1912&&test_heap_live==1);
     puts("PASS 24 full-width chunks preserve source bytes, count one real completed refresh and recover after dropped regions");
     return 0;
 }

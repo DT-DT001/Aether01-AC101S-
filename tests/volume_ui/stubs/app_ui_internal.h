@@ -9,6 +9,8 @@ struct app_ui {
     lv_obj_t *screen,*content,*app_obj[12];
     void *page_context;
     void (*page_cleanup)(app_ui_t *);
+    bool (*page_can_exit)(app_ui_t *, void (*destination)(app_ui_t *));
+    void (*page_back)(app_ui_t *);
     app_io_handle_t io;
     aether_storage_handle_t storage;
     aether_audio_player_handle_t audio_player;

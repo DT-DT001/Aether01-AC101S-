@@ -306,11 +306,19 @@ int main(void)
     assert(sizeof(legacy_bookmark_t) == sizeof(reader_bookmark_t));
     reader_bookmark_t *legacy = (reader_bookmark_t *)records[0].value;
     legacy->version = 1; legacy->encoding_hint = UINT32_MAX; /* Old padding is not a saved encoding. */
-    result = load(io,path); assert(result.offset == 4242 && result.encoding_hint == 0);
-    app_io_request_t forced = {.operation=APP_IO_READER_SAVE,.offset=4242,.font_px=16,.encoding_hint=2};
+    legacy->turn_mode = UINT8_MAX;
+    result = load(io,path);
+    assert(result.offset == 4242 && result.encoding_hint == 0 && result.turn_mode == APP_READER_TURN_SWIPE_HORIZONTAL);
+    legacy->version = 2;
+    legacy->encoding_hint = 4;
+    result = load(io,path);
+    assert(result.offset == 4242 && result.encoding_hint == 4 && result.turn_mode == APP_READER_TURN_SWIPE_HORIZONTAL);
+    app_io_request_t forced = {.operation=APP_IO_READER_SAVE,.offset=4242,.font_px=16,.encoding_hint=2,
+                              .turn_mode=APP_READER_TURN_TAP_VERTICAL};
     strlcpy(forced.path,path,sizeof(forced.path)); assert(app_io_submit_request(io,&forced) == ESP_OK);
-    result = load(io,path); assert(result.offset == 4242 && result.encoding_hint == 2);
-    puts("PASS v1 bookmark offset/font/theme survive upgrade and v2 encoding override persists without layout changes");
+    result = load(io,path);
+    assert(result.offset == 4242 && result.encoding_hint == 2 && result.turn_mode == APP_READER_TURN_TAP_VERTICAL);
+    puts("PASS v1/v2 bookmarks upgrade and v3 page turn preference persists without a binary layout change");
     puts("PASS safe paths and immediate close/reopen SAVE-before-LOAD ordering");
     size_t before = writes;
     for (unsigned i = 0; i < 20; ++i) save(io, path, 5000 + i);

@@ -5,7 +5,7 @@
 #include "../../components/aether_usb_host/aether_usb_host.c"
 static int critical,route=-1,install_error,uninstall_error,query_error,on_error,off_error,lib_error,route_off_error;
 static unsigned installs,uninstalls,route_writes,on_calls,off_calls,root_on,root_off,allocs,frees;
-static bool sink,physical_vbus,cancel_allowed,core_live;
+static bool sink,physical_vbus,cancel_allowed,core_live,custom_camera_fifo;
 static unsigned generic_keyboard_events,generic_mouse_events,generic_resets;
 static aether_usb_input_event_t last_keyboard,last_mouse;
 static unsigned role_calls,control_allocations,parser_allocations;
@@ -30,7 +30,13 @@ unsigned ulTaskNotifyTake(BaseType_t b,TickType_t t){(void)b;(void)t;return 0;}
 TickType_t xTaskGetTickCount(void){return ticks;}
 void vTaskDelay(TickType_t t){ticks+=t;}
 esp_err_t gpio_set_level(int p,int level){assert(p==51&&!critical);++route_writes;if(!level&&route_off_error)return route_off_error;route=level;return ESP_OK;}
-esp_err_t usb_host_install(const usb_host_config_t*c){assert(!critical&&c->root_port_unpowered&&!c->skip_phy_setup&&c->peripheral_map==0);++installs;if(!install_error)core_live=true;return install_error;}
+esp_err_t usb_host_install(const usb_host_config_t*c){
+ assert(!critical&&c->root_port_unpowered&&!c->skip_phy_setup&&c->peripheral_map==0);
+ custom_camera_fifo=c->fifo_settings_custom.rx_fifo_lines!=0;
+ assert(c->fifo_settings_custom.rx_fifo_lines==(custom_camera_fifo?800:0));
+ assert(c->fifo_settings_custom.nptx_fifo_lines==(custom_camera_fifo?64:0));
+ assert(c->fifo_settings_custom.ptx_fifo_lines==(custom_camera_fifo?32:0));
+ ++installs;if(!install_error)core_live=true;return install_error;}
 esp_err_t usb_host_uninstall(void){assert(!critical);++uninstalls;if(!uninstall_error)core_live=false;return uninstall_error;}
 esp_err_t usb_host_client_register(const usb_host_client_config_t*c,usb_host_client_handle_t*h){assert(c->async.callback_arg);*h=(void*)2;return ESP_OK;}
 esp_err_t usb_host_client_deregister(usb_host_client_handle_t h){assert(h==(void*)2);return ESP_OK;}
@@ -291,7 +297,7 @@ static void non_hid_class_policy_tests(void){
 static void class_lifecycle_tests(void){
  class_fake_t c[3]={0};aether_usb_host_class_ops_t ops[3];
  for(unsigned n=0;n<3;++n)ops[n]=(aether_usb_host_class_ops_t){.context=&c[n],.start=class_start,.request_stop=class_request,.poll_stopped=class_poll};
- aether_usb_host_config_t cfg={.context=(void*)3,.query_sink=role,.set_vbus=vbus,.input=input,.hid_input=generic_input,.classes=ops,.class_count=3};
+ aether_usb_host_config_t cfg={.context=(void*)3,.query_sink=role,.set_vbus=vbus,.input=input,.hid_input=generic_input,.classes=ops,.class_count=3,.camera_class_mask=4};
  aether_usb_host_handle_t h=NULL;assert(aether_usb_host_new(&cfg,&h)==ESP_OK);start(h,2400000);
  assert(h->started_classes==7&&c[0].starts==1&&c[1].starts==1&&c[2].starts==1);
  unsigned before=uninstalls;assert(aether_usb_host_set_enabled(h,false)==ESP_OK);service(h,2500000);
@@ -312,6 +318,26 @@ static void class_lifecycle_tests(void){
  cfg.class_count=4;assert(aether_usb_host_new(&cfg,&h)==ESP_ERR_INVALID_ARG);
  cfg.class_count=1;cfg.classes=NULL;assert(aether_usb_host_new(&cfg,&h)==ESP_ERR_INVALID_ARG);
  puts("PASS partial class startup rolls back only successful classes; missing/oversized hook arrays are rejected without a second Host install");
+
+ cfg.class_count=3;cfg.classes=ops;memset(c,0,sizeof c);
+ assert(aether_usb_host_new(&cfg,&h)==ESP_OK);
+ start(h,2800000);
+ assert(!h->status.camera_profile&&!custom_camera_fifo&&h->started_classes==7);
+ assert(aether_usb_host_set_camera_profile(h,true)==ESP_OK);
+ service(h,2900000);
+ assert(!physical_vbus&&!h->status.camera_profile&&h->status.cleanup_pending&&c[0].requests==1);
+ c[0].drained=c[1].drained=c[2].drained=true;
+ service(h,2920000);
+ start(h,3040000);
+ assert(h->status.camera_profile&&custom_camera_fifo&&h->started_classes==4);
+ assert(c[0].starts==1&&c[1].starts==1&&c[2].starts==2);
+ assert(aether_usb_host_set_camera_profile(h,false)==ESP_OK);
+ service(h,3100000);
+ start(h,3220000);
+ assert(!h->status.camera_profile&&!custom_camera_fifo&&h->started_classes==7);
+ assert(c[0].starts==2&&c[1].starts==2&&c[2].starts==3);
+ finish(h,3300000);
+ puts("PASS camera profile drains the regular USB classes before restarting, and restores regular FIFO and classes on exit");
 }
 static uint16_t remap_keyboard(void *context,const uint8_t keys[32])
 {

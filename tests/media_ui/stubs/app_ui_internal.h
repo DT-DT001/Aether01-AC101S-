@@ -16,6 +16,7 @@ struct app_ui {
     uint32_t app_value;
     lv_timer_t *timer;
     void (*page_cleanup)(app_ui_t *);
+    void (*page_back)(app_ui_t *);
     void *page_context;
     uint32_t page_generation;
     void (*io_complete)(app_ui_t *, const app_io_result_t *);
@@ -31,6 +32,7 @@ void app_ui_label_fmt(lv_obj_t *, const char *, ...) __attribute__((format(print
 void app_ui_set_timer(app_ui_t *, lv_timer_cb_t, uint32_t);
 void app_ui_request_io_ex(app_ui_t *, const app_io_request_t *, void (*)(app_ui_t *, const app_io_result_t *));
 void app_ui_show_home(app_ui_t *);
+bool app_ui_go_back(app_ui_t *);
 void app_open_video_path(app_ui_t *, const char *);
 void app_open_nes_path(app_ui_t *, const char *);
 void app_open_video(app_ui_t *);

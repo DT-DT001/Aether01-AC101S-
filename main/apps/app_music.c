@@ -1,6 +1,8 @@
 #include "app_ui_internal.h"
 #include "app_audio_system.h"
 #include "aether_media_fs.h"
+#include "ui/app_scroll_list.h"
+#include "app_text.h"
 #include "app_usb_input.h"
 
 #include <stdio.h>
@@ -15,14 +17,16 @@ typedef struct {
     app_ui_t *ui;
     app_io_entry_t *entries;
     size_t count;
-    size_t list_page;
+    app_scroll_list_t tracks;
     bool loading;
     bool seeking;
     bool was_mounted;
+    unsigned catalog_retries;
     int64_t retry_at_us;
     char requested_path[192];
+    char library_dir[192];
     lv_obj_t *title, *status, *time, *progress, *volume, *volume_label;
-    lv_obj_t *play_label, *repeat_label, *library, *rows, *library_count;
+    lv_obj_t *play_label, *repeat_label, *library, *library_count;
     lv_obj_t *eq_panel, *eq_toggle_label, *eq_status;
     lv_obj_t *eq_sliders[MUSIC_EQ_ROWS], *eq_levels[MUSIC_EQ_ROWS];
     aether_audio_eq_t eq;
@@ -36,7 +40,8 @@ static const char *filename(const char *path)
 
 static bool music_storage_ready(app_ui_t *ui, const char *path)
 {
-    return aether_media_fs_path_ready(ui->storage, path && path[0] ? path : aether_media_fs_default_root(ui->storage));
+    return !app_io_usb_storage_blocked(ui->io) &&
+        aether_media_fs_path_ready(ui->storage, path && path[0] ? path : aether_media_fs_default_root(ui->storage));
 }
 
 static music_page_t *page(lv_event_t *e)
@@ -73,6 +78,8 @@ static bool select_path(music_page_t *p, const char *path)
         /* A one-song fallback replaces the player's list. Discard matching UI
          * indices from the previous catalog before any later row is clicked. */
         free(p->entries); p->entries = NULL; p->count = 0;
+        app_scroll_list_set_count(&p->tracks, 0);
+        app_ui_label_text(p->library_count, "曲库为空");
         selected = 0;
     }
     const esp_err_t err = aether_audio_player_select(p->ui->audio_player, selected);
@@ -92,33 +99,31 @@ static void select_track(lv_event_t *e)
     if (index < p->count) select_path(p, p->entries[index].path);
 }
 
+static lv_obj_t *create_track_row(lv_obj_t *parent, void *context)
+{
+    music_page_t *p = context;
+    lv_obj_t *row = button(p, parent, "", 0, 0, 382, 43, select_track);
+    lv_obj_t *label = lv_obj_get_child(row, 0);
+    lv_obj_set_width(label, 350);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+    return row;
+}
+
+static void bind_track_row(lv_obj_t *row, size_t index, void *context)
+{
+    const music_page_t *p = context;
+    char name[sizeof(p->entries[index].path)];
+    strlcpy(name, filename(p->entries[index].path), sizeof(name));
+    app_text_sanitize_utf8(name, strlen(name));
+    app_ui_label_text(lv_obj_get_child(row, 0), name);
+}
+
 static void render_library(music_page_t *p)
 {
-    lv_obj_clean(p->rows);
-    const size_t first = p->list_page * 5;
-    for (size_t i = first; i < p->count && i < first + 5; ++i) {
-        lv_obj_t *b = button(p, p->rows, filename(p->entries[i].path),
-                             0, (int)(i - first) * 48, 382, 43, select_track);
-        lv_obj_set_user_data(b, (void *)(uintptr_t)i);
-        lv_obj_t *text = lv_obj_get_child(b, 0);
-        lv_obj_set_width(text, 350);
-        lv_label_set_long_mode(text, LV_LABEL_LONG_DOT);
-    }
-    app_ui_label_fmt(p->library_count, "%u 首 · 第 %u/%u 页", (unsigned)p->count,
-                     (unsigned)p->list_page + 1, (unsigned)(p->count ? (p->count + 4) / 5 : 1));
-    if (!lv_obj_has_flag(p->library, LV_OBJ_FLAG_HIDDEN)) app_usb_input_modal_open(p->library, NULL);
-}
-
-static void list_previous(lv_event_t *e)
-{
-    music_page_t *p = page(e);
-    if (p && !p->loading && p->list_page) { --p->list_page; render_library(p); }
-}
-
-static void list_next(lv_event_t *e)
-{
-    music_page_t *p = page(e);
-    if (p && !p->loading && (p->list_page + 1) * 5 < p->count) { ++p->list_page; render_library(p); }
+    app_scroll_list_set_count(&p->tracks, p->count);
+    if (p->count) app_ui_label_fmt(p->library_count, "%u 首", (unsigned)p->count);
+    else app_ui_label_text(p->library_count, "曲库为空");
 }
 
 static void list_close(lv_event_t *e)
@@ -131,7 +136,7 @@ static void list_show(lv_event_t *e)
 {
     music_page_t *p = page(e);
     if (p) {
-        render_library(p); lv_obj_remove_flag(p->library, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(p->library, LV_OBJ_FLAG_HIDDEN);
         app_usb_input_modal_open(p->library, NULL);
     }
 }
@@ -268,16 +273,25 @@ static void build_eq_panel(music_page_t *p, lv_obj_t *parent)
     lv_obj_add_flag(p->eq_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void retry_catalog_later(music_page_t *p)
+{
+    if (p->catalog_retries >= 3U) return;
+    p->retry_at_us = esp_timer_get_time() + (250000LL << p->catalog_retries);
+    ++p->catalog_retries;
+}
+
 static void loaded(app_ui_t *ui, const app_io_result_t *result)
 {
     music_page_t *p = ui->page_context;
     if (!p) return;
     p->loading = false;
     if (result->playlist_prepared) {
-        free(p->entries); p->entries = NULL; p->count = 0; p->list_page = 0;
-        render_library(p);
+        free(p->entries); p->entries = NULL; p->count = 0;
     }
     if (result->error != ESP_OK || !result->count) {
+        if (result->playlist_prepared) render_library(p);
+        if (result->error == ESP_ERR_INVALID_STATE && p->was_mounted && music_storage_ready(ui, p->library_dir))
+            retry_catalog_later(p);
         app_ui_label_text(p->status, result->error == ESP_OK || result->error == ESP_ERR_NOT_FOUND ?
                           "未找到 WAV/MP3：请放入 Music 文件夹或根目录" : "曲库读取失败，请检查 TF 卡后刷新");
         /* Only a successful scan proves that app_io completed the NES/video
@@ -289,12 +303,13 @@ static void loaded(app_ui_t *ui, const app_io_result_t *result)
         return;
     }
     if (!result->playlist_prepared) {
-        p->retry_at_us = esp_timer_get_time() + 250000;
+        retry_catalog_later(p);
         app_ui_label_text(p->status, "曲库尚未准备好，稍后重试…");
         return;
     }
     app_io_entry_t *entries = heap_caps_malloc(result->count * sizeof(*entries), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!entries) {
+        render_library(p);
         app_ui_label_text(p->status, "曲库内存不足");
         return;
     }
@@ -302,7 +317,9 @@ static void loaded(app_ui_t *ui, const app_io_result_t *result)
     /* The IO worker already allocated/copied the backend playlist. Never
      * interpret old UI indices after that worker list changes. */
     free(p->entries); p->entries = entries;
-    p->count = result->count; p->list_page = 0; p->retry_at_us = 0;
+    p->count = result->count;
+    p->retry_at_us = 0;
+    p->catalog_retries = 0;
     if (p->requested_path[0]) {
         if (select_path(p, p->requested_path)) p->requested_path[0] = '\0';
     } else {
@@ -318,11 +335,7 @@ static void refresh_catalog(music_page_t *p)
 {
     app_io_request_t request = {.operation = APP_IO_CATALOG, .filter = APP_IO_MUSIC, .limit = 4096};
     /* Opening through the file browser scans that directory as its playlist. */
-    if (p->requested_path[0]) {
-        strlcpy(request.path, p->requested_path, sizeof(request.path));
-        char *slash = strrchr(request.path, '/');
-        if (slash) *slash = '\0';
-    }
+    strlcpy(request.path, p->library_dir, sizeof(request.path));
     p->loading = true;
     p->retry_at_us = 0;
     app_ui_label_text(p->status, "正在扫描曲库…");
@@ -334,7 +347,7 @@ static void refresh_event(lv_event_t *e)
     music_page_t *p = page(e);
     /* One preparation owns ui->io_complete. A held key/repeated tap must not
      * overwrite it or queue repeated filesystem scans during playback. */
-    if (p && !p->loading) refresh_catalog(p);
+    if (p && !p->loading) { p->catalog_retries = 0; refresh_catalog(p); }
 }
 
 static void play_event(lv_event_t *e)
@@ -408,13 +421,14 @@ static void seek_event(lv_event_t *e)
         return;
     }
     if (code == LV_EVENT_PRESSED) p->seeking = true;
-    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        p->seeking = false;
+    if (code == LV_EVENT_RELEASED && p->seeking) {
         aether_audio_player_status_t s;
         aether_audio_player_get_status(p->ui->audio_player, &s);
         if (s.active) aether_audio_player_seek(p->ui->audio_player,
             (uint32_t)((uint64_t)s.duration_ms * lv_slider_get_value(p->progress) / 1000));
     }
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST || code == LV_EVENT_INDEV_RESET)
+        p->seeking = false;
 }
 
 static void music_timer(lv_timer_t *timer)
@@ -426,13 +440,17 @@ static void music_timer(lv_timer_t *timer)
     if (!ui->audio_player) return;
     aether_audio_player_status_t s = {0};
     aether_audio_player_get_status(ui->audio_player, &s);
-    const bool mounted = music_storage_ready(ui, s.active ? s.path : NULL);
+    const bool mounted = music_storage_ready(ui, s.active ? s.path : p->library_dir);
     if (!mounted) {
         p->was_mounted = false;
         app_ui_label_text(p->status, "存储设备未就绪，请插卡或接入 USB 存储后刷新");
         return;
     }
-    if (!p->was_mounted && !p->loading) { p->was_mounted = true; refresh_catalog(p); }
+    if (!p->was_mounted && !p->loading) {
+        p->was_mounted = true;
+        p->catalog_retries = 0;
+        refresh_catalog(p);
+    }
     if (p->retry_at_us && !p->loading && esp_timer_get_time() >= p->retry_at_us) refresh_catalog(p);
     if (s.path[0]) app_ui_label_text(p->title, filename(s.path));
     const uint32_t seconds = s.position_ms / 1000, total = s.duration_ms / 1000;
@@ -463,6 +481,7 @@ static void music_cleanup(app_ui_t *ui)
     music_page_t *p = ui->page_context;
     if (!p) return;
     app_usb_input_modal_close(p->eq_panel);
+    app_scroll_list_deinit(&p->tracks);
     free(p->entries);
     free(p);
     ui->page_context = NULL;
@@ -481,6 +500,10 @@ void app_open_music_path(app_ui_t *ui, const char *path)
     p->ui = ui;
     p->was_mounted = music_storage_ready(ui, requested);
     strlcpy(p->requested_path, requested, sizeof(p->requested_path));
+    strlcpy(p->library_dir, requested, sizeof(p->library_dir));
+    char *slash = strrchr(p->library_dir, '/');
+    if (slash) *slash = '\0';
+    else p->library_dir[0] = '\0';
     ui->page_context = p;
     ui->page_cleanup = music_cleanup;
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
@@ -514,8 +537,6 @@ void app_open_music_path(app_ui_t *ui, const char *path)
     button(p, content, "刷新", 211, 252, 81, 42, refresh_event);
     lv_obj_t *eq = button(p, content, "均衡器", 301, 252, 103, 42, eq_show);
     if (!ui->audio_player) lv_obj_add_state(eq, LV_STATE_DISABLED);
-    app_ui_add_text(content, "MP3 / AAC-LC M4A / PCM16 WAV · 8-48kHz",
-                    LV_ALIGN_TOP_LEFT, 0, 310, 0x7890B2, app_ui_chinese_font());
     p->library = lv_obj_create(content);
     lv_obj_set_pos(p->library, 0, 0); lv_obj_set_size(p->library, 408, 354);
     lv_obj_set_style_pad_all(p->library, 8, 0);
@@ -524,14 +545,13 @@ void app_open_music_path(app_ui_t *ui, const char *path)
     lv_obj_remove_flag(p->library, LV_OBJ_FLAG_SCROLLABLE);
     button(p, p->library, "返回", 0, 0, 68, 36, list_close);
     p->library_count = app_ui_add_text(p->library, "曲库", LV_ALIGN_TOP_RIGHT, -4, 8, 0xF6C175, app_ui_chinese_font());
-    p->rows = lv_obj_create(p->library);
-    lv_obj_set_pos(p->rows, 0, 44); lv_obj_set_size(p->rows, 390, 248);
-    lv_obj_set_style_pad_all(p->rows, 0, 0);
-    lv_obj_set_style_border_width(p->rows, 0, 0);
-    lv_obj_set_style_bg_color(p->rows, lv_color_hex(0x10192A), 0);
-    lv_obj_remove_flag(p->rows, LV_OBJ_FLAG_SCROLLABLE);
-    button(p, p->library, "上一页", 15, 298, 150, 38, list_previous);
-    button(p, p->library, "下一页", 217, 298, 150, 38, list_next);
+    lv_obj_t *rows = lv_obj_create(p->library);
+    lv_obj_set_pos(rows, 0, 44);
+    lv_obj_set_size(rows, 392, 294);
+    lv_obj_set_style_pad_all(rows, 0, 0);
+    lv_obj_set_style_border_width(rows, 0, 0);
+    lv_obj_set_style_bg_opa(rows, LV_OPA_TRANSP, 0);
+    app_scroll_list_init(&p->tracks, rows, 48, create_track_row, bind_track_row, p);
     lv_obj_add_flag(p->library, LV_OBJ_FLAG_HIDDEN);
     build_eq_panel(p, content);
     app_ui_set_timer(ui, music_timer, 120);

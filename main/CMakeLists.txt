@@ -28,8 +28,11 @@ idf_component_register(
          "app_intercom.c"
          "app_pc_remote.c"
          "app_air_mouse.c"
+         "app_arcade.c"
          "app_displacement.c"
          "app_displacement_estimator.c"
+         "app_utilities.c"
+         "app_weather_data.c"
          "app_usb_input.c"
          "app_telemetry.c"
          "app_io.c"
@@ -46,15 +49,19 @@ idf_component_register(
          "app_motion_filter.c"
          "ui/app_ui.c"
          "ui/app_ui_modal.c"
+         "ui/app_text_input.c"
          "ui/app_ui_media_control.c"
          "ui/app_home.c"
          "ui/app_battery.c"
          "apps/app_system.c"
+         "apps/app_utilities.c"
          "apps/app_controls.c"
          "apps/app_sensors.c"
          "apps/app_motion.c"
          "apps/app_usb.c"
          "apps/app_media.c"
+         "apps/app_camera.c"
+         "apps/app_gallery.c"
          "apps/app_music.c"
          "apps/app_recorder.c"
          "apps/app_reader.c"
@@ -70,9 +77,12 @@ idf_component_register(
          "assets/font_24.c"
          ${AETHER_ICON_SOURCES}
     INCLUDE_DIRS "." "ui"
+    EMBED_FILES "assets/boot_logo.rgb565"
     REQUIRES aether_media_fs aether_usb_storage aether_usb_audio aether_board aether_storage aether_usb_msc aether_usb_host aether_audio_player aether_recorder
              aether_video_player aether_bluetooth aether_wifi aether_intercom_radio aether_intercom_audio aether_nes co5300_display
-             aether_gnss esp_driver_uart esp_lvgl_port esp_psram esp_timer esp_app_format spi_flash lvgl nvs_flash fatfs)
+             aether_usb_camera aether_camera_record aether_image esp_driver_jpeg
+             aether_gnss esp_driver_uart esp_lvgl_port esp_psram esp_timer esp_app_format spi_flash lvgl nvs_flash fatfs esp_netif lwip
+             esp_http_client mbedtls)
 # Pull the project custom memory provider before the later LVGL archive is read.
 # All nine public allocator entry points live in this single object.
 if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_LV_USE_CUSTOM_MALLOC)
@@ -99,6 +109,10 @@ if(AETHER_GPS_DIAGNOSTIC AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     if(AETHER_GPS_DIAGNOSTIC_PASSIVE)
         target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_GPS_DIAGNOSTIC_PASSIVE=1)
     endif()
+endif()
+if(AETHER_UI_SELFTEST AND NOT CMAKE_BUILD_EARLY_EXPANSION)
+    target_sources(${COMPONENT_LIB} PRIVATE "app_ui_selftest.c")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_UI_SELFTEST=1)
 endif()
 if(AETHER_VIDEO_DIAGNOSTIC AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_VIDEO_DIAGNOSTIC=1)

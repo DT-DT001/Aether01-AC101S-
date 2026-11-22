@@ -42,12 +42,14 @@ typedef struct {
 } aether_board_t;
 
 /**
- * Initialize board power and low-level peripherals.
+ * Bring up safe outputs, PMIC power and a blank display.
  *
- * PMIC/DCDC2 and display failures are returned. Optional sensor probe failures
- * are reported through the ready flags so bring-up can continue.
+ * This stage lets the application present its first frame before probing the
+ * remaining hardware. Keep the panel off until that frame has been written.
  */
-esp_err_t aether_board_init(aether_board_t *board);
+esp_err_t aether_board_init_display(aether_board_t *board);
+/** Complete optional peripheral and input setup after the first frame. */
+esp_err_t aether_board_init_peripherals(aether_board_t *board);
 
 /** BLDO1 is deliberately off after boot and is switched only for microSD use. */
 esp_err_t aether_board_set_sd_power(aether_board_t *board, bool enabled);
