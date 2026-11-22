@@ -329,7 +329,7 @@ static esp_err_t init_nvs(void)
     return err;
 }
 
-enum { BOOT_LOGO_WIDTH = 432, BOOT_LOGO_HEIGHT = 203 };
+enum { BOOT_LOGO_WIDTH = 432, BOOT_LOGO_HEIGHT = 203, BOOT_LOGO_MIN_VISIBLE_MS = 2500 };
 extern const uint8_t boot_logo_data[] asm("_binary_boot_logo_rgb565_start");
 static const lv_image_dsc_t boot_logo = {
     .header = {
@@ -343,7 +343,35 @@ static const lv_image_dsc_t boot_logo = {
     .data = boot_logo_data,
 };
 
-static esp_err_t present_boot_frame(lv_display_t *display)
+/* Both callers hold LVGL exclusively. Render the full screen and wait for its
+ * final staged DMA transfer before reporting the frame as presented. */
+static esp_err_t complete_boot_refresh(lv_display_t *display)
+{
+    app_display_metrics_t before, after;
+    app_display_metrics_get(&before);
+    lv_obj_invalidate(lv_display_get_screen_active(display));
+    lv_refr_now(display);
+    app_display_metrics_get(&after);
+    const uint64_t target = after.submitted_sequence;
+    const uint64_t frame_bytes = (uint64_t)lv_display_get_horizontal_resolution(display) *
+        (uint64_t)lv_display_get_vertical_resolution(display) * sizeof(uint16_t);
+    if (target <= before.submitted_sequence ||
+        after.staging_copied_bytes - before.staging_copied_bytes < frame_bytes ||
+        after.dropped_regions != before.dropped_regions ||
+        after.flush_wait_timeouts != before.flush_wait_timeouts || after.staging_error != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int64_t deadline = esp_timer_get_time() + 100000;
+    while (after.completed_sequence < target) {
+        if (esp_timer_get_time() >= deadline) return ESP_ERR_TIMEOUT;
+        vTaskDelay(1);
+        app_display_metrics_get(&after);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t present_boot_frame(lv_display_t *display, int64_t *logo_on_us)
 {
     lv_obj_t *screen = lv_display_get_screen_active(display);
     lv_obj_remove_style_all(screen);
@@ -352,19 +380,17 @@ static esp_err_t present_boot_frame(lv_display_t *display)
     lv_obj_t *logo = lv_image_create(screen);
     lv_image_set_src(logo, &boot_logo);
     lv_obj_center(logo);
-    lv_refr_now(display);
 
-    /* The SPI panel's command path drains the last queued color transfer
-     * before issuing DISPON. TE starts only after the panel is visible. */
-    app_display_metrics_t metrics;
-    app_display_metrics_get(&metrics);
-    if (!metrics.submitted_sequence || metrics.dropped_regions ||
-        metrics.flush_wait_timeouts || metrics.staging_error != ESP_OK)
-        return ESP_ERR_INVALID_STATE;
-    return esp_lcd_panel_disp_on_off(s_board.display, true);
+    /* The initialized panel is blank until its entire first frame is ready. */
+    esp_err_t error = complete_boot_refresh(display);
+    if (error == ESP_OK) {
+        error = esp_lcd_panel_disp_on_off(s_board.display, true);
+        if (error == ESP_OK) *logo_on_us = esp_timer_get_time();
+    }
+    return error;
 }
 
-static lv_display_t *init_lvgl(void)
+static lv_display_t *init_lvgl(int64_t *logo_on_us)
 {
     lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     lvgl_cfg.task_priority = 6;
@@ -416,7 +442,7 @@ static lv_display_t *init_lvgl(void)
         ESP_LOGE(TAG, "reserved display DMA transport unavailable: %s", esp_err_to_name(metrics_error));
         return NULL;
     }
-    const esp_err_t logo_error = present_boot_frame(display);
+    const esp_err_t logo_error = present_boot_frame(display, logo_on_us);
     if (logo_error != ESP_OK) {
         lvgl_port_unlock();
         ESP_LOGE(TAG, "boot frame unavailable: %s", esp_err_to_name(logo_error));
@@ -428,8 +454,19 @@ static lv_display_t *init_lvgl(void)
     return display;
 }
 
+static void wait_for_logo_interval(int64_t logo_on_us)
+{
+    const int64_t deadline = logo_on_us + BOOT_LOGO_MIN_VISIBLE_MS * INT64_C(1000);
+    int64_t remaining;
+    while ((remaining = deadline - esp_timer_get_time()) > 0) {
+        const TickType_t ticks = pdMS_TO_TICKS((remaining + 999) / 1000);
+        vTaskDelay(ticks ? ticks : 1);
+    }
+}
+
 void app_main(void)
 {
+    const int64_t app_start_us = esp_timer_get_time();
     const esp_err_t display_err = aether_board_init_display(&s_board);
     if (display_err != ESP_OK) {
         ESP_LOGE(TAG, "display bring-up failed: %s; startup halted",
@@ -437,8 +474,13 @@ void app_main(void)
         return;
     }
     ESP_RETURN_VOID_ON_FALSE(s_board.display_ready, TAG, "display is not available");
-    lv_display_t *display = init_lvgl();
+    const int64_t panel_ready_us = esp_timer_get_time();
+    int64_t logo_on_us = 0;
+    lv_display_t *display = init_lvgl(&logo_on_us);
     ESP_RETURN_VOID_ON_FALSE(display, TAG, "LVGL display is not available");
+    ESP_LOGI(TAG, "boot display: panel_ready_ms=%lld logo_on_ms=%lld app_to_logo_ms=%lld",
+             (long long)(panel_ready_us / 1000), (long long)(logo_on_us / 1000),
+             (long long)((logo_on_us - app_start_us) / 1000));
 
     /* The software decoder logs its version on every lag-recovery reopen.
      * An unread native USB console can block that video task for50ms. */
@@ -526,6 +568,13 @@ void app_main(void)
     app_audio_system_set_media_control(remote_media_control, NULL);
     ESP_ERROR_CHECK(aether_usb_msc_init(s_storage));
     aether_usb_msc_set_vbus_query(usb_vbus_present,&s_board);
+
+    /* Services above initialize while the logo is already lit. Only wait for
+     * the remainder before enabling automatic dimming or blanking the panel. */
+    wait_for_logo_interval(logo_on_us);
+    ESP_RETURN_VOID_ON_FALSE(lvgl_port_lock(1000), TAG, "LVGL activity lock timeout");
+    lv_display_trigger_activity(display);
+    lvgl_port_unlock();
     ESP_ERROR_CHECK(app_power_init(&s_power, &s_board, display));
     app_pc_remote_init(s_bluetooth, &s_power, s_board.imu_ready, media_flash_busy);
     app_displacement_init(&s_power, s_board.imu_ready);
@@ -560,11 +609,23 @@ void app_main(void)
     esp_err_t ui_err = app_ui_start(&s_board, s_storage, s_audio_player,
                                     s_video_player, s_nes, touch_indev,
                                     &s_power, &s_ui);
+    esp_err_t desktop_refresh = ui_err == ESP_OK ? complete_boot_refresh(display) : ui_err;
+    const int64_t desktop_flush_us = esp_timer_get_time();
     lvgl_port_unlock();
     ESP_ERROR_CHECK(ui_err);
+    if (desktop_refresh == ESP_OK) {
+        ESP_LOGI(TAG, "boot display: desktop_flush_ms=%lld logo_interval_ms=%lld",
+                 (long long)(desktop_flush_us / 1000), (long long)((desktop_flush_us - logo_on_us) / 1000));
+    } else {
+        ESP_LOGW(TAG, "boot desktop first refresh incomplete: %s", esp_err_to_name(desktop_refresh));
+    }
     ESP_ERROR_CHECK(app_power_set_user_key_handler(&s_power, app_ui_queue_user_key, s_ui));
     ESP_ERROR_CHECK(app_power_set_user_key_tap_handler(&s_power, intercom_user_key_tap));
     ESP_ERROR_CHECK(app_power_set_shutdown_hook(&s_power, prepare_shutdown, &s_shutdown));
+    if (wifi_error == ESP_OK) {
+        const esp_err_t restore_error = aether_wifi_restore_preference(s_wifi);
+        if (restore_error != ESP_OK) ESP_LOGW(TAG, "Wi-Fi startup restore: %s", esp_err_to_name(restore_error));
+    }
 
     ESP_LOGI(TAG, "Aether01 UI ready: %u apps, TF hot-plug, screen idle power management",
              (unsigned)app_home_app_count());

@@ -344,8 +344,6 @@ static esp_err_t apply_power_profile_locked(tg29_handle_t handle, const tg29_pow
                              ESP_ERR_INVALID_ARG, TAG, "invalid profile voltage");
     }
 
-    tg29_log_diagnostics_locked(handle, "before power policy");
-
     /* Configure the shared-bus sensor supply first. Unlike other peripheral
      * loads, ALDO2 must stay on while communicating with this PMIC. */
     esp_err_t err = set_ldo_voltage_locked(handle, TG29_RAIL_ALDO2, profile->aldo2_mv);

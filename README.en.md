@@ -2,7 +2,7 @@
 
 This standalone firmware demo targets the AC101S edition of Aether01, a handheld ESP32-S31 device with 64 MiB flash, 32 MiB PSRAM, a 480 × 480 AMOLED touchscreen, and TF storage. It uses ESP-IDF 6.1 and LVGL 9.5. Device coverage is still developing and the demo may contain bugs.
 
-[中文说明](README.md) · [AC101S hardware](https://github.com/DT-DT001/Aether01-Hardware-AC101S) · [I/O and power map](docs/hardware/io-power-map.md)
+[Download firmware](https://github.com/DT-DT001/Aether01-AC101S-/releases/latest) · [中文说明](README.md) · [AC101S hardware](https://github.com/DT-DT001/Aether01-Hardware-AC101S) · [I/O and power map](docs/hardware/io-power-map.md)
 
 ## Interface previews
 

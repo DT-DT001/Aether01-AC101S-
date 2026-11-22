@@ -30,6 +30,11 @@ static atomic_llong time_shift;
 static wifi_config_t applied;
 static unsigned char saved[128],staged[128];
 static size_t saved_bytes,staged_bytes;
+static atomic_bool saved_enabled_present;
+static atomic_bool reject_queue_send;
+static atomic_uchar saved_enabled;
+static bool stage_credential,stage_enabled;
+static uint8_t staged_enabled;
 size_t heap_caps_get_free_size(unsigned caps)
 { assert(caps==(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT) || caps==(MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA)); ++heap_log_queries; return initialized ? 40000 : 70000; }
 size_t heap_caps_get_largest_free_block(unsigned caps)
@@ -53,6 +58,7 @@ QueueHandle_t xQueueCreate(unsigned capacity,size_t size)
 }
 BaseType_t xQueueSend(QueueHandle_t q,const void *data,TickType_t ticks)
 {
+    if(reject_queue_send) return pdFALSE;
     (void)ticks; pthread_mutex_lock(&q->lock);
     if(q->count==q->capacity) { pthread_mutex_unlock(&q->lock); return pdFALSE; }
     memcpy(q->data+((q->head+q->count)%q->capacity)*q->size,data,q->size); ++q->count;
@@ -121,15 +127,43 @@ esp_err_t esp_wifi_scan_get_ap_records(uint16_t *count,wifi_ap_record_t *records
     return ESP_OK;
 }
 esp_err_t esp_wifi_sta_get_ap_info(wifi_ap_record_t *out) { if(!linked || fail_ap_info) return ESP_ERR_WIFI_NOT_CONNECT; out->rssi=-42; memcpy(out->ssid,applied.sta.ssid,sizeof(applied.sta.ssid));if(mismatch_ap)out->ssid[0]^=1;memcpy(out->bssid,applied.sta.bssid,6);return ESP_OK; }
-esp_err_t nvs_open(const char *space,int mode,nvs_handle_t *out) { assert(!strcmp(space,"aether_wifi")); if(mode==NVS_READONLY && !saved_bytes) return ESP_ERR_NVS_NOT_FOUND; *out=1; return ESP_OK; }
+esp_err_t nvs_open(const char *space,int mode,nvs_handle_t *out)
+{
+    assert(!strcmp(space,"aether_wifi"));
+    if(mode==NVS_READONLY && !saved_bytes && !saved_enabled_present) return ESP_ERR_NVS_NOT_FOUND;
+    if(mode==NVS_READWRITE) stage_credential=stage_enabled=false;
+    *out=1;
+    return ESP_OK;
+}
 esp_err_t nvs_get_blob(nvs_handle_t h,const char *key,void *out,size_t *size)
 { assert(h==1 && !strcmp(key,"cred")); if(!saved_bytes) return ESP_ERR_NVS_NOT_FOUND; assert(*size>=saved_bytes); memcpy(out,saved,saved_bytes); *size=saved_bytes; return ESP_OK; }
 esp_err_t nvs_set_blob(nvs_handle_t h,const char *key,const void *data,size_t size)
-{ assert(!flash_busy && h==1 && !strcmp(key,"cred") && size<=sizeof(staged)); memcpy(staged,data,size); staged_bytes=size; ++set_calls; return ESP_OK; }
+{ assert(!flash_busy && h==1 && !strcmp(key,"cred") && size<=sizeof(staged)); memcpy(staged,data,size); staged_bytes=size; stage_credential=true; ++set_calls; return ESP_OK; }
+esp_err_t nvs_get_u8(nvs_handle_t h,const char *key,uint8_t *value)
+{
+    assert(h==1 && !strcmp(key,"enabled_v1"));
+    if(!saved_enabled_present) return ESP_ERR_NVS_NOT_FOUND;
+    *value=saved_enabled;
+    return ESP_OK;
+}
+esp_err_t nvs_set_u8(nvs_handle_t h,const char *key,uint8_t value)
+{
+    assert(!flash_busy && h==1 && !strcmp(key,"enabled_v1") && value<=1);
+    stage_enabled=true;
+    staged_enabled=value;
+    return ESP_OK;
+}
 esp_err_t nvs_erase_key(nvs_handle_t h,const char *key)
-{ assert(!flash_busy && h==1 && !strcmp(key,"cred")); staged_bytes=0; ++erase_calls; return ESP_OK; }
+{ assert(!flash_busy && h==1 && !strcmp(key,"cred")); staged_bytes=0; stage_credential=true; ++erase_calls; return ESP_OK; }
 esp_err_t nvs_commit(nvs_handle_t h)
-{ assert(!flash_busy && h==1); ++commit_calls; if(fail_commit) return ESP_FAIL; memcpy(saved,staged,staged_bytes); saved_bytes=staged_bytes; return ESP_OK; }
+{
+    assert(!flash_busy && h==1);
+    ++commit_calls;
+    if(fail_commit) return ESP_FAIL;
+    if(stage_credential) { memcpy(saved,staged,staged_bytes); saved_bytes=staged_bytes; }
+    if(stage_enabled) { saved_enabled=staged_enabled; saved_enabled_present=true; }
+    return ESP_OK;
+}
 void nvs_close(nvs_handle_t h) { assert(h==1); }
 static bool busy(void *ctx) { assert(ctx==(void *)7); return flash_busy; }
 static aether_wifi_status_t snapshot(aether_wifi_handle_t h) { aether_wifi_status_t s; assert(aether_wifi_get_status(h,&s)==ESP_OK); return s; }
@@ -147,6 +181,92 @@ static void saved_fixture(void)
     memset(saved,0,sizeof(saved)); saved[0]=1; saved[1]=WIFI_AUTH_WPA2_PSK;
     memcpy(saved+2,"remembered",10); memcpy(saved+35,"example-password",16); saved_bytes=99;
 }
+
+static void test_enabled_preference(void)
+{
+    saved_fixture();
+    unsigned char remembered[99];
+    memcpy(remembered,saved,sizeof(remembered));
+    aether_wifi_handle_t h=NULL;
+    const unsigned commits=commit_calls, owners=task_creates;
+    assert(aether_wifi_new(&h)==ESP_OK && aether_wifi_restore_preference(h)==ESP_OK);
+    assert(!initialized && task_creates==owners && snapshot(h).saved_network);
+    assert(aether_wifi_set_enabled_preference(h,false)==ESP_OK && task_creates==owners);
+    assert(aether_wifi_set_persistence_guard(h,busy,(void *)7)==ESP_OK);
+
+    flash_busy=true;
+    assert(aether_wifi_set_enabled_preference(h,true)==ESP_OK);
+    wait_state(h,AETHER_WIFI_CONNECTING);
+    assert(snapshot(h).preference_pending && snapshot(h).persistence_pending && commit_calls==commits);
+    assert(aether_wifi_set_enabled(h,false)==ESP_OK);
+    wait_state(h,AETHER_WIFI_OFF);
+    assert(aether_wifi_del(h,0)==ESP_ERR_INVALID_STATE);
+    flash_busy=false;
+    advance(1200);
+    wait_persist(h);
+    assert(saved_enabled_present && saved_enabled==1 && commit_calls==commits+1);
+    assert(aether_wifi_del(h,2000)==ESP_OK);
+    pthread_join(task.thread,NULL);
+
+    assert(aether_wifi_new(&h)==ESP_OK && snapshot(h).state==AETHER_WIFI_OFF);
+    assert(aether_wifi_set_persistence_guard(h,busy,(void *)7)==ESP_OK);
+    fail_task=1;
+    assert(aether_wifi_restore_preference(h)==ESP_ERR_NO_MEM && !initialized);
+    fail_task=0;
+    assert(aether_wifi_restore_preference(h)==ESP_OK);
+    wait_state(h,AETHER_WIFI_CONNECTING);
+    assert(!strcmp((const char *)applied.sta.ssid,"remembered") && commit_calls==commits+1);
+    got_ip();
+    wait_state(h,AETHER_WIFI_CONNECTED);
+    reject_queue_send=true;
+    assert(aether_wifi_set_enabled_preference(h,false)==ESP_ERR_TIMEOUT);
+    reject_queue_send=false;
+    assert(!snapshot(h).preference_pending && snapshot(h).connected && saved_enabled==1);
+
+    assert(aether_wifi_peer_acquire(h,2000)==ESP_OK);
+    assert(aether_wifi_set_enabled_preference(h,false)==ESP_OK);
+    assert(snapshot(h).peer_radio && !snapshot(h).enabled_preference && started);
+    assert(snapshot(h).preference_pending && saved_enabled==1);
+    fail_commit=1;
+    assert(aether_wifi_peer_release(h,2000)==ESP_OK);
+    wait_state(h,AETHER_WIFI_OFF);
+    for(unsigned i=0;i<2000 && snapshot(h).preference_error==ESP_OK;++i) delay(1);
+    assert(snapshot(h).preference_error==ESP_FAIL && snapshot(h).preference_pending && saved_enabled==1);
+    fail_commit=0;
+    advance(1200);
+    wait_persist(h);
+    assert(saved_enabled==0 && snapshot(h).preference_error==ESP_OK);
+
+    const unsigned previous=commit_calls;
+    flash_busy=true;
+    assert(aether_wifi_set_enabled_preference(h,true)==ESP_OK);
+    assert(aether_wifi_set_enabled_preference(h,false)==ESP_OK);
+    assert(snapshot(h).preference_pending);
+    wait_state(h,AETHER_WIFI_OFF);
+    flash_busy=false;
+    advance(1200);
+    wait_persist(h);
+    assert(saved_enabled==0 && commit_calls==previous+1);
+    assert(aether_wifi_del(h,2000)==ESP_OK);
+    pthread_join(task.thread,NULL);
+
+    const unsigned owners_after_test=task_creates;
+    assert(aether_wifi_new(&h)==ESP_OK && aether_wifi_restore_preference(h)==ESP_OK);
+    assert(snapshot(h).saved_network && !initialized && task_creates==owners_after_test);
+    assert(saved_bytes==sizeof(remembered) && !memcmp(saved,remembered,sizeof(remembered)));
+    assert(aether_wifi_del(h,2000)==ESP_OK);
+
+    saved_enabled=2;
+    assert(aether_wifi_new(&h)==ESP_OK && aether_wifi_restore_preference(h)==ESP_ERR_INVALID_RESPONSE);
+    assert(snapshot(h).preference_error==ESP_ERR_INVALID_RESPONSE && !initialized);
+    assert(aether_wifi_set_enabled_preference(h,false)==ESP_OK);
+    wait_persist(h);
+    assert(saved_enabled==0 && snapshot(h).preference_error==ESP_OK && !initialized);
+    assert(aether_wifi_del(h,2000)==ESP_OK);
+    pthread_join(task.thread,NULL);
+    puts("PASS Wi-Fi preference persists ON/OFF independently of credentials; boots connect or stay lazy OFF, temporary shutdown and peer lease preserve intent, failed saves retry and last toggle wins");
+}
+
 static void test_scan_priority(void)
 {
     const aether_wifi_ap_t open={.ssid="explicit-open",.authmode=WIFI_AUTH_OPEN,.supported=true};
@@ -444,5 +564,6 @@ int main(void)
     assert(wifi_init_calls && init_log_before==wifi_init_calls && init_log_after==wifi_init_calls && heap_log_queries==wifi_init_calls*8);
     puts("PASS actual driver-init config is RX4/BA4/TX4/dynamic12/cache8/mgmt5/short6; before/after diagnostics cover success and failed init recovery");
     test_peer_radio_lease();
+    test_enabled_preference();
     return 0;
 }

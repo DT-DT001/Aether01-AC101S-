@@ -107,6 +107,11 @@ static void selected(lv_event_t *event)
     if(!p || index>=p->count || !p->aps[index].supported) return;
     p->selected=p->aps[index]; password_dialog(p);
 }
+static bool wifi_switch_on(const aether_wifi_status_t *status)
+{
+    return status->peer_radio ? status->enabled_preference :
+           status->enabled || status->state==AETHER_WIFI_STARTING;
+}
 static void action(lv_event_t *event)
 {
     app_ui_t *ui=lv_event_get_user_data(event); wifi_page_t *p=ui ? ui->page_context : NULL;
@@ -114,7 +119,7 @@ static void action(lv_event_t *event)
     intptr_t kind=(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(event));
     aether_wifi_status_t status; if(aether_wifi_get_status(p->wifi,&status)!=ESP_OK) return;
     esp_err_t error;
-    if(kind==1) error=aether_wifi_set_enabled(p->wifi,!(status.enabled || status.state==AETHER_WIFI_STARTING));
+    if(kind==1) error=aether_wifi_set_enabled_preference(p->wifi,!wifi_switch_on(&status));
     else if(kind==2) error=aether_wifi_scan(p->wifi);
     else if(kind==3) error=aether_wifi_disconnect(p->wifi);
     else error=aether_wifi_forget(p->wifi);
@@ -150,11 +155,14 @@ static void update(lv_timer_t *timer)
     char name[33]; memcpy(name,s.ssid,sizeof(name)); app_text_sanitize_utf8(name,strlen(name));
     if(s.connected) app_ui_label_fmt(p->status,"%s · %s\nIP %s · %d dBm",state_name(s.state),name,s.ip,s.rssi);
     else app_ui_label_fmt(p->status,"%s\n发现 %u 个网络%s · 重试 %u/5",state_name(s.state),s.ap_count,s.saved_network ? "，已保存网络" : "",s.retry_count);
-    app_ui_label_text(p->toggle_label,s.enabled || s.state==AETHER_WIFI_STARTING ? "关闭 Wi-Fi" : "开启 Wi-Fi");
-    bool ready=s.enabled && s.state!=AETHER_WIFI_STARTING && s.state!=AETHER_WIFI_CONNECTING && s.state!=AETHER_WIFI_DISCONNECTING;
-    availability(p->scan,ready && !s.scanning); availability(p->disconnect,s.connected || s.state==AETHER_WIFI_CONNECTING);
-    availability(p->forget,s.saved_network);
-    if(s.last_error!=ESP_OK) app_ui_label_fmt(p->message,"网络：%s · 原因 %u",esp_err_to_name(s.last_error),s.disconnect_reason);
+    app_ui_label_text(p->toggle_label,wifi_switch_on(&s) ? "关闭 Wi-Fi" : "开启 Wi-Fi");
+    bool ready=!s.peer_radio && s.enabled && s.state!=AETHER_WIFI_STARTING &&
+               s.state!=AETHER_WIFI_CONNECTING && s.state!=AETHER_WIFI_DISCONNECTING;
+    availability(p->scan,ready && !s.scanning);
+    availability(p->disconnect,!s.peer_radio && (s.connected || s.state==AETHER_WIFI_CONNECTING));
+    availability(p->forget,!s.peer_radio && s.saved_network);
+    if(s.preference_error!=ESP_OK) app_ui_label_fmt(p->message,"Wi-Fi 开关设置：%s",esp_err_to_name(s.preference_error));
+    else if(s.last_error!=ESP_OK) app_ui_label_fmt(p->message,"网络：%s · 原因 %u",esp_err_to_name(s.last_error),s.disconnect_reason);
     else if(s.storage_error!=ESP_OK) app_ui_label_fmt(p->message,"网络已受理，保存失败：%s",esp_err_to_name(s.storage_error));
     else if(s.persistence_pending) app_ui_label_text(p->message,"网络设置待保存，媒体空闲后自动完成");
     else if(!p->notice || lv_tick_elaps(p->notice_started)>3000) {

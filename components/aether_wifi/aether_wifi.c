@@ -30,6 +30,13 @@ typedef struct {
     } data;
 } command_t;
 typedef struct { uint8_t version,authmode; char ssid[33],password[64]; } credential_t;
+typedef struct {
+    bool enabled, known, pending, submitting;
+    uint8_t failures;
+    uint32_t revision;
+    int64_t retry_at;
+    esp_err_t error;
+} enabled_preference_t;
 struct aether_wifi {
     portMUX_TYPE lock;
     QueueHandle_t queue;
@@ -43,6 +50,7 @@ struct aether_wifi {
     esp_err_t peer_result;
     bool peer_restore, peer_restore_overridden;
     aether_wifi_status_t status;
+    enabled_preference_t preference;
     aether_wifi_ap_t aps[AETHER_WIFI_MAX_APS];
     /* The fields below belong exclusively to the command-owner task. */
     bool initialized,started,desired,want_connect,switching,save_pending,ignore_disconnect,scan_pending;
@@ -61,6 +69,7 @@ struct aether_wifi {
 };
 static aether_wifi_handle_t default_handle;
 static const char *TAG="aether_wifi";
+static const char ENABLED_KEY[]="enabled_v1";
 static void log_init_heap(const char *stage,esp_err_t result)
 {
     ESP_LOGI(TAG,"init %s result=0x%x internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u",
@@ -124,6 +133,67 @@ static bool load_credentials(aether_wifi_handle_t h)
     if(valid) h->credentials=saved;
     erase_secret(&saved,sizeof(saved)); return valid;
 }
+
+static void load_enabled_preference(aether_wifi_handle_t h)
+{
+    nvs_handle_t nvs;
+    esp_err_t error=nvs_open("aether_wifi",NVS_READONLY,&nvs);
+    uint8_t value=0;
+    if(error==ESP_OK) {
+        error=nvs_get_u8(nvs,ENABLED_KEY,&value);
+        nvs_close(nvs);
+    }
+    if(error==ESP_ERR_NVS_NOT_FOUND) { error=ESP_OK; value=0; }
+    else if(error==ESP_OK && value>1) error=ESP_ERR_INVALID_RESPONSE;
+    h->preference=(enabled_preference_t){
+        .enabled=error==ESP_OK && value==1, .known=error==ESP_OK, .error=error,
+    };
+}
+
+static bool flash_write_blocked(aether_wifi_handle_t h)
+{
+    portENTER_CRITICAL(&h->lock);
+    bool (*busy)(void *)=h->persistence_busy;
+    void *context=h->persistence_context;
+    portEXIT_CRITICAL(&h->lock);
+    return busy && busy(context);
+}
+
+static void persist_enabled_preference(aether_wifi_handle_t h,int64_t now)
+{
+    portENTER_CRITICAL(&h->lock);
+    const enabled_preference_t request=h->preference;
+    portEXIT_CRITICAL(&h->lock);
+    if(!request.pending || now<request.retry_at) return;
+
+    if(flash_write_blocked(h)) {
+        portENTER_CRITICAL(&h->lock);
+        if(request.revision==h->preference.revision) h->preference.retry_at=now+1000000;
+        portEXIT_CRITICAL(&h->lock);
+        return;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t error=nvs_open("aether_wifi",NVS_READWRITE,&nvs);
+    if(error==ESP_OK) {
+        error=nvs_set_u8(nvs,ENABLED_KEY,request.enabled);
+        if(error==ESP_OK) error=nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    portENTER_CRITICAL(&h->lock);
+    if(request.revision==h->preference.revision) {
+        h->preference.error=error;
+        if(error==ESP_OK) {
+            h->preference.known=true;
+            h->preference.pending=false;
+        } else {
+            if(h->preference.failures<5) ++h->preference.failures;
+            h->preference.retry_at=now+(INT64_C(1000000)<<(h->preference.failures-1));
+        }
+    }
+    portEXIT_CRITICAL(&h->lock);
+}
+
 static void defer_credentials(aether_wifi_handle_t h,bool erase)
 {
     erase_secret(&h->pending_credentials,sizeof(h->pending_credentials));
@@ -138,10 +208,7 @@ static void defer_credentials(aether_wifi_handle_t h,bool erase)
 static void persist_credentials(aether_wifi_handle_t h,int64_t now)
 {
     if(!h->persistence_kind || now<h->persistence_at) return;
-    portENTER_CRITICAL(&h->lock);
-    bool (*busy)(void *)=h->persistence_busy; void *context=h->persistence_context;
-    portEXIT_CRITICAL(&h->lock);
-    if(busy && busy(context)) { h->persistence_at=now+1000000; return; }
+    if(flash_write_blocked(h)) { h->persistence_at=now+1000000; return; }
     nvs_handle_t nvs; esp_err_t error=nvs_open("aether_wifi",NVS_READWRITE,&nvs);
     if(error==ESP_OK) {
         error=h->persistence_kind==2 ? nvs_erase_key(nvs,"cred") : nvs_set_blob(nvs,"cred",&h->pending_credentials,sizeof(h->pending_credentials));
@@ -528,6 +595,7 @@ static void worker(void *context)
             else { h->ignore_disconnect=esp_wifi_disconnect()==ESP_OK; retry(h,0); }
         }
         if(h->retry_at && now>=h->retry_at) begin_connect(h);
+        persist_enabled_preference(h,now);
         persist_credentials(h,now);
     }
     stop_driver(h); command_t pending;
@@ -552,6 +620,7 @@ esp_err_t aether_wifi_new(aether_wifi_handle_t *out)
     /* Remembered-network availability is readable while the radio and its
      * 8KiB owner task are still OFF. No NVS write occurs here. */
     load_credentials(h); erase_secret(&h->credentials,sizeof(h->credentials));
+    load_enabled_preference(h);
     default_handle=h; *out=h; return ESP_OK;
 fail:
     if(h->ip_registered) esp_event_handler_instance_unregister(IP_EVENT,ESP_EVENT_ANY_ID,h->ip_handler);
@@ -615,6 +684,49 @@ esp_err_t aether_wifi_set_enabled(aether_wifi_handle_t h,bool enabled)
     }
     command_t c={.kind=CMD_ENABLE,.data.enabled=enabled}; return enqueue(h,&c);
 }
+
+esp_err_t aether_wifi_restore_preference(aether_wifi_handle_t h)
+{
+    if(!h) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&h->lock);
+    const bool enabled=h->preference.enabled;
+    const bool known=h->preference.known;
+    const esp_err_t error=h->preference.error;
+    portEXIT_CRITICAL(&h->lock);
+    if(!known) return error;
+    return enabled ? aether_wifi_set_enabled(h,true) : ESP_OK;
+}
+
+esp_err_t aether_wifi_set_enabled_preference(aether_wifi_handle_t h,bool enabled)
+{
+    if(!h) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&h->lock);
+    if(h->preference.submitting || atomic_load(&h->shutdown)) {
+        portEXIT_CRITICAL(&h->lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const bool save=!h->preference.known || h->preference.pending || h->preference.enabled!=enabled;
+    h->preference.submitting=true;
+    portEXIT_CRITICAL(&h->lock);
+
+    /* Reuse the session API so ESP-NOW owns the radio until lease release. */
+    esp_err_t error=save && !enabled ? ensure_owner(h) : ESP_OK;
+    if(error==ESP_OK) error=aether_wifi_set_enabled(h,enabled);
+
+    portENTER_CRITICAL(&h->lock);
+    if(error==ESP_OK && save) {
+        h->preference.enabled=enabled;
+        h->preference.pending=true;
+        ++h->preference.revision;
+        h->preference.retry_at=0;
+        h->preference.failures=0;
+        h->preference.error=ESP_OK;
+    }
+    h->preference.submitting=false;
+    portEXIT_CRITICAL(&h->lock);
+    return error;
+}
+
 esp_err_t aether_wifi_scan(aether_wifi_handle_t h)
 { if(!enabled(h)) return ESP_ERR_INVALID_STATE; command_t c={.kind=CMD_SCAN}; return enqueue(h,&c); }
 esp_err_t aether_wifi_connect(aether_wifi_handle_t h,const aether_wifi_ap_t *ap,const char *password,bool save)
@@ -694,6 +806,9 @@ esp_err_t aether_wifi_get_status(aether_wifi_handle_t h,aether_wifi_status_t *st
     *status=h->status;
     status->peer_radio=h->peer_phase!=PEER_IDLE;
     status->enabled_preference=status->peer_radio ? h->peer_restore : h->status.enabled;
+    status->preference_pending=h->preference.pending || h->preference.submitting;
+    status->preference_error=h->preference.error;
+    status->persistence_pending|=status->preference_pending;
     portEXIT_CRITICAL(&h->lock);
     return ESP_OK;
 }
@@ -708,7 +823,8 @@ esp_err_t aether_wifi_del(aether_wifi_handle_t h,uint32_t timeout_ms)
 {
     if(!h) return ESP_ERR_INVALID_ARG;
     portENTER_CRITICAL(&h->lock);
-    bool pending=h->status.persistence_pending || h->peer_phase!=PEER_IDLE;
+    bool pending=h->status.persistence_pending || h->preference.pending ||
+                 h->preference.submitting || h->peer_phase!=PEER_IDLE;
     bool starting=h->owner_starting,started=h->owner_started;
     if(!pending && !starting) atomic_store(&h->shutdown,true);
     portEXIT_CRITICAL(&h->lock);

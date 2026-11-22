@@ -6,6 +6,7 @@ struct app_ui {
     lv_timer_t *timer;
     void *page_context;
     void (*page_cleanup)(app_ui_t *);
+    void (*page_back)(app_ui_t *);
     app_power_t *power;
     bool media_active;
 };

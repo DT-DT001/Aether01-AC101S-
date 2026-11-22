@@ -26,14 +26,21 @@ typedef struct {
     esp_err_t last_error,storage_error;
     char ssid[33],ip[16];
     int8_t rssi;
-    bool peer_radio, enabled_preference;
+    bool peer_radio, enabled_preference; /**< Effective station setting during a peer lease. */
+    bool preference_pending;
+    esp_err_t preference_error;
 } aether_wifi_status_t;
-/** One station service; NVS is initialized by main. Wireless starts OFF.
+/** One station service; NVS is initialized by main. The radio starts OFF.
  * All commands enqueue without waiting for scans, association or NVS writes. */
 esp_err_t aether_wifi_new(aether_wifi_handle_t *out);
 aether_wifi_handle_t aether_wifi_get_default(void);
-/** Defer credential NVS writes/erase while media owns Flash bandwidth. */
+/** Defer preference and credential writes while media owns Flash bandwidth. */
 esp_err_t aether_wifi_set_persistence_guard(aether_wifi_handle_t,bool (*busy)(void *),void *context);
+/** Restore the saved boot preference after installing startup guards. An unset preference is OFF. */
+esp_err_t aether_wifi_restore_preference(aether_wifi_handle_t);
+/** Apply a deliberate user change and save it independently of credentials. */
+esp_err_t aether_wifi_set_enabled_preference(aether_wifi_handle_t,bool);
+/** Change only the current session, including a pending peer lease restore. */
 esp_err_t aether_wifi_set_enabled(aether_wifi_handle_t,bool);
 esp_err_t aether_wifi_scan(aether_wifi_handle_t);
 esp_err_t aether_wifi_connect(aether_wifi_handle_t,const aether_wifi_ap_t *,const char *password,bool save);

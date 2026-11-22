@@ -32,6 +32,7 @@ idf_component_register(
          "app_displacement.c"
          "app_displacement_estimator.c"
          "app_utilities.c"
+         "app_alarm_audio.c"
          "app_weather_data.c"
          "app_usb_input.c"
          "app_telemetry.c"

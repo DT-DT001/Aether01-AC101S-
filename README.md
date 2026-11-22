@@ -2,7 +2,7 @@
 
 以太01是一款基于 ESP32-S31 的便携触屏设备。这个仓库是 AC101S 音频硬件版的独立固件工程，使用 ESP-IDF 6.1 和 LVGL 9.5。当前固件为 **Demo，可能存在 Bug**。AC101S 版本已通过编译并在实板启动，完整音频体验仍需实板验证。
 
-[硬件设计文件](https://github.com/DT-DT001/Aether01-Hardware-AC101S) · [引脚与电源域](docs/hardware/io-power-map.zh_CN.md) · [English](README.en.md)
+[下载 AC101S 固件](https://github.com/DT-DT001/Aether01-AC101S-/releases/latest) · [硬件设计文件](https://github.com/DT-DT001/Aether01-Hardware-AC101S) · [引脚与电源域](docs/hardware/io-power-map.zh_CN.md) · [English](README.en.md)
 
 ## 界面预览
 

@@ -11,6 +11,12 @@ mkdir -p "$output_root"
     -I "$test_root/stubs" -I "$project_root/components/ac101s_audio/include" \
     "$test_root/audio_test.c" -Wl,--gc-sections -lm -o "$output_root/audio_native"
 "$output_root/audio_native"
+"${CC:-cc}" -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Werror \
+    -I "$test_root/stubs" \
+    -I "$project_root/components/ac101s_audio/include" -I "$project_root/main" \
+    -I "$project_root/tests/player/stubs" \
+    "$project_root/main/app_alarm_audio.c" "$test_root/alarm_audio_test.c" -o "$output_root/alarm_audio_native"
+"$output_root/alarm_audio_native"
 "${CC:-cc}" -std=c11 -D_POSIX_C_SOURCE=200809L -O1 -g -fsanitize=address,undefined \
     -ffunction-sections -fdata-sections -pthread -Wall -Wextra -Werror \
     -I "$test_root/stubs" -I "$project_root/components/ac101s_audio/include" \

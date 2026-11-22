@@ -4,7 +4,6 @@
 #include "aether_wifi.h"
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
-#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -20,7 +19,12 @@ enum {
     WEATHER_REQUEST_TIMEOUT_MS = 8000,
     WEATHER_BODY_TIMEOUT_MS = 5000,
     WEATHER_BODY_READ_TIMEOUT_MS = 1500,
-    ALARM_FRAMES = 4320,
+    ALARM_TONE_INTERVAL_MS = 2000,
+    ALARM_TONE_RETRY_MS = 500,
+    ALARM_RING_MAX_MS = 60000,
+    ALARM_SLOT_BYTES = 4,
+    ALARM_FLAG_CONFIGURED = 1,
+    ALARM_FLAG_ENABLED = 2,
     NVS_RETRY_MS = 3000,
 };
 static const char s_namespace[] = "utilities";
@@ -34,7 +38,12 @@ static void *s_storage_context;
 static EXT_RAM_BSS_ATTR char s_notes[APP_NOTE_COUNT][APP_NOTE_CAPACITY];
 static app_note_status_t s_note_status[APP_NOTE_COUNT];
 static uint32_t s_note_revision[APP_NOTE_COUNT];
-static app_alarm_snapshot_t s_alarm = {.hour = 7};
+static app_alarm_snapshot_t s_alarm = {.hour = 7, .ringing_slot = APP_ALARM_NO_SLOT};
+static app_alarm_slot_t s_alarm_slots[APP_ALARM_SLOTS];
+static uint64_t s_alarm_last_minute[APP_ALARM_SLOTS];
+static uint64_t s_ringing_minute;
+static uint32_t s_ring_revision, s_preview_revision;
+static uint8_t s_ringing_mask, s_preview_tone = APP_ALARM_TONE_COUNT;
 static uint32_t s_alarm_revision, s_city_revision;
 static bool s_city_pending, s_weather_running;
 static esp_err_t s_city_error;
@@ -58,13 +67,78 @@ static esp_err_t load_value_error(esp_err_t error)
     return error == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : error;
 }
 
+typedef uint8_t alarm_record_t[APP_ALARM_SLOTS][ALARM_SLOT_BYTES];
+
+static void update_ringing_summary_locked(void)
+{
+    s_alarm.ringing = s_ringing_mask != 0;
+    s_alarm.ringing_count = 0;
+    s_alarm.ringing_slot = APP_ALARM_NO_SLOT;
+    for (unsigned i = 0; i < APP_ALARM_SLOTS; ++i) {
+        if (!(s_ringing_mask & (1U << i))) continue;
+        if (!s_alarm.ringing_count) s_alarm.ringing_slot = i;
+        ++s_alarm.ringing_count;
+    }
+    const app_alarm_slot_t *slot = &s_alarm_slots[s_alarm.ringing ? s_alarm.ringing_slot : 0];
+    s_alarm.enabled = slot->enabled;
+    s_alarm.hour = slot->configured ? slot->hour : 7;
+    s_alarm.minute = slot->minute;
+    s_alarm.tone = slot->tone;
+}
+
+static void encode_alarms(alarm_record_t record)
+{
+    for (unsigned i = 0; i < APP_ALARM_SLOTS; ++i) {
+        const app_alarm_slot_t *slot = &s_alarm_slots[i];
+        record[i][0] = (slot->configured ? ALARM_FLAG_CONFIGURED : 0) |
+            (slot->enabled ? ALARM_FLAG_ENABLED : 0);
+        record[i][1] = slot->hour;
+        record[i][2] = slot->minute;
+        record[i][3] = slot->tone;
+    }
+}
+
+static esp_err_t load_alarms(nvs_handle_t handle, app_alarm_slot_t *slots, bool *migrate)
+{
+    alarm_record_t record;
+    size_t length = sizeof(record);
+    esp_err_t error = nvs_get_blob(handle, "alarms_v2", record, &length);
+    if (error == ESP_ERR_NVS_NOT_FOUND) {
+        uint16_t legacy;
+        error = nvs_get_u16(handle, "alarm_v1", &legacy);
+        if (error != ESP_OK) return error;
+        const unsigned hour = (legacy >> 8) & 0x7f;
+        const unsigned minute = legacy & 0xff;
+        if (hour >= 24 || minute >= 60) return ESP_ERR_INVALID_RESPONSE;
+        slots[0] = (app_alarm_slot_t){true, (legacy & 0x8000) != 0, hour, minute, 0};
+        *migrate = true;
+        return ESP_OK;
+    }
+    if (error != ESP_OK) return error;
+    if (length != sizeof(record)) return ESP_ERR_INVALID_SIZE;
+
+    for (unsigned i = 0; i < APP_ALARM_SLOTS; ++i) {
+        const uint8_t flags = record[i][0];
+        if (!flags) continue;
+        if (!(flags & ALARM_FLAG_CONFIGURED) || (flags & ~(ALARM_FLAG_CONFIGURED | ALARM_FLAG_ENABLED)) ||
+            record[i][1] >= 24 || record[i][2] >= 60 || record[i][3] >= APP_ALARM_TONE_COUNT) {
+            error = ESP_ERR_INVALID_RESPONSE;
+            continue;
+        }
+        slots[i] = (app_alarm_slot_t){true, (flags & ALARM_FLAG_ENABLED) != 0,
+                                      record[i][1], record[i][2], record[i][3]};
+    }
+    return error;
+}
+
 static void load_preferences(void)
 {
     nvs_handle_t handle;
     const esp_err_t opened = nvs_open(s_namespace, NVS_READONLY, &handle);
-    uint16_t alarm = 7U << 8;
+    app_alarm_slot_t alarms[APP_ALARM_SLOTS] = {0};
+    bool migrate_alarms = false;
     uint8_t city = 0;
-    const esp_err_t alarm_error = opened == ESP_OK ? nvs_get_u16(handle, "alarm_v1", &alarm) : opened;
+    const esp_err_t alarm_error = opened == ESP_OK ? load_alarms(handle, alarms, &migrate_alarms) : opened;
     const esp_err_t city_error = opened == ESP_OK ? nvs_get_u8(handle, "city_v1", &city) : opened;
     esp_err_t note_errors[APP_NOTE_COUNT];
     for (unsigned note = 0; note < APP_NOTE_COUNT; ++note) {
@@ -75,13 +149,9 @@ static void load_preferences(void)
     }
     if (opened == ESP_OK) nvs_close(handle);
     portENTER_CRITICAL(&s_lock);
-    const unsigned hour = (alarm >> 8) & 0x7f;
-    const unsigned minute = alarm & 0xff;
-    if (hour < 24 && minute < 60) {
-        s_alarm.hour = hour;
-        s_alarm.minute = minute;
-        s_alarm.enabled = (alarm & 0x8000) != 0;
-    }
+    memcpy(s_alarm_slots, alarms, sizeof(alarms));
+    update_ringing_summary_locked();
+    s_alarm.pending = migrate_alarms;
     s_alarm.save_error = load_value_error(alarm_error);
     s_alarm.ready = true;
     if (!s_city_revision && city < app_weather_city_count()) s_weather.city = city;
@@ -95,26 +165,25 @@ static void load_preferences(void)
 
 static esp_err_t save_preferences(void)
 {
-    app_alarm_snapshot_t alarm;
+    alarm_record_t alarms;
     unsigned city;
-    bool city_pending;
+    bool city_pending, alarm_pending;
     uint32_t alarm_revision, city_revision;
     portENTER_CRITICAL(&s_lock);
-    alarm = s_alarm;
+    alarm_pending = s_alarm.pending;
+    if (alarm_pending) encode_alarms(alarms);
     alarm_revision = s_alarm_revision;
     city = s_weather.city;
     city_pending = s_city_pending;
     city_revision = s_city_revision;
     portEXIT_CRITICAL(&s_lock);
-    if (!alarm.pending && !city_pending) return ESP_OK;
+    if (!alarm_pending && !city_pending) return ESP_OK;
 
     nvs_handle_t handle;
     const esp_err_t opened = nvs_open(s_namespace, NVS_READWRITE, &handle);
     esp_err_t alarm_error = opened, city_error = opened;
     if (opened == ESP_OK) {
-        if (alarm.pending)
-            alarm_error = nvs_set_u16(handle, "alarm_v1",
-                (alarm.enabled ? 0x8000 : 0) | (alarm.hour << 8) | alarm.minute);
+        if (alarm_pending) alarm_error = nvs_set_blob(handle, "alarms_v2", alarms, sizeof(alarms));
         if (city_pending)
             city_error = nvs_set_u8(handle, "city_v1", city);
         const esp_err_t committed = nvs_commit(handle);
@@ -123,7 +192,7 @@ static esp_err_t save_preferences(void)
         nvs_close(handle);
     }
     portENTER_CRITICAL(&s_lock);
-    if (alarm.pending && alarm_revision == s_alarm_revision) {
+    if (alarm_pending && alarm_revision == s_alarm_revision) {
         s_alarm.save_error = alarm_error;
         s_alarm.pending = alarm_error != ESP_OK;
     }
@@ -165,76 +234,86 @@ static esp_err_t save_note(unsigned note)
     return error;
 }
 
-static void play_alarm(void)
+static bool collect_due_alarms(const pcf85063_time_t *rtc)
 {
-    if (!s_board->audio_ready || storage_busy()) return;
-    int16_t *pcm = heap_caps_malloc(ALARM_FRAMES * 2 * sizeof(*pcm),
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!pcm) return;
-    /* Two 35 ms notes with short ramps. The one-shot codec operation owns
-     * the local speaker only for this burst and leaves existing routes intact. */
-    const unsigned note_frames = 1680;
-    const unsigned ramp_frames = 192;
-    for (unsigned frame = 0; frame < ALARM_FRAMES; ++frame) {
-        const bool second_note = frame >= ALARM_FRAMES / 2;
-        const unsigned offset = frame % (ALARM_FRAMES / 2);
-        int16_t sample = 0;
-        if (offset < note_frames) {
-            unsigned edge = offset < note_frames - offset ? offset : note_frames - offset;
-            if (edge > ramp_frames) edge = ramp_frames;
-            const int amplitude = (int)(5200U * edge / ramp_frames);
-            const unsigned period = second_note ? 40 : 50;
-            sample = offset % period < period / 2 ? amplitude : -amplitude;
-        }
-        pcm[2 * frame] = pcm[2 * frame + 1] = sample;
+    if (rtc->oscillator_stopped) return false;
+    const uint64_t seconds = app_calendar_seconds(rtc->year, rtc->month, rtc->day,
+                                                  rtc->hour, rtc->minute, rtc->second);
+    if (seconds == UINT64_MAX) return false;
+    const uint64_t minute = seconds / 60 + 1; /* Keep zero for never fired. */
+    uint8_t due = 0;
+    portENTER_CRITICAL(&s_lock);
+    for (unsigned i = 0; i < APP_ALARM_SLOTS; ++i) {
+        const app_alarm_slot_t *slot = &s_alarm_slots[i];
+        if (!slot->configured || !slot->enabled || slot->hour != rtc->hour ||
+            slot->minute != rtc->minute || s_alarm_last_minute[i] == minute) continue;
+        s_alarm_last_minute[i] = minute;
+        due |= 1U << i;
     }
-    app_alarm_snapshot_t alarm;
-    app_alarm_get(&alarm);
-    if (alarm.ringing && power_running())
-        (void)ac101s_audio_play_alert(s_board->audio, pcm, ALARM_FRAMES);
-    free(pcm);
+    if (due) {
+        /* Simultaneous alarms share one wake and dismissal. An alarm in the
+         * next minute starts a new occurrence even if the old one is active. */
+        s_ringing_mask = s_ringing_minute == minute ? s_ringing_mask | due : due;
+        s_ringing_minute = minute;
+        ++s_ring_revision;
+        s_preview_tone = APP_ALARM_TONE_COUNT;
+        ++s_preview_revision;
+        update_ringing_summary_locked();
+    }
+    portEXIT_CRITICAL(&s_lock);
+    return due != 0;
+}
+
+typedef struct {
+    uint32_t revision;
+    uint8_t slot, tone;
+    bool preview;
+} alarm_audio_request_t;
+
+static bool alarm_audio_current(void *context)
+{
+    const alarm_audio_request_t *request = context;
+    portENTER_CRITICAL(&s_lock);
+    const bool current = request->preview ? !s_alarm.ringing && request->revision == s_preview_revision :
+        s_alarm.ringing && request->slot == s_alarm.ringing_slot && request->revision == s_ring_revision;
+    portEXIT_CRITICAL(&s_lock);
+    return current && power_running();
 }
 
 static void service(void *unused)
 {
     (void)unused;
     load_preferences();
-    uint64_t last_alarm_minute = UINT64_MAX;
     int64_t ring_started = 0, next_tone = 0, next_save = 0;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(450));
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const bool running = power_running();
-        app_alarm_snapshot_t alarm;
-        app_alarm_get(&alarm);
         app_telemetry_snapshot_t telemetry;
         app_telemetry_get(&telemetry);
-        const pcf85063_time_t *rtc = &telemetry.rtc;
-        if (running && alarm.enabled && telemetry.rtc_error == ESP_OK && !rtc->oscillator_stopped &&
-            rtc->hour == alarm.hour && rtc->minute == alarm.minute) {
-            const uint64_t seconds = app_calendar_seconds(rtc->year, rtc->month, rtc->day,
-                                                         rtc->hour, rtc->minute, 0);
-            if (seconds != UINT64_MAX && seconds != last_alarm_minute) {
-                portENTER_CRITICAL(&s_lock);
-                const bool match = s_alarm.enabled && s_alarm.hour == rtc->hour &&
-                                   s_alarm.minute == rtc->minute;
-                if (match) s_alarm.ringing = true;
-                portEXIT_CRITICAL(&s_lock);
-                if (match) {
-                    ring_started = now_ms;
-                    next_tone = now_ms;
-                    last_alarm_minute = seconds;
-                    alarm.ringing = true;
-                    (void)app_power_wake(s_power);
-                }
-            }
+        if (running && telemetry.rtc_error == ESP_OK && collect_due_alarms(&telemetry.rtc)) {
+            ring_started = now_ms;
+            next_tone = now_ms;
+            (void)app_power_wake(s_power);
         }
-        if (alarm.ringing) {
-            if (!running || now_ms - ring_started >= 60000) app_alarm_dismiss();
-            else if (now_ms >= next_tone) {
-                play_alarm();
-                next_tone = now_ms + 4500;
-            }
+
+        portENTER_CRITICAL(&s_lock);
+        const bool ringing = s_alarm.ringing;
+        alarm_audio_request_t audio = ringing ? (alarm_audio_request_t){
+            .revision = s_ring_revision, .slot = s_alarm.ringing_slot, .tone = s_alarm.tone,
+        } : (alarm_audio_request_t){
+            .revision = s_preview_revision, .tone = s_preview_tone, .preview = true,
+        };
+        s_preview_tone = APP_ALARM_TONE_COUNT;
+        portEXIT_CRITICAL(&s_lock);
+
+        if (ringing && (!running || now_ms - ring_started >= ALARM_RING_MAX_MS)) {
+            app_alarm_dismiss();
+        } else if (running && s_board->audio_ready && audio.tone < APP_ALARM_TONE_COUNT &&
+                   (!ringing || now_ms >= next_tone)) {
+            const esp_err_t error = app_alarm_audio_play(s_board->audio, audio.tone,
+                                                         alarm_audio_current, &audio);
+            if (ringing) next_tone = now_ms + (error == ESP_OK ? ALARM_TONE_INTERVAL_MS : ALARM_TONE_RETRY_MS);
         }
         /* Allow the shutdown coordinator to flush already admitted saves. */
         if (now_ms >= next_save && !storage_busy()) {
@@ -266,32 +345,91 @@ void app_alarm_get(app_alarm_snapshot_t *out)
     portEXIT_CRITICAL(&s_lock);
 }
 
-esp_err_t app_alarm_set(unsigned hour, unsigned minute, bool enabled)
+esp_err_t app_alarm_get_slot(unsigned slot, app_alarm_slot_t *out)
 {
-    if (hour >= 24 || minute >= 60) return ESP_ERR_INVALID_ARG;
+    if (slot >= APP_ALARM_SLOTS || !out) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_lock);
+    const bool ready = s_alarm.ready;
+    *out = s_alarm_slots[slot];
+    portEXIT_CRITICAL(&s_lock);
+    return ready ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t update_alarm_slot(unsigned slot, app_alarm_slot_t value)
+{
     portENTER_CRITICAL(&s_lock);
     if (!s_alarm.ready) {
         portEXIT_CRITICAL(&s_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_alarm.hour != hour || s_alarm.minute != minute || s_alarm.enabled != enabled) {
-        s_alarm.hour = hour;
-        s_alarm.minute = minute;
-        s_alarm.enabled = enabled;
-        s_alarm.ringing = false;
+    const app_alarm_slot_t old = s_alarm_slots[slot];
+    const bool changed = old.configured != value.configured || old.enabled != value.enabled ||
+        old.hour != value.hour || old.minute != value.minute || old.tone != value.tone;
+    if (changed) {
+        s_alarm_slots[slot] = value;
+        if (s_ringing_mask & (1U << slot)) {
+            s_ringing_mask &= ~(1U << slot);
+            if (s_alarm.ringing_slot == slot) ++s_ring_revision;
+        }
+        update_ringing_summary_locked();
         s_alarm.pending = true;
         s_alarm.save_error = ESP_OK;
         ++s_alarm_revision;
     }
     portEXIT_CRITICAL(&s_lock);
-    xTaskNotifyGive(s_service);
+    if (changed) xTaskNotifyGive(s_service);
     return ESP_OK;
+}
+
+esp_err_t app_alarm_set_slot(unsigned slot, unsigned hour, unsigned minute, bool enabled, unsigned tone)
+{
+    if (slot >= APP_ALARM_SLOTS || hour >= 24 || minute >= 60 || tone >= APP_ALARM_TONE_COUNT)
+        return ESP_ERR_INVALID_ARG;
+    return update_alarm_slot(slot, (app_alarm_slot_t){true, enabled, hour, minute, tone});
+}
+
+esp_err_t app_alarm_remove_slot(unsigned slot)
+{
+    if (slot >= APP_ALARM_SLOTS) return ESP_ERR_INVALID_ARG;
+    return update_alarm_slot(slot, (app_alarm_slot_t){0});
+}
+
+esp_err_t app_alarm_set(unsigned hour, unsigned minute, bool enabled)
+{
+    return app_alarm_set_slot(0, hour, minute, enabled, 0);
+}
+
+esp_err_t app_alarm_preview(unsigned tone)
+{
+    if (tone >= APP_ALARM_TONE_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!s_service || !s_board->audio_ready || !power_running()) return ESP_ERR_INVALID_STATE;
+    portENTER_CRITICAL(&s_lock);
+    const bool allowed = s_alarm.ready && !s_alarm.ringing;
+    if (allowed) {
+        s_preview_tone = tone;
+        ++s_preview_revision;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (allowed) xTaskNotifyGive(s_service);
+    return allowed ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+void app_alarm_cancel_preview(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_preview_tone = APP_ALARM_TONE_COUNT;
+    ++s_preview_revision;
+    portEXIT_CRITICAL(&s_lock);
 }
 
 void app_alarm_dismiss(void)
 {
     portENTER_CRITICAL(&s_lock);
-    s_alarm.ringing = false;
+    if (s_ringing_mask) {
+        s_ringing_mask = 0;
+        ++s_ring_revision;
+        update_ringing_summary_locked();
+    }
     portEXIT_CRITICAL(&s_lock);
 }
 

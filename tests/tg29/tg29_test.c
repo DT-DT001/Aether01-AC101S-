@@ -1462,14 +1462,23 @@ int main(void)
     assert_unrelated_preserved();
     puts("PASS runtime enable readback and preservation of other rails");
 
-    /* Fault telemetry is best effort and must not clear pending flags. */
+    /* The first display frame needs no informational fault reads on success. */
     reset_chip();
     fail_read_reg = 0x08;
     assert(tg29_apply_power_profile(pmic, &profile) == ESP_OK);
-    assert(reads[0x08] && chip.reg[0x08] == 0x31);
+    assert(!reads[0x08] && chip.reg[0x08] == 0x31);
     assert_unrelated_preserved();
+
+    /* A real policy failure still attempts the dump without clearing flags
+     * or preventing the verified safe-off cleanup when a diagnostic read fails. */
+    reset_chip();
+    fail_read_reg = 0x08;
+    fail_write_reg = 0x96;
+    assert(tg29_apply_power_profile(pmic, &profile) != ESP_OK);
+    assert(reads[0x08] && chip.reg[0x08] == 0x31);
+    assert_safe_off();
     assert(!pmic->mutex->depth);
-    puts("PASS diagnostic read failure is nonfatal and retains fault evidence");
+    puts("PASS normal startup bypasses diagnostic reads; fault dump retains evidence and safe-off cleanup");
 
     /* Model a shared-bus sensor which clamps communication if its previously
      * powered rail is cut. Preparation and cleanup must preserve the rail. */
