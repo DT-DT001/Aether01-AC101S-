@@ -1,5 +1,6 @@
 #include "app_ui_internal.h"
 #include "app_audio_system.h"
+#include "app_screen.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +9,7 @@ extern const lv_font_t font_16,font_24;
 static uint16_t buffer[480*40];
 static lv_point_t pointer;
 static bool held;
-static unsigned connections;
+static unsigned connections, radio_commands, hid_entries;
 static uint8_t connected_address[6];
 static aether_bluetooth_device_t devices[AETHER_BLUETOOTH_MAX_DEVICES];
 static aether_bluetooth_status_t status={.state=AETHER_BT_SCANNING,.enabled=true,.audio_requested=true,.scanning=true,.device_count=16,
@@ -21,35 +22,74 @@ esp_err_t app_audio_system_set_volume(uint8_t v,bool p){(void)p;audio.master_vol
 esp_err_t aether_bluetooth_get_status(aether_bluetooth_handle_t h,aether_bluetooth_status_t *s){assert(h);*s=status;return ESP_OK;}
 esp_err_t aether_bluetooth_get_device(aether_bluetooth_handle_t h,size_t i,aether_bluetooth_device_t *d){assert(h&&i<16);*d=devices[i];return ESP_OK;}
 esp_err_t aether_bluetooth_connect(aether_bluetooth_handle_t h,const uint8_t a[6]){assert(h);++connections;memcpy(connected_address,a,6);return ESP_OK;}
-esp_err_t aether_bluetooth_scan(aether_bluetooth_handle_t h){assert(h);return ESP_OK;}
-esp_err_t aether_bluetooth_disconnect(aether_bluetooth_handle_t h){assert(h);return ESP_OK;}
-esp_err_t aether_bluetooth_set_enabled(aether_bluetooth_handle_t h,bool on){assert(h);(void)on;return ESP_OK;}
+esp_err_t aether_bluetooth_scan(aether_bluetooth_handle_t h){assert(h);++radio_commands;return ESP_OK;}
+esp_err_t aether_bluetooth_disconnect(aether_bluetooth_handle_t h){assert(h);++radio_commands;return ESP_OK;}
+esp_err_t aether_bluetooth_set_enabled(aether_bluetooth_handle_t h,bool on){assert(h);(void)on;++radio_commands;return ESP_OK;}
 const char *esp_err_to_name(esp_err_t e){return e?"ESP_FAIL":"ESP_OK";}
 const lv_font_t *app_ui_chinese_font_size(unsigned s){return s>=24?&font_24:&font_16;}
 const lv_font_t *app_ui_chinese_font(void){return &font_16;}
 void app_ui_label_text(lv_obj_t *o,const char *s){if(strcmp(lv_label_get_text(o),s))lv_label_set_text(o,s);}
 void app_ui_label_fmt(lv_obj_t *o,const char *f,...){char s[512];va_list a;va_start(a,f);vsnprintf(s,sizeof(s),f,a);va_end(a);app_ui_label_text(o,s);}
 lv_obj_t *app_ui_add_text(lv_obj_t *p,const char *s,lv_align_t a,int32_t x,int32_t y,uint32_t c,const lv_font_t *f){lv_obj_t *o=lv_label_create(p);lv_label_set_text(o,s);lv_obj_set_style_text_font(o,f,0);lv_obj_set_style_text_color(o,lv_color_hex(c),0);lv_obj_align(o,a,x,y);return o;}
+static void header_back(lv_event_t *event)
+{
+    app_ui_t *ui=lv_event_get_user_data(event);
+    if (lv_obj_get_parent(lv_event_get_current_target_obj(event))==ui->screen && ui->page_back)
+        ui->page_back(ui);
+}
 lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 {
-    (void)title;lv_obj_t *old=ui->screen;if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}if(ui->page_cleanup){ui->page_cleanup(ui);ui->page_cleanup=NULL;}
+    if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}if(ui->page_cleanup){ui->page_cleanup(ui);ui->page_cleanup=NULL;}
+    ui->page_back=NULL;
     ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);lv_obj_set_style_text_font(ui->screen,&font_16,0);
+    app_ui_add_text(ui->screen,title,LV_ALIGN_TOP_MID,0,20,0xEAF2FF,&font_24);
+    lv_obj_t *back=lv_button_create(ui->screen);lv_obj_set_pos(back,14,12);lv_obj_set_size(back,48,44);
+    lv_obj_add_event_cb(back,header_back,LV_EVENT_CLICKED,ui);
+    app_ui_add_text(back,LV_SYMBOL_LEFT,LV_ALIGN_CENTER,0,0,0xBFD7FF,&lv_font_montserrat_16);
     ui->content=lv_obj_create(ui->screen);lv_obj_set_size(ui->content,448,394);lv_obj_align(ui->content,LV_ALIGN_BOTTOM_MID,0,-14);
-    lv_obj_set_style_pad_all(ui->content,20,0);lv_obj_set_style_border_width(ui->content,0,0);lv_screen_load(ui->screen);if(old)lv_obj_delete(old);return ui->content;
+    lv_obj_set_style_pad_all(ui->content,20,0);lv_obj_set_style_border_width(ui->content,0,0);
+    app_ui_load_screen(ui->screen);return ui->content;
 }
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t ms){ui->timer=lv_timer_create(cb,ms,ui);}
+void app_open_settings(app_ui_t *ui){app_ui_begin_page(ui,"设置");}
+void app_open_pc_remote(app_ui_t *ui){++hid_entries;app_ui_begin_page(ui,"电脑键鼠");}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p){(void)a;(void)p;lv_display_flush_ready(d);}
 static void read_pointer(lv_indev_t *i,lv_indev_data_t *d){(void)i;d->point=pointer;d->state=held?LV_INDEV_STATE_PRESSED:LV_INDEV_STATE_RELEASED;}
 static void advance(unsigned ms){for(unsigned i=0;i<ms;++i){lv_tick_inc(1);lv_timer_handler();}}
 static lv_obj_t *find(lv_obj_t *p,const char *text)
 {if(lv_obj_check_type(p,&lv_label_class)&&strstr(lv_label_get_text(p),text))return p;for(unsigned i=0;i<lv_obj_get_child_count(p);++i){lv_obj_t *f=find(lv_obj_get_child(p,i),text);if(f)return f;}return NULL;}
+static void tap_label(app_ui_t *ui,const char *title)
+{
+    lv_obj_t *label=find(ui->screen,title);
+    assert(label);
+    lv_obj_update_layout(ui->screen);
+    lv_area_t area;
+    lv_obj_get_coords(lv_obj_get_parent(label),&area);
+    pointer=(lv_point_t){(area.x1+area.x2)/2,(area.y1+area.y2)/2};
+    held=true;advance(80);held=false;advance(80);
+}
+
+static void assert_title(app_ui_t *ui,const char *title)
+{
+    assert(!strcmp(lv_label_get_text(lv_obj_get_child(ui->screen,0)),title));
+}
+
 int main(void)
 {
     setbuf(stdout,NULL);for(unsigned i=0;i<16;++i){devices[i].address[5]=i+1;snprintf(devices[i].name,sizeof(devices[i].name),"Nearby %u",i);}
     strcpy(devices[0].name,"Old target");lv_init();lv_display_t *d=lv_display_create(480,480);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(d,buffer,NULL,sizeof(buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
     lv_indev_t *in=lv_indev_create();lv_indev_set_type(in,LV_INDEV_TYPE_POINTER);lv_indev_set_display(in,d);lv_indev_set_read_cb(in,read_pointer);
-    app_ui_t ui={0};app_open_bluetooth(&ui);advance(100);lv_obj_t *name=find(ui.screen,"Old target");assert(name);
+    app_ui_t ui={0};app_open_bluetooth(&ui);advance(100);
+    assert_title(&ui,"蓝牙");assert(ui.page_back==app_open_settings);
+    assert(find(ui.content,"连接耳机、音箱播放音乐")&&find(ui.content,"供手机、平板或电脑连接"));
+    tap_label(&ui,"蓝牙键鼠");assert_title(&ui,"电脑键鼠");
+    assert(hid_entries==1&&ui.page_back==app_open_bluetooth&&!connections&&!radio_commands);
+    tap_label(&ui,LV_SYMBOL_LEFT);assert_title(&ui,"蓝牙");assert(ui.page_back==app_open_settings);
+    tap_label(&ui,"音频输出");assert_title(&ui,"蓝牙音频");
+    assert(ui.page_back==app_open_bluetooth&&!connections&&!radio_commands);
+    puts("PASS Bluetooth overview enters audio and HID roles without changing radio state; HID header Back restores overview");
+    lv_obj_t *name=find(ui.screen,"Old target");assert(name);
     lv_obj_t *row=lv_obj_get_parent(name);lv_obj_scroll_to_view(row,LV_ANIM_OFF);lv_obj_update_layout(ui.screen);advance(200);
     lv_area_t area;lv_obj_get_coords(row,&area);pointer=(lv_point_t){.x=area.x1+60,.y=area.y1+32};held=true;advance(80);
     assert(lv_obj_has_state(row,LV_STATE_PRESSED));assert(!connections);
@@ -80,22 +120,28 @@ int main(void)
     lv_area_t message_area,list_area;lv_obj_get_coords(error,&message_area);lv_obj_get_coords(lv_obj_get_parent(row),&list_area);
     assert(message_area.y2<list_area.y1);
     status.last_error=ESP_OK;status.state=AETHER_BT_DISCONNECTING;status.connected=true;status.sample_rate=44100;advance(350);
-    lv_obj_t *route=lv_obj_get_parent(find(ui.screen,"使用耳机"));
-    lv_obj_t *scan=lv_obj_get_parent(find(ui.screen,"搜索耳机"));
+    lv_obj_t *route=lv_obj_get_parent(find(ui.screen,"使用蓝牙输出"));
+    lv_obj_t *scan=lv_obj_get_parent(find(ui.screen,"搜索音频设备"));
     assert(lv_obj_has_state(route,LV_STATE_DISABLED)&&lv_obj_has_state(scan,LV_STATE_DISABLED)&&lv_obj_has_state(row,LV_STATE_DISABLED));
     status.state=AETHER_BT_STOPPING;status.connected=false;advance(350);
     assert(lv_obj_has_state(route,LV_STATE_DISABLED)&&lv_obj_has_state(scan,LV_STATE_DISABLED)&&lv_obj_has_state(row,LV_STATE_DISABLED));
     puts("PASS ACL failure detail stays above device list; disconnecting/late connected and stopping disable scan/select/output");
     status.state=AETHER_BT_CONNECTED;status.connected=true;status.channels=2;
-    strcpy(status.peer.name,"Paired headphones");audio.applied_output=APP_AUDIO_OUTPUT_BLUETOOTH;
+    strcpy(status.peer.name,"Paired speaker");audio.applied_output=APP_AUDIO_OUTPUT_BLUETOOTH;
     advance(350);
     lv_obj_t *speaker=lv_obj_get_parent(find(ui.screen,"使用扬声器"));
-    assert(find(ui.screen,"Paired headphones")&&find(ui.screen,"44100 Hz · 立体声"));
+    assert(find(ui.screen,"Paired speaker")&&find(ui.screen,"44100 Hz · 立体声"));
     assert(lv_obj_has_state(route,LV_STATE_CHECKED)&&!lv_obj_has_state(speaker,LV_STATE_CHECKED));
     assert(lv_obj_get_height(route)>=44&&lv_obj_get_height(row)>=44);
-    audio.applied_output=APP_AUDIO_OUTPUT_SPEAKER;advance(350);
+    audio.applied_output=APP_AUDIO_OUTPUT_SPEAKER;status.peer.name[0]='\0';advance(350);
+    assert(find(ui.screen,"未命名音频设备"));
     assert(!lv_obj_has_state(route,LV_STATE_CHECKED)&&lv_obj_has_state(speaker,LV_STATE_CHECKED));
     puts("PASS audio format and applied output stay visible, with full-size controls");
+    tap_label(&ui,LV_SYMBOL_LEFT);assert_title(&ui,"蓝牙");
+    assert(ui.page_back==app_open_settings);
+    tap_label(&ui,LV_SYMBOL_LEFT);assert_title(&ui,"设置");
+    assert(!ui.page_back&&!radio_commands);
+    puts("PASS audio header Back restores Bluetooth overview, then Settings");
     if(ui.timer)lv_timer_delete(ui.timer);
     if(ui.page_cleanup)ui.page_cleanup(&ui);
     lv_obj_delete(ui.screen);lv_indev_delete(in);assert(lv_mem_test()==LV_RESULT_OK);lv_display_delete(d);lv_deinit();

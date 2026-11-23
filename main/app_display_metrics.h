@@ -45,4 +45,8 @@ esp_err_t app_display_metrics_attach(esp_lcd_panel_io_handle_t io, lv_display_t 
 esp_err_t app_display_metrics_attach_staged_rgb565(esp_lcd_panel_io_handle_t io,
     esp_lcd_panel_handle_t panel, lv_display_t *display, size_t capacity);
 void app_display_metrics_set_active(bool active);
+#if AETHER_UI_SELFTEST
+/* Temporarily measure non-video pages without the media poll disabling it. */
+void app_display_metrics_set_probe_active(bool active);
+#endif
 void app_display_metrics_get(app_display_metrics_t *metrics);

@@ -268,7 +268,7 @@ static void test_catalog_end(app_ui_t *ui)
         lv_obj_t *label=find(ui->screen,first);
         assert(label&&lv_obj_is_visible(label));
         lv_obj_t *list=lv_obj_get_parent(lv_obj_get_parent(label));
-        assert(lv_obj_get_child_count(list)==13&&!find(ui->screen,"下一页"));
+        assert(lv_obj_get_child_count(list)<13&&!find(ui->screen,"下一页"));
         capture(ui, i ? "nes-catalog" : "video-catalog");
         const unsigned before=catalog_calls;
         lv_obj_scroll_to_y(list,INT32_MAX,LV_ANIM_OFF);

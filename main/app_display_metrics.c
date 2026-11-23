@@ -18,6 +18,9 @@ static lv_display_t *s_display;
 static int64_t s_window_start_us;
 static int64_t s_previous_us;
 static uint32_t s_window_frames;
+#if AETHER_UI_SELFTEST
+static bool s_probe_active;
+#endif
 static struct {
     SemaphoreHandle_t signal;
     lv_display_flush_cb_t original;
@@ -250,9 +253,8 @@ esp_err_t app_display_metrics_attach_staged_rgb565(esp_lcd_panel_io_handle_t io,
     esp_lcd_panel_handle_t panel, lv_display_t *display, size_t capacity)
 { return panel && capacity ? attach(io, panel, display, capacity) : ESP_ERR_INVALID_ARG; }
 
-void app_display_metrics_set_active(bool active)
+static void set_active_locked(bool active)
 {
-    portENTER_CRITICAL(&s_lock);
     if (s_metrics.active != active) {
         const bool available = s_display != NULL && s_metrics.available;
         s_metrics = (app_display_metrics_t){.available = available, .active = active};
@@ -260,8 +262,27 @@ void app_display_metrics_set_active(bool active)
         s_window_frames = 0;
         s_window_start_us = esp_timer_get_time();
     }
+}
+
+void app_display_metrics_set_active(bool active)
+{
+    portENTER_CRITICAL(&s_lock);
+#if AETHER_UI_SELFTEST
+    active |= s_probe_active;
+#endif
+    set_active_locked(active);
     portEXIT_CRITICAL(&s_lock);
 }
+
+#if AETHER_UI_SELFTEST
+void app_display_metrics_set_probe_active(bool active)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_probe_active = active;
+    set_active_locked(active);
+    portEXIT_CRITICAL(&s_lock);
+}
+#endif
 
 void app_display_metrics_get(app_display_metrics_t *metrics)
 {

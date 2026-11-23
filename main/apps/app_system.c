@@ -1,8 +1,10 @@
 #include "aether_media_fs.h"
 #include "aether_usb_audio.h"
 #include "aether_usb_storage.h"
+#include "aether_wifi.h"
 #include "app_otg_control.h"
 #include "app_ui_internal.h"
+#include "app_connection_style.h"
 #include "app_telemetry.h"
 #include "app_utilities.h"
 #include "app_tools.h"
@@ -342,6 +344,7 @@ void app_open_clock(app_ui_t *ui)
 
 typedef struct {
     lv_obj_t *volume, *volume_label, *mute_label, *mute_button, *output, *audio_status;
+    lv_obj_t *wifi_status, *bluetooth_status;
     esp_err_t audio_submit_error;
     lv_obj_t *usb_switch, *usb_status;
     esp_err_t usb_submit_error;
@@ -663,8 +666,33 @@ static void refresh_audio(settings_page_t *page)
     else if (audio.persistence_pending) app_ui_label_text(page->audio_status, "音量已生效，正在后台保存");
     else app_ui_label_fmt(page->audio_status, "%s · %s",
                           audio.applied_output == APP_AUDIO_OUTPUT_USB ? "USB 音频输出" :
-                          audio.applied_output == APP_AUDIO_OUTPUT_BLUETOOTH ? "蓝牙耳机输出" : "扬声器输出",
+                          audio.applied_output == APP_AUDIO_OUTPUT_BLUETOOTH ? "蓝牙音频输出" : "扬声器输出",
                           audio.applied_volume ? "音量已生效" : "已静音");
+}
+
+static void connection_status(lv_obj_t *label, bool ready, bool enabled, bool connected)
+{
+    app_ui_label_text(label, !ready ? "不可用" : connected ? "已连接" : enabled ? "已开启" : "已关闭");
+    const lv_color_t color = lv_color_hex(connected ? CONNECTION_ACCENT : CONNECTION_DETAIL);
+    if (!lv_color_eq(lv_obj_get_style_text_color(label, 0), color))
+        lv_obj_set_style_text_color(label, color, 0);
+}
+
+static void refresh_connections(settings_page_t *page)
+{
+    const aether_wifi_handle_t wifi = aether_wifi_get_default();
+    aether_wifi_status_t station = {0};
+    const bool wifi_ready = wifi && aether_wifi_get_status(wifi, &station) == ESP_OK;
+    connection_status(page->wifi_status, wifi_ready,
+                      station.peer_radio ? station.enabled_preference : station.enabled, station.connected);
+
+    const aether_bluetooth_handle_t bluetooth = app_audio_system_bluetooth();
+    aether_bluetooth_status_t audio = {0};
+    aether_bluetooth_hid_status_t input = {0};
+    const bool audio_ready = bluetooth && aether_bluetooth_get_status(bluetooth, &audio) == ESP_OK;
+    const bool input_ready = bluetooth && aether_bluetooth_hid_get_status(bluetooth, &input) == ESP_OK;
+    connection_status(page->bluetooth_status, audio_ready || input_ready,
+                      audio.enabled || input.requested, audio.connected || input.connected);
 }
 
 static void settings_timer(lv_timer_t *timer)
@@ -683,7 +711,12 @@ static void settings_timer(lv_timer_t *timer)
                                 status.persistence_pending ? "正在后台保存设置…" : "设置已保存");
     }
     settings_page_t *page = ui->page_context;
-    if (page) { refresh_audio(page); refresh_usb(ui, page); refresh_otg(ui, page); }
+    if (page) {
+        refresh_connections(page);
+        refresh_audio(page);
+        refresh_usb(ui, page);
+        refresh_otg(ui, page);
+    }
 }
 
 static void nes_controls_event(lv_event_t *event)
@@ -752,6 +785,42 @@ static lv_obj_t *settings_switch(lv_obj_t *card, int y, lv_event_cb_t callback, 
     return control;
 }
 
+enum { SETTINGS_WIFI, SETTINGS_BLUETOOTH, SETTINGS_DEVICE_STATUS };
+
+static const struct { const char *name; void (*open)(app_ui_t *ui); } settings_subpages[] = {
+    [SETTINGS_WIFI] = {"Wi-Fi", app_open_wifi},
+    [SETTINGS_BLUETOOTH] = {"蓝牙", app_open_bluetooth},
+    [SETTINGS_DEVICE_STATUS] = {"设备状态", app_open_status},
+};
+
+static void settings_open_subpage(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    lv_obj_t *row = lv_event_get_current_target_obj(event);
+    if (lv_obj_get_screen(row) != ui->screen) return;
+    const size_t item = (uintptr_t)lv_obj_get_user_data(row);
+    settings_subpages[item].open(ui);
+    ui->page_back = app_open_settings;
+}
+
+static lv_obj_t *settings_subpage_row(lv_obj_t *card, int y, size_t item,
+                                     lv_obj_t **status, app_ui_t *ui)
+{
+    lv_obj_t *row = lv_button_create(card);
+    lv_obj_set_pos(row, 16, y);
+    lv_obj_set_size(row, 380, 44);
+    app_connection_button_style(row, false);
+    lv_obj_set_user_data(row, (void *)(uintptr_t)item);
+    lv_obj_add_event_cb(row, settings_open_subpage, LV_EVENT_CLICKED, ui);
+    app_ui_add_text(row, settings_subpages[item].name, LV_ALIGN_LEFT_MID, 14, 0,
+                    CONNECTION_TEXT, app_ui_chinese_font());
+    app_ui_add_text(row, LV_SYMBOL_RIGHT, LV_ALIGN_RIGHT_MID, -10, 0,
+                    CONNECTION_DETAIL, &lv_font_montserrat_16);
+    if (status) *status = app_ui_add_text(row, "", LV_ALIGN_RIGHT_MID, -33, 0,
+                                         CONNECTION_DETAIL, app_ui_chinese_font());
+    return row;
+}
+
 void app_open_settings(app_ui_t *ui)
 {
     lv_obj_t *content = app_ui_begin_page(ui, "设置");
@@ -764,6 +833,12 @@ void app_open_settings(app_ui_t *ui)
     ui->page_cleanup = page_free;
     lv_obj_set_style_pad_all(content, 16, 0);
     lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content, 14, 0);
+    lv_obj_t *connections = section_card(content, 0, 160, LV_SYMBOL_WIFI, "连接", 0x85DCFF);
+    lv_obj_t *wifi_row = settings_subpage_row(connections, 53, SETTINGS_WIFI, &page->wifi_status, ui);
+    settings_subpage_row(connections, 100, SETTINGS_BLUETOOTH, &page->bluetooth_status, ui);
+
     lv_obj_t *sound = section_card(content, 0, 216, LV_SYMBOL_VOLUME_MAX, "声音", 0x86E3C9);
     page->volume_label = section_text(sound, "", 60, 0xD9E8FF);
     page->volume = lv_slider_create(sound);
@@ -778,11 +853,11 @@ void app_open_settings(app_ui_t *ui)
     lv_obj_set_style_bg_color(page->mute_button, lv_color_hex(0x29354F), 0);
     page->mute_label = lv_obj_get_child(page->mute_button, 0);
     section_text(sound, "音频输出", 137, 0xD9E8FF);
-    page->output = system_dropdown(sound, 158, 124, 238, "扬声器\n蓝牙耳机\nUSB 耳机 / 声卡");
+    page->output = system_dropdown(sound, 158, 124, 238, "扬声器\n蓝牙音频\nUSB 耳机 / 声卡");
     lv_obj_add_event_cb(page->output, output_event, LV_EVENT_VALUE_CHANGED, ui);
     page->audio_status = section_text(sound, "", 173, 0x9CCFBE);
 
-    lv_obj_t *display = section_card(content, 230, 270, LV_SYMBOL_IMAGE, "显示", 0xADC8FF);
+    lv_obj_t *display = section_card(content, 0, 270, LV_SYMBOL_IMAGE, "显示", 0xADC8FF);
     ui->app_obj[1] = section_text(display, "", 59, 0xD9E8FF);
     lv_obj_t *brightness = lv_slider_create(display);
     lv_obj_set_pos(brightness, 24, 94);
@@ -803,13 +878,13 @@ void app_open_settings(app_ui_t *ui)
     action(display, "立即息屏", 16, 174, 140, sleep_event, ui);
     ui->app_obj[2] = section_text(display, "按电源键唤醒屏幕", 225, 0xA6B4CD);
 
-    lv_obj_t *storage = section_card(content, 514, 206, LV_SYMBOL_SD_CARD, "存储与按键", 0xBEBAFF);
+    lv_obj_t *storage = section_card(content, 0, 206, LV_SYMBOL_SD_CARD, "存储与按键", 0xBEBAFF);
     section_text(storage, "USB 虚拟U盘", 67, 0xD9E8FF);
     page->usb_switch = settings_switch(storage, 58, usb_switch_event, ui);
     page->usb_status = section_text(storage, "", 100, 0x9CCFBE);
     action(storage, "传输详情", 16, 148, 183, usb_details, ui);
     action(storage, "NES 按键映射", 213, 148, 183, nes_controls_event, ui);
-    lv_obj_t *otg = section_card(content, 734, LV_SIZE_CONTENT, LV_SYMBOL_USB, "USB 外设", 0x8FD7FF);
+    lv_obj_t *otg = section_card(content, 0, LV_SIZE_CONTENT, LV_SYMBOL_USB, "USB 外设", 0x8FD7FF);
     section_text(otg, "自动 OTG（CC 检测）", 67, 0xD9E8FF);
     page->otg_switch = settings_switch(otg, 58, otg_switch_event, ui);
     section_text(otg, "手动 OTG（无 CC 外设）", 117, 0xD9E8FF);
@@ -822,14 +897,17 @@ void app_open_settings(app_ui_t *ui)
     page->otg_help = section_text(otg,
         "OTG 与虚拟U盘互斥。自动模式在 CC 确认后供电。支持 HID 键鼠、手柄、UAC 1.0 音频和 FAT32/exFAT U盘。USB 音频在声音与录音页选择，U盘在文件管理中打开。",
         OTG_HID_Y, 0xA6B4CD);
+    lv_obj_t *device = section_card(content, 0, 113, LV_SYMBOL_SETTINGS, "设备", 0x92B8FF);
+    settings_subpage_row(device, 53, SETTINGS_DEVICE_STATUS, NULL, ui);
     refresh_setting_labels(ui);
+    refresh_connections(page);
     refresh_audio(page);
     refresh_usb(ui, page);
     refresh_otg(ui, page);
     /* Take focus before the previous screen's deferred deletion can move it
      * to one of this page's lower controls and start an automatic scroll. */
     lv_obj_update_layout(content);
-    lv_group_focus_obj(page->volume);
+    lv_group_focus_obj(wifi_row);
     lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
     app_ui_set_timer(ui, settings_timer, 300);
 }

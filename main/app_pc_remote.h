@@ -30,7 +30,9 @@ esp_err_t app_pc_remote_click(uint8_t buttons);
 void app_pc_remote_set_air_mode(bool enabled);
 void app_pc_remote_set_motion(bool enabled);
 void app_pc_remote_recenter(void);
-void app_pc_remote_leave(void);
+/* Release queued keys, buttons and IMU control without changing the link. */
+void app_pc_remote_release_controls(void);
+void app_pc_remote_shutdown(void);
 esp_err_t app_pc_remote_get_shortcut(unsigned slot, app_pc_shortcut_t *shortcut);
 esp_err_t app_pc_remote_set_shortcut(unsigned slot, app_pc_shortcut_t shortcut);
 esp_err_t app_pc_remote_trigger(unsigned slot);

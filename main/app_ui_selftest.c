@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -11,6 +12,7 @@
 #include "aether_recorder.h"
 #include "aether_storage.h"
 #include "aether_wifi.h"
+#include "app_audio_system.h"
 #include "app_display_metrics.h"
 #include "app_home.h"
 #include "app_otg_control.h"
@@ -32,7 +34,7 @@ static const uint32_t external_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 
 typedef enum {
     CLOCK, WEATHER, CALENDAR, NOTES, MUSIC, READER, VIDEO, FILES, GAMES, NES,
-    RECORDER, SETTINGS, WIFI, BLUETOOTH, STATUS, MOTION, PRESSURE, DISPLACEMENT,
+    RECORDER, SETTINGS, MOTION, PRESSURE, DISPLACEMENT,
     REMOTE, OBS, INTERCOM, GPS, CAMERA, GALLERY,
 } route_id_t;
 
@@ -55,9 +57,6 @@ static const route_t routes[] = {
     [NES] = {"nes-picker", "选择 NES 游戏", "NES 游戏"},
     [RECORDER] = {"recorder", "录音机", "录音"},
     [SETTINGS] = {"settings", "设置", "设置"},
-    [WIFI] = {"wifi", "Wi-Fi 网络", "无线网络"},
-    [BLUETOOTH] = {"bluetooth", "蓝牙耳机", "蓝牙耳机"},
-    [STATUS] = {"status", "设备状态", "设备状态"},
     [MOTION] = {"motion", "运动与姿态", "运动"},
     [PRESSURE] = {"barometer", "气压与高度", "气压高度"},
     [DISPLACEMENT] = {"displacement", "短程位移", "位移测量"},
@@ -77,8 +76,11 @@ typedef struct {
 
 static const nested_route_t nested_routes[] = {
     {CLOCK, LV_SYMBOL_BELL, {"alarm", "闹钟", NULL}},
+    {SETTINGS, "Wi-Fi", {"wifi", "Wi-Fi 网络", NULL}},
+    {SETTINGS, "蓝牙", {"bluetooth", "蓝牙", NULL}},
     {SETTINGS, "NES 按键映射", {"nes-keymap", "NES 键盘映射", NULL}},
     {SETTINGS, "传输详情", {"usb-transfer", "USB 文件传输", NULL}},
+    {SETTINGS, "设备状态", {"status", "设备状态", NULL}},
     {GAMES, "2048", {"game-2048", "2048", NULL}},
     {GAMES, "推箱子", {"game-crates", "推箱子", NULL}},
     {GAMES, "贪吃蛇", {"game-snake", "贪吃蛇", NULL}},
@@ -230,6 +232,14 @@ static lv_indev_t *create_pointer(lv_display_t *display, lv_indev_data_t *sample
     return pointer;
 }
 
+static void delete_pointer(lv_indev_t *pointer)
+{
+    /* LVGL 9.5 scroll throw animations retain the input device as their target. */
+    lv_indev_reset(pointer, NULL);
+    lv_anim_delete(pointer, NULL);
+    lv_indev_delete(pointer);
+}
+
 /* Call with the LVGL lock held. Keep this synthetic pointer separate from the
  * physical touch controller, and finish the press before dispatching a tile. */
 static bool desktop_drag(probe_t *probe, int32_t dx, int32_t dy, unsigned steps,
@@ -254,7 +264,7 @@ static bool desktop_drag(probe_t *probe, int32_t dx, int32_t dy, unsigned steps,
     const uint32_t before_release = ui->page_generation;
     sample.state = LV_INDEV_STATE_RELEASED;
     lv_indev_read(pointer);
-    lv_indev_delete(pointer);
+    delete_pointer(pointer);
 
     const uint32_t expected = probe->generation + (opens_drawer ? 1U : 0U);
     return before_release == expected && ui->page_generation == expected;
@@ -309,6 +319,22 @@ static bool click_label(probe_t *probe, const char *caption)
     }
     lvgl_port_unlock();
     return ok;
+}
+
+static bool click_subpage_back(probe_t *probe, const char *duplicate)
+{
+    if (!lvgl_port_lock(1000)) return false;
+    app_ui_t *ui = probe->ui;
+    lv_obj_t *back = current_page(probe) ? button_for(ui->screen, LV_SYMBOL_LEFT) : NULL;
+    void (*previous)(app_ui_t *) = ui->page_back;
+    void *context = ui->page_context;
+    const bool has_header = back && lv_obj_get_parent(back) == ui->screen && previous &&
+        !lv_obj_has_state(back, LV_STATE_DISABLED) && !button_for(ui->content, duplicate);
+    if (has_header) lv_obj_send_event(back, LV_EVENT_CLICKED, NULL);
+    const bool returned = has_header && current_page(probe) && ui->page_context == context &&
+        ui->page_back != previous;
+    lvgl_port_unlock();
+    return returned;
 }
 
 static bool idle_media(app_ui_t *ui)
@@ -421,7 +447,7 @@ static bool click_drawer_home(probe_t *probe)
                 const bool held_drawer = current_page(probe);
                 sample.state = LV_INDEV_STATE_RELEASED;
                 lv_indev_read(pointer);
-                lv_indev_delete(pointer);
+                delete_pointer(pointer);
                 opened = held_drawer && ui->page_generation == probe->generation + 1U;
             }
         }
@@ -705,7 +731,7 @@ static bool test_ime_locked(lv_obj_t *screen)
                 ime_glide_locked(pointer, &sample, &keys, strokes[i], false);
             sentence_parts = ime_pick_locked(dock, pointer, &sample, "明天我想跟你一起去公园") &&
                 !strcmp(lv_textarea_get_text(field), "明天我想跟你一起去公园");
-            lv_indev_delete(pointer);
+            delete_pointer(pointer);
         }
     }
     lv_obj_delete(scope);
@@ -768,11 +794,202 @@ static bool test_settings_top(probe_t *probe, const char *entry)
     return scroll == 0;
 }
 
+static lv_obj_t *find_scrolling_list(lv_obj_t *obj)
+{
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return NULL;
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_SCROLLABLE) && lv_obj_get_scroll_bottom(obj) > 0) return obj;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(obj); ++i) {
+        lv_obj_t *list = find_scrolling_list(lv_obj_get_child(obj, i));
+        if (list) return list;
+    }
+    return NULL;
+}
+
+typedef struct {
+    int64_t began;
+    uint32_t position_ms, tx_overflows;
+    ac101s_audio_write_metrics_t writes;
+} playback_probe_t;
+
+static playback_probe_t begin_playback_probe(probe_t *probe)
+{
+    aether_audio_player_status_t status = {0};
+    (void)aether_audio_player_get_status(probe->ui->audio_player, &status);
+    playback_probe_t sample = {.position_ms = status.position_ms};
+    ac101s_audio_handle_t codec = probe->ui->board->audio;
+    (void)ac101s_audio_get_write_metrics(codec, &sample.writes);
+#if AETHER_AUDIO_DIAG
+    sample.tx_overflows = ac101s_audio_diag_tx_overflows(codec);
+#endif
+    app_display_metrics_set_probe_active(true);
+    sample.began = esp_timer_get_time();
+    return sample;
+}
+
+static bool finish_playback_probe(probe_t *probe, const aether_audio_player_status_t *before,
+                                  const playback_probe_t *start, const char *phase,
+                                  uint32_t min_fps, uint32_t max_refresh_gap_us, bool ok)
+{
+    const uint32_t wall_ms = (uint32_t)((esp_timer_get_time() - start->began) / 1000);
+    aether_audio_player_status_t audio;
+    const bool audio_ok = aether_audio_player_get_status(probe->ui->audio_player, &audio) == ESP_OK;
+    const uint32_t advanced = audio_ok && audio.position_ms >= start->position_ms ?
+        audio.position_ms - start->position_ms : 0;
+    ac101s_audio_handle_t codec = probe->ui->board->audio;
+    ac101s_audio_write_metrics_t writes = {0};
+    const bool writes_ok = ac101s_audio_get_write_metrics(codec, &writes) == ESP_OK;
+    uint32_t overflows = 0;
+#if AETHER_AUDIO_DIAG
+    overflows = ac101s_audio_diag_tx_overflows(codec) - start->tx_overflows;
+#endif
+    app_display_metrics_t display;
+    app_display_metrics_get(&display);
+    app_display_metrics_set_probe_active(false);
+    ok = ok && audio_ok && writes_ok && !overflows &&
+        audio.state == AETHER_AUDIO_PLAYING && !strcmp(before->path, audio.path) &&
+        advanced >= wall_ms * 9 / 10 &&
+        display.completed_refreshes * 1000 >= wall_ms * min_fps &&
+        display.max_refresh_gap_us <= max_refresh_gap_us &&
+        writes.write_calls > start->writes.write_calls &&
+        writes.mutex_timeouts == start->writes.mutex_timeouts &&
+        writes.output_errors == start->writes.output_errors &&
+        audio.supply_gap_max_us < 25000;
+    ESP_LOGI(TAG, "CHECK music-%s position_delta_ms=%" PRIu32 " wall_ms=%" PRIu32
+             " lcd_refreshes=%" PRIu32 " lcd_max_gap_us=%" PRIu32 " dma_tx_overflows=%" PRIu32
+             " mutex_wait_max_us=%" PRIu32 " supply_gap_max_us=%" PRIu32 " result=%s",
+             phase, advanced, wall_ms, display.completed_refreshes, display.max_refresh_gap_us,
+             overflows, writes.mutex_wait_max_us, audio_ok ? audio.supply_gap_max_us : 0,
+             ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool test_music_scroll(probe_t *probe, const aether_audio_player_status_t *before)
+{
+    if (before->duration_ms < before->position_ms + 5000) return true;
+    if (!click_label(probe, "曲库") || !lvgl_port_lock(1000)) return false;
+    lv_obj_update_layout(probe->ui->content);
+    lv_obj_t *list = find_scrolling_list(probe->ui->content);
+    if (!list) {
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "SKIP music-scroll no overflowing library");
+        return click_subpage_back(probe, "返回");
+    }
+    lv_indev_data_t input = {0};
+    lv_indev_t *pointer = create_pointer(lv_obj_get_display(list), &input);
+    lv_area_t area;
+    lv_obj_get_coords(list, &area);
+    lvgl_port_unlock();
+    if (!pointer) return false;
+
+    const lv_point_t center = {(area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2};
+    const int32_t span = lv_area_get_height(&area) / 2 - 12;
+    const playback_probe_t start = begin_playback_probe(probe);
+    int32_t traveled = 0;
+    uint32_t peak_sample_speed = 0;
+    bool ok = true;
+    for (int swipe = 0; swipe < 10 && ok; ++swipe) {
+        const int32_t delta = swipe % 2 ? -span : span;
+        int64_t previous_us = 0;
+        for (int step = 0; step <= 4; ++step) {
+            if (!lvgl_port_lock(1000)) { ok = false; break; }
+            if (!current_page(probe) || !lv_obj_is_valid(list)) {
+                lvgl_port_unlock();
+                ok = false;
+                break;
+            }
+            const lv_point_t point = {center.x, center.y + delta - LV_MIN(step, 3) * delta * 2 / 3};
+            const int32_t previous_y = lv_obj_get_scroll_y(list);
+            const int64_t now = esp_timer_get_time();
+            ime_sample(pointer, &input, point, step < 4);
+            traveled += abs(lv_obj_get_scroll_y(list) - previous_y);
+            if (step > 0 && step < 4 && now > previous_us) {
+                const uint32_t speed = (uint32_t)(span * 2 * INT64_C(1000000) / 3 / (now - previous_us));
+                peak_sample_speed = LV_MAX(peak_sample_speed, speed);
+            }
+            previous_us = now;
+            lvgl_port_unlock();
+            pause_ms(step == 4 ? 45 : 5);
+        }
+    }
+    if (lvgl_port_lock(1000)) {
+        delete_pointer(pointer);
+        lvgl_port_unlock();
+    } else ok = false;
+    ESP_LOGI(TAG, "music fast input travel_px=%" PRId32 " peak_input_px_s=%" PRIu32,
+             traveled, peak_sample_speed);
+    /* The input sequence includes a deliberate 45 ms interval between flicks. */
+    ok = finish_playback_probe(probe, before, &start, "scroll", 20, 75000,
+        ok && traveled >= 500 && peak_sample_speed >= 1800);
+    return click_subpage_back(probe, "返回") && ok;
+}
+
+static lv_obj_t *find_volume_slider(lv_obj_t *obj)
+{
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return NULL;
+    if (lv_obj_check_type(obj, &lv_slider_class) && lv_slider_get_max_value(obj) == 100) return obj;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(obj); ++i) {
+        lv_obj_t *slider = find_volume_slider(lv_obj_get_child(obj, i));
+        if (slider) return slider;
+    }
+    return NULL;
+}
+
+static bool test_music_volume(probe_t *probe, const aether_audio_player_status_t *before)
+{
+    app_audio_system_snapshot_t audio;
+    app_audio_system_get_snapshot(&audio);
+    const uint8_t original = audio.master_volume;
+    if (!audio.ready || audio.applied_output != APP_AUDIO_OUTPUT_SPEAKER || !lvgl_port_lock(1000)) return false;
+    lv_obj_t *slider = current_page(probe) ? find_volume_slider(probe->ui->content) : NULL;
+    lv_indev_data_t input = {0};
+    lv_indev_t *pointer = slider ? create_pointer(lv_obj_get_display(slider), &input) : NULL;
+    lv_area_t area;
+    if (slider) lv_obj_get_coords(slider, &area);
+    lvgl_port_unlock();
+    if (!pointer) return false;
+
+    const playback_probe_t start = begin_playback_probe(probe);
+    const int32_t center_y = (area.y1 + area.y2) / 2;
+    const int32_t width = area.x2 - area.x1;
+    unsigned changes = 0;
+    uint8_t minimum = 100, maximum = 0, last = audio.applied_volume;
+    bool ok = true;
+    for (int step = 0; step <= 41; ++step) {
+        if (!lvgl_port_lock(1000)) { ok = false; break; }
+        if (!current_page(probe)) { lvgl_port_unlock(); ok = false; break; }
+        const int offset = step % 20;
+        const int fraction = offset <= 10 ? offset : 20 - offset;
+        const lv_point_t point = {area.x1 + width * fraction / 10, center_y};
+        ime_sample(pointer, &input, point, step < 41);
+        lvgl_port_unlock();
+        pause_ms(9);
+        app_audio_system_get_snapshot(&audio);
+        minimum = LV_MIN(minimum, audio.applied_volume);
+        maximum = LV_MAX(maximum, audio.applied_volume);
+        if (audio.applied_volume != last) ++changes;
+        last = audio.applied_volume;
+    }
+    if (lvgl_port_lock(1000)) {
+        delete_pointer(pointer);
+        lvgl_port_unlock();
+    } else ok = false;
+    /* Measure the drag itself. The settled screen need not draw extra frames
+     * after release while awaiting confirmation of the final volume. */
+    ok = finish_playback_probe(probe, before, &start, "volume", 30, 45000,
+        ok && changes >= 12 && minimum <= 2 && maximum >= 98);
+    pause_ms(100);
+    app_audio_system_get_snapshot(&audio);
+    ESP_LOGI(TAG, "music volume input updates=%u applied_min=%u applied_max=%u target=%u applied=%u",
+             changes, minimum, maximum, audio.master_volume, audio.applied_volume);
+    const bool settled = !audio.pending && audio.master_volume == last && audio.applied_volume == last;
+    return app_audio_system_set_volume(original, false) == ESP_OK && settled && ok;
+}
+
 static bool test_music(probe_t *probe)
 {
     if (!click_label(probe, "曲库")) return false;
     pause_ms(180);
-    if (!click_label(probe, "返回")) return false;
+    if (!click_subpage_back(probe, "返回")) return false;
     aether_audio_player_status_t audio;
     if (!probe->ui->audio_player ||
         aether_audio_player_get_status(probe->ui->audio_player, &audio) != ESP_OK ||
@@ -818,7 +1035,10 @@ static bool test_music(probe_t *probe)
                      esp_timer_get_time() - start, reached ? "PASS" : "FAIL");
             if (!reached) return false;
         }
-        return true;
+        pause_ms(120);
+        const bool scroll_ok = test_music_scroll(probe, &audio);
+        const bool volume_ok = test_music_volume(probe, &audio);
+        return scroll_ok && volume_ok;
     }
     ESP_LOGE(TAG, "FAIL music-playback state=%d error=%s", audio.state,
              esp_err_to_name(audio.last_error));
@@ -976,7 +1196,7 @@ static bool test_gallery(probe_t *probe)
         lvgl_port_unlock();
         if (!current) return false;
         if (width && height && completed_regions() > before) {
-            if (!click_label(probe, "返回列表")) return false;
+            if (!click_subpage_back(probe, "返回列表")) return false;
             ++probe->media_passed;
             ESP_LOGI(TAG, "PASS gallery-decode rendered_pixels=%ux%u list_return=1", width, height);
             return true;
@@ -984,7 +1204,7 @@ static bool test_gallery(probe_t *probe)
         if (rejected) {
             ++probe->media_skipped;
             ESP_LOGI(TAG, "SKIP gallery-decode first indexed image rejected by decoder");
-            return click_label(probe, "返回列表");
+            return click_subpage_back(probe, "返回列表");
         }
     } while (esp_timer_get_time() < deadline);
     ESP_LOGE(TAG, "FAIL gallery-decode image open did not finish");
@@ -1111,7 +1331,7 @@ static bool test_routes(probe_t *probe, unsigned round)
         const route_t *route = &routes[i];
         const heap_sample_t heap_before = psram_sample();
         const uint64_t before = completed_regions();
-        const bool settle = round != ROUNDS;
+        const bool settle = round != ROUNDS || i == MUSIC;
         if (!open_drawer_tile(probe, (route_id_t)i, settle)) {
             ESP_LOGE(TAG, "FAIL round=%u route=%s open/render/catalog", round, route->id);
             return false;
@@ -1120,13 +1340,14 @@ static bool test_routes(probe_t *probe, unsigned round)
             pause_ms(160);
             report_sensors((route_id_t)i);
         }
-        const bool actions_ok = round != 1 ||
+        const bool stress_music = i == MUSIC && (round == 1 || round == ROUNDS / 2 || round == ROUNDS);
+        const bool music_ok = !stress_music || test_music(probe);
+        const bool actions_ok = music_ok && (round != 1 ||
             ((i != NOTES || test_notes_keyboard(probe)) &&
-             (i != MUSIC || test_music(probe)) &&
              (i != VIDEO || test_video(probe)) &&
              (i != RECORDER || test_recordings_back(probe)) &&
              (i != SETTINGS || test_settings_top(probe, "drawer")) &&
-             (i != GALLERY || test_gallery(probe)));
+             (i != GALLERY || test_gallery(probe))));
         const bool back_ok = round != DRAWER_BACK_ROUND ||
             back_to_drawer(probe, route, i + 1 == probe->route_count);
         const bool use_drawer_home = round == DRAWER_BACK_ROUND && i + 1 == probe->route_count;
@@ -1162,7 +1383,7 @@ static bool tap_point_locked(lv_obj_t *widget, lv_point_t point)
     lv_indev_read(pointer);
     sample.state = LV_INDEV_STATE_RELEASED;
     lv_indev_read(pointer);
-    lv_indev_delete(pointer);
+    delete_pointer(pointer);
     return true;
 }
 
@@ -1300,12 +1521,12 @@ static bool test_game_controls(probe_t *probe, const route_t *route)
     return verified;
 }
 
-static bool settings_back_for_selftest(probe_t *probe, const char *entry)
+static bool header_return(probe_t *probe, void (*destination)(app_ui_t *), const route_t *parent)
 {
     const uint64_t before = completed_regions();
     if (!lvgl_port_lock(1000)) return false;
     app_ui_t *ui = probe->ui;
-    lv_obj_t *back = current_page(probe) && ui->page_back == app_open_settings ?
+    lv_obj_t *back = current_page(probe) && ui->page_back == destination ?
         button_for(ui->screen, LV_SYMBOL_LEFT) : NULL;
     if (back && lv_obj_get_parent(back) != ui->screen) back = NULL;
     if (back) {
@@ -1313,7 +1534,24 @@ static bool settings_back_for_selftest(probe_t *probe, const char *entry)
         ++probe->generation;
     }
     lvgl_port_unlock();
-    return back && wait_page(probe, &routes[SETTINGS], before, true) && test_settings_top(probe, entry);
+    return back && wait_page(probe, parent, before, true);
+}
+
+static bool test_bluetooth_modes(probe_t *probe, const route_t *parent)
+{
+    const route_t modes[] = {
+        {"bt-audio", "蓝牙音频", "音频输出"},
+        {"bt-hid", "电脑键鼠", "蓝牙键鼠"},
+    };
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
+        const uint64_t before = completed_regions();
+        if (!click_label(probe, modes[i].drawer_label)) return false;
+        ++probe->generation;
+        if (!wait_page(probe, &modes[i], before, true) ||
+            !header_return(probe, app_open_bluetooth, parent)) return false;
+    }
+    ESP_LOGI(TAG, "CHECK bluetooth-modes audio=1 hid=1 back=overview");
+    return true;
 }
 
 static bool test_nested_routes(probe_t *probe, unsigned round)
@@ -1336,7 +1574,15 @@ static bool test_nested_routes(probe_t *probe, unsigned round)
             ESP_LOGE(TAG, "FAIL nested=%s input controls", test->page.id);
             return false;
         }
-        if (round == 1 && test->parent == SETTINGS && !settings_back_for_selftest(probe, test->page.id)) {
+        const bool verify_bluetooth = !strcmp(test->page.id, "bluetooth") &&
+            (round == 1 || round == ROUNDS / 2 || round == ROUNDS);
+        if (verify_bluetooth && !test_bluetooth_modes(probe, &test->page)) {
+            ESP_LOGE(TAG, "FAIL bluetooth modes/back");
+            return false;
+        }
+        if ((round == 1 || verify_bluetooth) && test->parent == SETTINGS &&
+            (!header_return(probe, app_open_settings, &routes[SETTINGS]) ||
+             !test_settings_top(probe, test->page.id))) {
             ESP_LOGE(TAG, "FAIL nested=%s settings back/scroll", test->page.id);
             return false;
         }
@@ -1388,6 +1634,7 @@ static void test_task(void *context)
      * advance its in-memory bookmark without changing the user's NVS. */
     if (probe.ui->audio_player)
         aether_audio_player_set_persistence_guard(probe.ui->audio_player, keep_music_preferences, NULL);
+    app_audio_system_set_persistence_guard(keep_music_preferences, NULL);
     pause_ms(1500);
     const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     app_display_metrics_t start_display, end_display;

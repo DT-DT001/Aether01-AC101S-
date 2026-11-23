@@ -15,11 +15,14 @@
 #include "freertos/task.h"
 
 static const char *TAG = "ac101s_audio";
+static const char alert_owner;
 
 enum {
     AUDIO_DMA_FRAMES = 240,
     PCM16_STEREO_BYTES = 4,
     ALERT_MAX_FRAMES = 5760,
+    PLAYBACK_GAIN_ONE_Q15 = 1 << 15,
+    PLAYBACK_GAIN_RAMP_FRAMES = 512,
     MIC_GAIN_UNITY_Q12 = 1 << 12,
     MIC_GAIN_QUIET_Q12 = 2 * MIC_GAIN_UNITY_Q12,
     MIC_CAPTURE_PEAK = 24000,
@@ -43,6 +46,11 @@ typedef struct {
     unsigned gain_countdown;
 } recording_gain_t;
 
+typedef struct {
+    int32_t current, target, step;
+    unsigned remaining;
+} playback_gain_t;
+
 struct ac101s_audio_dev_t {
     i2s_chan_handle_t tx;
     i2s_chan_handle_t rx;
@@ -59,8 +67,11 @@ struct ac101s_audio_dev_t {
     bool capture_external;
     const void *board_owner;
     bool board_ready;
-    uint8_t master_volume;
+    atomic_uint master_volume;
     int requested_volume;
+    playback_gain_t playback_gain;
+    unsigned speaker_silent_frames, speaker_ring_frames;
+    bool speaker_enabled;
     float mic_gain_db;
     int32_t capture_gain_history;
     recording_gain_t recording_gain;
@@ -73,9 +84,28 @@ struct ac101s_audio_dev_t {
     atomic_uint route_epoch, stop_serial, stop_completed;
     portMUX_TYPE route_lock;
     ac101s_audio_write_metrics_t write_metrics;
+#if AETHER_AUDIO_DIAG
+    atomic_uint tx_queue_overflows;
+#endif
     esp_err_t (*route_cancel)(void *);
     void *route_cancel_context;
 };
+
+#if AETHER_AUDIO_DIAG
+static bool count_tx_queue_overflow(i2s_chan_handle_t tx, i2s_event_data_t *event, void *context)
+{
+    (void)tx;
+    (void)event;
+    ac101s_audio_handle_t handle = context;
+    atomic_fetch_add_explicit(&handle->tx_queue_overflows, 1, memory_order_relaxed);
+    return false;
+}
+
+uint32_t ac101s_audio_diag_tx_overflows(ac101s_audio_handle_t handle)
+{
+    return atomic_load_explicit(&handle->tx_queue_overflows, memory_order_relaxed);
+}
+#endif
 
 /* Normal I/O keeps its 1s bound. Only contention with a route handover gets
  * enough time for the transport's bounded (3s) media-start handshake. */
@@ -104,7 +134,7 @@ esp_err_t ac101s_audio_new(const ac101s_audio_config_t *config,
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_NO_MEM, TAG, "no memory");
     handle->pa_enable = config->pa_enable;
     handle->sample_rate_hz = 48000;
-    handle->master_volume = 100;
+    atomic_init(&handle->master_volume, 100);
     handle->requested_volume = 100;
     atomic_init(&handle->route_epoch, 0);
     atomic_init(&handle->stop_serial, 0);
@@ -133,6 +163,7 @@ esp_err_t ac101s_audio_new(const ac101s_audio_config_t *config,
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.dma_frame_num = AUDIO_DMA_FRAMES;
+    handle->speaker_ring_frames = chan_cfg.dma_desc_num * chan_cfg.dma_frame_num;
     chan_cfg.auto_clear = true;
     ESP_GOTO_ON_ERROR(i2s_new_channel(&chan_cfg, &handle->tx, &handle->rx), fail,
                       TAG, "create I2S channels");
@@ -154,6 +185,12 @@ esp_err_t ac101s_audio_new(const ac101s_audio_config_t *config,
                       TAG, "initialize I2S TX");
     ESP_GOTO_ON_ERROR(i2s_channel_init_std_mode(handle->rx, &std_cfg), fail,
                       TAG, "initialize I2S RX");
+#if AETHER_AUDIO_DIAG
+    atomic_init(&handle->tx_queue_overflows, 0);
+    const i2s_event_callbacks_t callbacks = {.on_send_q_ovf = count_tx_queue_overflow};
+    ESP_GOTO_ON_ERROR(i2s_channel_register_event_callback(handle->tx, &callbacks, handle), fail,
+                      TAG, "monitor I2S TX queue");
+#endif
     ESP_GOTO_ON_ERROR(i2s_channel_enable(handle->tx), fail, TAG, "enable I2S TX");
     ESP_GOTO_ON_ERROR(i2s_channel_enable(handle->rx), fail, TAG, "enable I2S RX");
 
@@ -177,6 +214,85 @@ static int speaker_volume(int requested, uint8_t master)
     return (logical * AC101S_AUDIO_SPEAKER_VOLUME_MAX + 99) / 100;
 }
 
+static unsigned get_master_volume(ac101s_audio_handle_t handle)
+{
+    return atomic_load_explicit(&handle->master_volume, memory_order_relaxed);
+}
+
+static int32_t speaker_gain_q15(unsigned level)
+{
+    /* The AC101S line-out (datasheet Figure 2-1) changes by 3 dB per code.
+     * Preserve the old speaker level at each 10% anchor and interpolate
+     * between them. The lowest segment reaches actual PCM silence at zero. */
+    static const uint16_t anchors[] = {
+        0, 1464, 2068, 2920, 4125, 5827, 8231, 11627, 16423, 23198, PLAYBACK_GAIN_ONE_Q15,
+    };
+    const unsigned step = level / 1000;
+    if (step == 10) return PLAYBACK_GAIN_ONE_Q15;
+    const unsigned difference = anchors[step + 1] - anchors[step];
+    return anchors[step] + (difference * (level % 1000) + 500) / 1000;
+}
+
+static int32_t playback_target(int volume, unsigned master, bool external)
+{
+    const unsigned level = (unsigned)volume * master;
+    const int32_t linear = (level * PLAYBACK_GAIN_ONE_Q15 + 5000) / 10000;
+    const int32_t gain = external ?
+        (linear * linear + PLAYBACK_GAIN_ONE_Q15 / 2) / PLAYBACK_GAIN_ONE_Q15 : speaker_gain_q15(level);
+    return gain * PLAYBACK_GAIN_RAMP_FRAMES;
+}
+
+static void reset_playback_gain(ac101s_audio_handle_t handle, int32_t target)
+{
+    handle->playback_gain = (playback_gain_t){.current = target, .target = target};
+}
+
+static void update_playback_target(ac101s_audio_handle_t handle, bool external)
+{
+    playback_gain_t *gain = &handle->playback_gain;
+    const int32_t target = playback_target(handle->requested_volume, get_master_volume(handle), external);
+    if (target == gain->target) return;
+    gain->target = target;
+    gain->step = (target - gain->current) / PLAYBACK_GAIN_RAMP_FRAMES;
+    gain->remaining = PLAYBACK_GAIN_RAMP_FRAMES;
+}
+
+static void advance_playback_gain(playback_gain_t *gain, unsigned frames)
+{
+    if (frames >= gain->remaining) {
+        gain->current = gain->target;
+        gain->remaining = 0;
+    } else {
+        gain->current += gain->step * (int32_t)frames;
+        gain->remaining -= frames;
+    }
+}
+
+static const void *playback_block(const playback_gain_t *state, const void *pcm,
+                                  int16_t *block, size_t bytes)
+{
+    if (!state->remaining) {
+        if (state->current == PLAYBACK_GAIN_ONE_Q15 * PLAYBACK_GAIN_RAMP_FRAMES) {
+            if ((uintptr_t)pcm % _Alignof(int16_t) == 0) return pcm;
+            memcpy(block, pcm, bytes);
+            return block;
+        }
+        if (!state->current) {
+            memset(block, 0, bytes);
+            return block;
+        }
+    }
+    memcpy(block, pcm, bytes);
+    playback_gain_t gain = *state;
+    for (size_t i = 0; i < bytes / sizeof(*block); i += 2) {
+        if (gain.remaining) advance_playback_gain(&gain, 1);
+        const int32_t q15 = gain.current / PLAYBACK_GAIN_RAMP_FRAMES;
+        block[i] = (int16_t)(block[i] * q15 / PLAYBACK_GAIN_ONE_Q15);
+        block[i + 1] = (int16_t)(block[i + 1] * q15 / PLAYBACK_GAIN_ONE_Q15);
+    }
+    return block;
+}
+
 static ac101s_audio_sink_t *output_sink(ac101s_audio_handle_t handle, ac101s_audio_output_t output)
 {
     return output == AC101S_OUTPUT_EXTERNAL ? &handle->sink :
@@ -187,6 +303,9 @@ static esp_err_t start_locked(ac101s_audio_handle_t handle, int volume, float mi
 {
     if (handle->started || handle->capture_active) return ESP_ERR_INVALID_STATE;
     ESP_RETURN_ON_ERROR(gpio_set_level(handle->pa_enable, 0), TAG, "disable PA");
+    handle->speaker_enabled = false;
+    handle->speaker_silent_frames = 0;
+    const unsigned master = get_master_volume(handle);
     ac101s_audio_sink_t *sink = handle->board_owner ? NULL : output_sink(handle, handle->output);
     if (sink) {
         if (handle->output == AC101S_OUTPUT_USB && handle->sample_rate_hz != 48000) return ESP_ERR_NOT_SUPPORTED;
@@ -205,13 +324,17 @@ static esp_err_t start_locked(ac101s_audio_handle_t handle, int volume, float mi
         }
         handle->external_ready = true;
         handle->external_started = handle->started = true;
-        ESP_LOGI(TAG, "audio start output=external stream_volume=%d master=%u", volume, handle->master_volume);
+        reset_playback_gain(handle, playback_target(volume, master, true));
+        ESP_LOGI(TAG, "audio start output=external stream_volume=%d master=%u", volume, master);
         return ESP_OK;
     }
-    const int effective = speaker_volume(volume, handle->master_volume);
+    const bool alert = handle->board_owner == &alert_owner;
+    const int effective = alert ? speaker_volume(volume, master) :
+        (volume ? AC101S_AUDIO_SPEAKER_VOLUME_MAX : 0);
+    const bool enabled = effective && master;
     esp_err_t err = ac101s_codec_start(handle->codec, false, mic_gain_db);
     if (err == ESP_OK) err = ac101s_codec_set_speaker(handle->codec, effective);
-    if (err == ESP_OK && effective) err = gpio_set_level(handle->pa_enable, 1);
+    if (err == ESP_OK && enabled) err = gpio_set_level(handle->pa_enable, 1);
     if (err != ESP_OK) {
         gpio_set_level(handle->pa_enable, 0);
         handle->started = ac101s_codec_stop(handle->codec) != ESP_OK;
@@ -220,9 +343,11 @@ static esp_err_t start_locked(ac101s_audio_handle_t handle, int volume, float mi
     handle->requested_volume = volume;
     handle->mic_gain_db = mic_gain_db;
     handle->external_started = false;
+    handle->speaker_enabled = enabled;
     handle->local_ready = handle->started = true;
-    ESP_LOGI(TAG, "audio start output=speaker stream_volume=%d master=%u codec_volume=%d mute=%u PA_command=%u",
-        volume, handle->master_volume, effective, effective == 0, effective > 0);
+    reset_playback_gain(handle, playback_target(volume, master, false));
+    ESP_LOGI(TAG, "audio start output=speaker stream_volume=%d master=%u codec_volume=%d PA_command=%u",
+        volume, master, effective, enabled);
     return ESP_OK;
 }
 
@@ -254,6 +379,7 @@ esp_err_t ac101s_audio_start(ac101s_audio_handle_t handle, int volume, float mic
 static esp_err_t stop_locked(ac101s_audio_handle_t handle)
 {
     const esp_err_t pa_err = gpio_set_level(handle->pa_enable, 0);
+    if (pa_err == ESP_OK) handle->speaker_enabled = false;
     handle->local_ready = false;
     if (!handle->started) {
         if (pa_err == ESP_OK) handle->alert_cleanup_pending = false;
@@ -429,6 +555,8 @@ static void finish_board_capture(ac101s_audio_handle_t handle, uint8_t *frames, 
 static esp_err_t board_pcm_locked(ac101s_audio_handle_t handle, bool capture, void *data,
                                   size_t bytes, TickType_t began, TickType_t budget)
 {
+    const bool apply_gain = !capture && handle->board_owner != &alert_owner;
+    int16_t block[AUDIO_DMA_FRAMES * 2];
     size_t offset = 0;
     while (offset < bytes) {
         const TickType_t elapsed = xTaskGetTickCount() - began;
@@ -443,15 +571,48 @@ static esp_err_t board_pcm_locked(ac101s_audio_handle_t handle, bool capture, vo
             if (chunk > dma_bytes) chunk = dma_bytes;
             wait /= 2;
         }
+        void *const original = (uint8_t *)data + offset;
+        const void *output = original;
+        bool silent = false;
+        if (apply_gain) {
+            if (chunk > sizeof(block)) chunk = sizeof(block);
+            update_playback_target(handle, false);
+            const playback_gain_t *gain = &handle->playback_gain;
+            silent = !gain->current && !gain->target;
+            if (!silent) {
+                handle->speaker_silent_frames = 0;
+                if (!handle->speaker_enabled) {
+                    const esp_err_t enabled = gpio_set_level(handle->pa_enable, 1);
+                    if (enabled != ESP_OK) return enabled;
+                    handle->speaker_enabled = true;
+                }
+            }
+            output = playback_block(gain, original, block, chunk);
+        }
         const uint32_t timeout_ms = wait * portTICK_PERIOD_MS;
         size_t count = 0;
         /* Preserve the actual byte count. A partial DMA read must never
          * publish unread memory as a valid capture frame. */
         const esp_err_t err = capture
-            ? i2s_channel_read(handle->rx, (uint8_t *)data + offset, chunk, &count, timeout_ms)
-            : i2s_channel_write(handle->tx, (uint8_t *)data + offset, chunk, &count, timeout_ms);
+            ? i2s_channel_read(handle->rx, original, chunk, &count, timeout_ms)
+            : i2s_channel_write(handle->tx, output, chunk, &count, timeout_ms);
         if (err != ESP_OK) return err;
         if (!count || count > chunk || count % PCM16_STEREO_BYTES) return ESP_FAIL;
+        if (apply_gain) {
+            const unsigned frames = count / PCM16_STEREO_BYTES;
+            advance_playback_gain(&handle->playback_gain, frames);
+            /* Let queued ramp samples reach the speaker before turning the
+             * amp off. A full ring of accepted silent frames displaces them. */
+            if (silent && handle->speaker_enabled) {
+                handle->speaker_silent_frames += frames;
+                if (handle->speaker_silent_frames >= handle->speaker_ring_frames &&
+                    !get_master_volume(handle)) {
+                    const esp_err_t disabled = gpio_set_level(handle->pa_enable, 0);
+                    if (disabled != ESP_OK) return disabled;
+                    handle->speaker_enabled = false;
+                }
+            }
+        }
         offset += count;
     }
     if (capture) finish_board_capture(handle, data, bytes);
@@ -460,7 +621,6 @@ static esp_err_t board_pcm_locked(ac101s_audio_handle_t handle, bool capture, vo
 
 esp_err_t ac101s_audio_play_alert(ac101s_audio_handle_t handle, const int16_t *pcm, size_t frames)
 {
-    static const char alert_owner;
     if (!handle || !handle->codec || !handle->tx || !pcm || !frames || frames > ALERT_MAX_FRAMES)
         return ESP_ERR_INVALID_ARG;
     if (handle->sample_rate_hz != 48000) return ESP_ERR_NOT_SUPPORTED;
@@ -470,7 +630,7 @@ esp_err_t ac101s_audio_play_alert(ac101s_audio_handle_t handle, const int16_t *p
     if (error == ESP_OK && (handle->started || handle->capture_active || handle->board_owner ||
         atomic_load(&handle->stop_serial) != atomic_load(&handle->stop_completed)))
         error = ESP_ERR_INVALID_STATE;
-    if (error == ESP_OK && handle->master_volume) {
+    if (error == ESP_OK && get_master_volume(handle)) {
         const int previous_volume = handle->requested_volume;
         const float previous_gain = handle->mic_gain_db;
         /* The local-only owner token keeps a configured USB/BT sink untouched.
@@ -691,8 +851,6 @@ esp_err_t ac101s_audio_write(ac101s_audio_handle_t handle, void *data, size_t by
     if (!handle->board_owner && handle->started && handle->external_started && handle->external_ready) {
         ac101s_audio_sink_t *sink = output_sink(handle, handle->output);
         int16_t block[256 * 2];
-        const int effective = handle->requested_volume * handle->master_volume / 100;
-        const int32_t gain = effective * effective;
         const TickType_t started = xTaskGetTickCount();
         err = ESP_OK;
         for (size_t offset = 0; offset < bytes;) {
@@ -702,10 +860,12 @@ esp_err_t ac101s_audio_write(ac101s_audio_handle_t handle, void *data, size_t by
             if (elapsed >= 1000) { err = ESP_ERR_TIMEOUT; break; }
             size_t amount = bytes - offset;
             if (amount > sizeof(block)) amount = sizeof(block);
-            memcpy(block, (const uint8_t *)data + offset, amount);
-            for (size_t i = 0; i < amount / sizeof(*block); ++i)
-                block[i] = (int16_t)((int32_t)block[i] * gain / 10000);
-            if (err == ESP_OK) err = sink->write(sink->context, block, amount, 1000 - (uint32_t)elapsed);
+            if (err == ESP_OK) {
+                update_playback_target(handle, true);
+                const void *output = playback_block(&handle->playback_gain,
+                    (const uint8_t *)data + offset, block, amount);
+                err = sink->write(sink->context, output, amount, 1000 - (uint32_t)elapsed);
+            }
             if (err != ESP_OK && handle->output == AC101S_OUTPUT_USB && !sink->connected(sink->context)) {
                 /* USB removal is a route change, not a decoder failure. Keep
                  * the current media session and feed its remaining original
@@ -730,6 +890,7 @@ esp_err_t ac101s_audio_write(ac101s_audio_handle_t handle, void *data, size_t by
                 break;
             }
             if (err != ESP_OK) break;
+            advance_playback_gain(&handle->playback_gain, amount / PCM16_STEREO_BYTES);
             offset += amount;
         }
     } else if (!handle->board_owner && handle->local_ready) {
@@ -754,42 +915,17 @@ esp_err_t ac101s_audio_read(ac101s_audio_handle_t handle, void *data, size_t byt
     return err;
 }
 
-static esp_err_t local_volume_locked(ac101s_audio_handle_t handle, uint8_t master)
-{
-    const int effective = speaker_volume(handle->requested_volume, master);
-    esp_err_t error = gpio_set_level(handle->pa_enable, 0);
-    if (error == ESP_OK) error = ac101s_codec_set_speaker(handle->codec, effective);
-    if (error == ESP_OK && effective) error = gpio_set_level(handle->pa_enable, 1);
-    return error;
-}
-
 esp_err_t ac101s_audio_set_master_volume(ac101s_audio_handle_t handle, uint8_t volume)
 {
     if (!handle || volume > 100) return ESP_ERR_INVALID_ARG;
-    if (xSemaphoreTake(handle->mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    esp_err_t error = ESP_OK;
-    if (handle->local_ready && (!handle->board_owner || handle->board_ready)) {
-        error = local_volume_locked(handle, volume);
-        if (error != ESP_OK) {
-            /* Preserve the old requested value; only re-enable the PA if
-             * restoring its previous volume and mute state also succeeds. */
-            if (local_volume_locked(handle, handle->master_volume) != ESP_OK)
-                gpio_set_level(handle->pa_enable, 0);
-        }
-    }
-    if (error == ESP_OK) handle->master_volume = volume;
-    ESP_LOGI(TAG, "master volume requested=%u applied=%u output=%s active=%u result=%d", volume,
-        handle->master_volume, handle->output == AC101S_OUTPUT_EXTERNAL ? "external" : "speaker", handle->started, error);
-    xSemaphoreGive(handle->mutex);
-    return error;
+    atomic_store_explicit(&handle->master_volume, volume, memory_order_relaxed);
+    return ESP_OK;
 }
 
 esp_err_t ac101s_audio_get_master_volume(ac101s_audio_handle_t handle, uint8_t *volume)
 {
     if (!handle || !volume) return ESP_ERR_INVALID_ARG;
-    if (xSemaphoreTake(handle->mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    *volume = handle->master_volume;
-    xSemaphoreGive(handle->mutex);
+    *volume = get_master_volume(handle);
     return ESP_OK;
 }
 

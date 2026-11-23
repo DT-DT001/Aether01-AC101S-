@@ -5,6 +5,7 @@
 typedef struct app_ui app_ui_t;
 typedef struct {
     char directory[192];
+    size_t exit_path_length;
     int32_t scroll_y;
     uint32_t media_generation;
     void (*parent)(app_ui_t *ui);

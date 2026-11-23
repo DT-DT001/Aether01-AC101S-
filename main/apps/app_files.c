@@ -16,6 +16,8 @@
 #define FILES_LIMIT 4096U
 typedef struct {
     char directory[192];
+    size_t exit_path_length;
+    void (*exit_back)(app_ui_t *ui);
     char clipboard[192], query[96], requested_query[96];
     app_io_entry_t selected;
     app_io_entry_t *entries;
@@ -29,7 +31,7 @@ typedef struct {
     bool select_mode, cut, mutating;
     const char *feedback;
     uint32_t retry_after;
-    lv_obj_t *path, *info, *up, *refresh, *source, *quick, *search;
+    lv_obj_t *path, *info, *refresh, *source, *quick, *search;
     lv_obj_t *dialog, *search_field, *search_notice;
 } files_page_t;
 
@@ -48,6 +50,20 @@ static bool files_storage_ready(app_ui_t *ui)
 static void files_refresh(app_ui_t *ui);
 static void files_open(app_ui_t *ui, const char *path, const app_files_return_t *previous);
 static void files_search_start(app_ui_t *ui, const char *query);
+static void files_folder_back(app_ui_t *ui);
+
+static void files_update_back(app_ui_t *ui, const files_page_t *page)
+{
+    ui->page_back = strlen(page->directory) > page->exit_path_length ? files_folder_back : page->exit_back;
+}
+
+static void files_capture_entry_route(app_ui_t *ui, files_page_t *page)
+{
+    /* A caller can make the folder it opened the return point to its page. */
+    if (ui->page_back == files_folder_back || ui->page_back == page->exit_back) return;
+    page->exit_back = ui->page_back;
+    page->exit_path_length = strlen(page->directory);
+}
 
 static void enabled(lv_obj_t *object, bool value)
 {
@@ -60,8 +76,6 @@ static void files_controls(files_page_t *page)
     const bool busy = page->loading || page->mutating;
     const bool ready = page->mounted && !busy;
     enabled(page->source, !busy);
-    const char *root = !strncmp(page->directory, "/usb", 4) ? "/usb" : AETHER_STORAGE_MOUNT_POINT;
-    enabled(page->up, ready && strcmp(page->directory, root));
     enabled(page->refresh, ready || (!busy && page->retry_allowed));
     enabled(page->search, ready);
     enabled(page->quick, ready && (page->count != 0 || page->clipboard[0]));
@@ -127,6 +141,20 @@ static void files_clear_rows(files_page_t *page)
     free(page->entries);
     page->entries = NULL;
     page->count = 0;
+}
+
+static void files_folder_back(app_ui_t *ui)
+{
+    files_page_t *page = ui->page_context;
+    if (!page || page->loading || page->mutating || page->dialog || ui->io_complete) return;
+    char *slash = strrchr(page->directory, '/');
+    if (!slash || slash == page->directory) return;
+    *slash = '\0';
+    page->restore_scroll_y = 0;
+    page->feedback = NULL;
+    files_update_back(ui, page);
+    files_clear_rows(page);
+    files_refresh(ui);
 }
 
 static void files_back_from_audio(app_ui_t *ui)
@@ -364,9 +392,11 @@ static void file_clicked(lv_event_t *event)
         return;
     }
     if (item.directory) {
+        files_capture_entry_route(ui, page);
         page->feedback = NULL;
         page->restore_scroll_y = 0;
         strlcpy(page->directory, item.path, sizeof(page->directory));
+        files_update_back(ui, page);
         files_clear_rows(page);
         files_refresh(ui);
         return;
@@ -374,10 +404,12 @@ static void file_clicked(lv_event_t *event)
     const char *ext = strrchr(item.path, '.');
     if (ext && !strcasecmp(ext, ".txt")) app_open_reader_path(ui, item.path);
     else if (ext && (!strcasecmp(ext, ".wav") || !strcasecmp(ext, ".mp3") || !strcasecmp(ext, ".m4a"))) {
+        files_capture_entry_route(ui, page);
         app_files_return_t previous = {
+            .exit_path_length = page->exit_path_length,
             .scroll_y = lv_obj_get_scroll_y(page->rows.viewport),
             .media_generation = page->media_generation,
-            .parent = ui->page_back,
+            .parent = page->exit_back,
         };
         /* Opening the player frees this browser page. Keep only its return location. */
         strlcpy(previous.directory, page->directory, sizeof(previous.directory));
@@ -597,7 +629,7 @@ static void files_search_dialog(app_ui_t *ui, files_page_t *page)
     app_ui_modal_focus(box, page->search_field);
 }
 
-enum { FILES_REFRESH, FILES_UP, FILES_QUICK, FILES_SEARCH };
+enum { FILES_REFRESH, FILES_QUICK, FILES_SEARCH };
 
 static void files_action(lv_event_t *event)
 {
@@ -627,12 +659,6 @@ static void files_action(lv_event_t *event)
         const esp_err_t error = aether_storage_request_retry(ui->storage);
         if (error != ESP_OK) { app_ui_label_fmt(page->info,"TF 重试失败：%s",esp_err_to_name(error));return; }
         page->retry_after = lv_tick_get()+1000;
-    }
-    if (action == FILES_UP) {
-        page->restore_scroll_y = 0;
-        char *slash = strrchr(page->directory, '/');
-        if (slash && slash > page->directory) *slash = 0;
-        files_clear_rows(page);
     }
     files_refresh(ui);
 }
@@ -675,10 +701,13 @@ static void files_source(lv_event_t *event)
     app_ui_t *ui = lv_event_get_user_data(event);
     files_page_t *page = ui->page_context;
     if (!page || ui->io_complete || page->dialog || page->mutating) return;
+    files_capture_entry_route(ui, page);
     page->feedback = NULL;
     page->restore_scroll_y = 0;
     strlcpy(page->directory, lv_dropdown_get_selected(page->source) ? "/usb" : AETHER_STORAGE_MOUNT_POINT,
             sizeof(page->directory));
+    page->exit_path_length = strlen(page->directory);
+    files_update_back(ui, page);
     files_clear_rows(page);
     files_refresh(ui);
 }
@@ -693,11 +722,16 @@ static void files_open(app_ui_t *ui, const char *path, const app_files_return_t 
     files_page_t *page = calloc(1, sizeof(*page));
     if (!page) { app_ui_add_text(content, "内存不足", LV_ALIGN_CENTER, 0, 0, 0xFF8888, NULL); return; }
     ui->page_context = page; ui->page_cleanup = files_cleanup;
+    page->exit_back = ui->page_back;
     strlcpy(page->directory, selected, sizeof(page->directory));
+    const char *root = !strncmp(selected, "/usb", 4) ? "/usb" : AETHER_STORAGE_MOUNT_POINT;
+    page->exit_path_length = strlen(root);
     if (previous && !strcmp(selected, previous->directory)) {
+        page->exit_path_length = previous->exit_path_length;
         page->restore_generation = previous->media_generation;
         page->restore_scroll_y = previous->scroll_y;
     }
+    files_update_back(ui, page);
     page->mounted = files_storage_ready(ui);
     app_catalog_panel(content);
     /* Keep the 408px content area when adding the panel border. */
@@ -705,7 +739,7 @@ static void files_open(app_ui_t *ui, const char *path, const app_files_return_t 
     page->path = app_ui_add_text(content, page->directory, LV_ALIGN_TOP_LEFT, 3, 55, 0x98D5E4, NULL);
     lv_obj_set_width(page->path, 402); lv_label_set_long_mode(page->path, LV_LABEL_LONG_DOT);
     page->source = lv_dropdown_create(content);
-    lv_obj_set_pos(page->source, 0, 0); lv_obj_set_size(page->source, 153, 44);
+    lv_obj_set_pos(page->source, 0, 0); lv_obj_set_size(page->source, 211, 44);
     lv_obj_set_style_text_font(page->source, app_ui_chinese_font(), 0);
     lv_obj_set_style_text_font(lv_dropdown_get_list(page->source), app_ui_chinese_font(), 0);
     app_catalog_control(page->source, 0x20344C);
@@ -716,10 +750,9 @@ static void files_open(app_ui_t *ui, const char *path, const app_files_return_t 
     lv_dropdown_set_options(page->source, "TF 卡\nUSB U盘");
     lv_dropdown_set_selected(page->source, !strncmp(page->directory, "/usb", 4));
     lv_obj_add_event_cb(page->source, files_source, LV_EVENT_VALUE_CHANGED, ui);
-    page->search = files_button(ui, "查找", 167, 0, FILES_SEARCH);
-    page->quick = files_button(ui, LV_SYMBOL_LIST, 230, 0, FILES_QUICK);
+    page->search = files_button(ui, "查找", 225, 0, FILES_SEARCH);
+    page->quick = files_button(ui, LV_SYMBOL_LIST, 289, 0, FILES_QUICK);
     lv_obj_set_style_bg_color(page->quick, lv_color_hex(0x315A72), LV_STATE_CHECKED);
-    page->up = files_button(ui, LV_SYMBOL_UP, 292, 0, FILES_UP);
     page->refresh = files_button(ui, LV_SYMBOL_REFRESH, 354, 0, FILES_REFRESH);
     lv_obj_t *list = lv_obj_create(content);
     lv_obj_set_pos(list, 0, 81);

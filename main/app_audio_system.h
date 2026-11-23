@@ -16,7 +16,7 @@ typedef enum { APP_AUDIO_INPUT_BOARD = 0, APP_AUDIO_INPUT_USB = 1 } app_audio_in
 typedef struct {
     bool ready;
     uint8_t master_volume;       /* Requested 0..100; zero is mute. */
-    uint8_t applied_volume;
+    uint8_t applied_volume;      /* Target accepted by the PCM writer. */
     app_audio_output_t output;
     app_audio_output_t applied_output;
     app_audio_input_t input, applied_input;
@@ -29,7 +29,8 @@ typedef struct {
     esp_err_t persistence_error;
 } app_audio_system_snapshot_t;
 
-/* Hardware changes and NVS commits happen on this background service. */
+/* Transport changes and NVS commits happen on the background service.
+ * Volume updates publish a PCM target immediately. */
 esp_err_t app_audio_system_init(ac101s_audio_handle_t audio);
 void app_audio_system_set_persistence_guard(bool (*busy)(void *), void *context);
 void app_audio_system_get_snapshot(app_audio_system_snapshot_t *snapshot);

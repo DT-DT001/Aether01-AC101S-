@@ -118,6 +118,8 @@ if(AETHER_GPS_DIAGNOSTIC AND NOT CMAKE_BUILD_EARLY_EXPANSION)
 endif()
 if(AETHER_UI_SELFTEST AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_sources(${COMPONENT_LIB} PRIVATE "app_ui_selftest.c")
+    # Keep the diagnostic routes within the same factory slot as the release.
+    set_property(SOURCE app_ui_selftest.c APPEND PROPERTY COMPILE_OPTIONS -Os)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_UI_SELFTEST=1)
 endif()
 if(AETHER_VIDEO_DIAGNOSTIC AND NOT CMAKE_BUILD_EARLY_EXPANSION)

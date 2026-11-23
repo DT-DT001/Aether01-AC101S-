@@ -47,9 +47,11 @@ static void show_error(bluetooth_page_t *page, esp_err_t error)
 static void action(lv_event_t *event)
 {
     app_ui_t *ui = lv_event_get_user_data(event);
-    bluetooth_page_t *page = ui ? ui->page_context : NULL;
+    lv_obj_t *target = lv_event_get_current_target_obj(event);
+    if (!ui || lv_obj_get_screen(target) != ui->screen) return;
+    bluetooth_page_t *page = ui->page_context;
     if (!page || !page->bluetooth) return;
-    const intptr_t action = (intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(event));
+    const intptr_t action = (intptr_t)lv_obj_get_user_data(target);
     aether_bluetooth_status_t status;
     if (aether_bluetooth_get_status(page->bluetooth,&status) != ESP_OK) return;
     esp_err_t error;
@@ -116,7 +118,8 @@ static void device_clicked(lv_event_t *event)
 static void volume_changed(lv_event_t *event)
 {
     app_ui_t *ui = lv_event_get_user_data(event);
-    bluetooth_page_t *page = ui ? ui->page_context : NULL;
+    if (!ui || lv_obj_get_screen(lv_event_get_current_target_obj(event)) != ui->screen) return;
+    bluetooth_page_t *page = ui->page_context;
     if (!page) return;
     uint8_t volume = (uint8_t)lv_slider_get_value(page->volume);
     show_error(page,app_audio_system_set_volume(volume,lv_event_get_code(event)==LV_EVENT_RELEASED));
@@ -131,7 +134,7 @@ static void update(lv_timer_t *timer)
     if (aether_bluetooth_get_status(page->bluetooth,&status) != ESP_OK) return;
     app_audio_system_snapshot_t audio; app_audio_system_get_snapshot(&audio);
     const bool linked = status.state == AETHER_BT_CONNECTED && status.connected;
-    const char *peer = status.peer.name[0] ? status.peer.name : "未命名耳机";
+    const char *peer = status.peer.name[0] ? status.peer.name : "未命名音频设备";
     app_ui_label_text(page->status,linked ? peer : state_name(status.state));
     if (linked) app_ui_label_fmt(page->detail,"%lu Hz · %s",(unsigned long)status.sample_rate,
                                 status.channels == 1 ? "单声道" : "立体声");
@@ -140,19 +143,19 @@ static void update(lv_timer_t *timer)
     else app_ui_label_text(page->detail,"");
     if (status.last_error != ESP_OK) {
         if (status.acl_status > 0) app_ui_label_fmt(page->message,"ACL 连接失败：0x%02X\n未完成连接，可关闭蓝牙后重试",(unsigned)status.acl_status);
-        else if (status.auth_status > 0) app_ui_label_fmt(page->message,"配对认证失败：0x%02X\n请将耳机重新设为配对模式",(unsigned)status.auth_status);
+        else if (status.auth_status > 0) app_ui_label_fmt(page->message,"配对认证失败：0x%02X\n请将设备重新设为配对模式",(unsigned)status.auth_status);
         else if (status.acl_disconnect_reason >= 0) app_ui_label_fmt(page->message,"蓝牙链路已断开：0x%02X\n%s",(unsigned)status.acl_disconnect_reason,esp_err_to_name(status.last_error));
-        else if (status.a2dp_disconnect_reason >= 0) app_ui_label_fmt(page->message,"耳机音频连接失败：0x%02X\n%s",(unsigned)status.a2dp_disconnect_reason,esp_err_to_name(status.last_error));
+        else if (status.a2dp_disconnect_reason >= 0) app_ui_label_fmt(page->message,"蓝牙音频连接失败：0x%02X\n%s",(unsigned)status.a2dp_disconnect_reason,esp_err_to_name(status.last_error));
         else app_ui_label_fmt(page->message,"蓝牙：%s",esp_err_to_name(status.last_error));
     } else if (!page->notice || lv_tick_elaps(page->notice_started) > 3000) {
         page->notice = false;
         if (!status.connected && audio.applied_output == APP_AUDIO_OUTPUT_BLUETOOTH)
-            app_ui_label_text(page->message,"耳机已断开，可切回扬声器。");
+            app_ui_label_text(page->message,"蓝牙音频设备已断开，可切回扬声器。");
         else if (!status.device_count && status.state == AETHER_BT_IDLE)
-            app_ui_label_text(page->message,"请将耳机设为配对模式。");
+            app_ui_label_text(page->message,"请将音频设备设为配对模式。");
         else app_ui_label_text(page->message,"");
     }
-    app_ui_label_text(page->toggle_label,status.audio_requested ? "关闭蓝牙" : "开启蓝牙");
+    app_ui_label_text(page->toggle_label,status.audio_requested ? "关闭全部蓝牙" : "开启蓝牙");
     const bool can_select = status.audio_requested && status.enabled &&
         (status.state == AETHER_BT_IDLE || status.state == AETHER_BT_SCANNING);
     availability(page->scan,status.audio_requested && status.enabled && status.state == AETHER_BT_IDLE && !status.scanning);
@@ -184,7 +187,8 @@ static void update(lv_timer_t *timer)
         page->devices[i] = device;
         page->valid[i] = true;
         app_ui_label_text(page->icons[i],device.audio_device ? LV_SYMBOL_AUDIO : LV_SYMBOL_BLUETOOTH);
-        app_ui_label_text(page->names[i],device.name[0] ? device.name : "未命名设备");
+        app_ui_label_text(page->names[i],device.name[0] ? device.name :
+                          device.audio_device ? "未命名音频设备" : "未命名设备");
         app_ui_label_fmt(page->metrics[i],"%02X:%02X:%02X:%02X:%02X:%02X · %d dBm",
             device.address[0],device.address[1],device.address[2],device.address[3],device.address[4],device.address[5],device.rssi);
         lv_obj_remove_flag(page->rows[i],LV_OBJ_FLAG_HIDDEN);
@@ -195,9 +199,9 @@ static void update(lv_timer_t *timer)
 }
 static void cleanup(app_ui_t *ui) { free(ui->page_context); ui->page_context = NULL; }
 
-void app_open_bluetooth(app_ui_t *ui)
+static void open_bluetooth_audio(app_ui_t *ui)
 {
-    lv_obj_t *content = app_ui_begin_page(ui,"蓝牙耳机");
+    lv_obj_t *content = app_ui_begin_page(ui,"蓝牙音频");
     bluetooth_page_t *page = calloc(1,sizeof(*page));
     if (!page) { app_ui_add_text(content,"内存不足",LV_ALIGN_TOP_LEFT,0,0,0xFFB17A,app_ui_chinese_font()); return; }
     page->ui = ui; page->bluetooth = app_audio_system_bluetooth();
@@ -213,9 +217,9 @@ void app_open_bluetooth(app_ui_t *ui)
     page->detail = app_ui_add_text(card,"",LV_ALIGN_TOP_LEFT,50,35,CONNECTION_DETAIL,app_ui_chinese_font());
     lv_obj_set_size(page->detail,214,20); lv_label_set_long_mode(page->detail,LV_LABEL_LONG_DOT);
     button(page,card,"开启蓝牙",278,9,113,1);
-    page->scan = button(page,content,"搜索耳机",0,73,197,2);
+    page->scan = button(page,content,"搜索音频设备",0,73,197,2);
     page->disconnect = button(page,content,"断开连接",207,73,197,3);
-    page->route = button(page,content,"使用耳机",0,124,197,4);
+    page->route = button(page,content,"使用蓝牙输出",0,124,197,4);
     page->speaker = button(page,content,"使用扬声器",207,124,197,5);
     lv_obj_t *volume_card = lv_obj_create(content);
     lv_obj_set_pos(volume_card,0,176); lv_obj_set_size(volume_card,404,46);
@@ -255,4 +259,39 @@ void app_open_bluetooth(app_ui_t *ui)
         lv_obj_add_event_cb(row,device_clicked,LV_EVENT_CLICKED,ui); lv_obj_add_flag(row,LV_OBJ_FLAG_HIDDEN);
     }
     app_ui_set_timer(ui,update,300); update(ui->timer);
+}
+
+static void open_role(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    lv_obj_t *row = lv_event_get_current_target_obj(event);
+    if (!ui || lv_obj_get_screen(row) != ui->screen) return;
+    if (lv_obj_get_user_data(row)) app_open_pc_remote(ui);
+    else open_bluetooth_audio(ui);
+    ui->page_back = app_open_bluetooth;
+}
+
+static void role_row(app_ui_t *ui, lv_obj_t *parent, int y, bool hid,
+                     const char *icon, const char *title, const char *detail)
+{
+    lv_obj_t *row = lv_button_create(parent);
+    lv_obj_set_pos(row, 0, y);
+    lv_obj_set_size(row, 404, 72);
+    app_connection_button_style(row, false);
+    lv_obj_set_user_data(row, (void *)(uintptr_t)hid);
+    lv_obj_add_event_cb(row, open_role, LV_EVENT_CLICKED, ui);
+    app_ui_add_text(row, icon, LV_ALIGN_LEFT_MID, 16, 0, CONNECTION_ACCENT, &lv_font_montserrat_16);
+    app_ui_add_text(row, title, LV_ALIGN_TOP_LEFT, 49, 10, CONNECTION_TEXT, app_ui_chinese_font_size(24));
+    app_ui_add_text(row, detail, LV_ALIGN_TOP_LEFT, 49, 42, CONNECTION_DETAIL, app_ui_chinese_font());
+    app_ui_add_text(row, LV_SYMBOL_RIGHT, LV_ALIGN_RIGHT_MID, -14, 0,
+                    CONNECTION_DETAIL, &lv_font_montserrat_16);
+}
+
+void app_open_bluetooth(app_ui_t *ui)
+{
+    lv_obj_t *content = app_ui_begin_page(ui, "蓝牙");
+    ui->page_back = app_open_settings;
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    role_row(ui, content, 0, false, LV_SYMBOL_AUDIO, "音频输出", "连接耳机、音箱播放音乐");
+    role_row(ui, content, 84, true, LV_SYMBOL_KEYBOARD, "蓝牙键鼠", "供手机、平板或电脑连接");
 }

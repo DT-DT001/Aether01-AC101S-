@@ -13,7 +13,7 @@ static app_pc_remote_status_t status = {.available=true};
 static app_pc_shortcut_t shortcuts[] = {{5,0x42},{5,0x43},{5,0x44},{5,0x45}};
 static bool pressed, air_mode, moving, confirm_value;
 static lv_point_t pointer;
-static unsigned confirmations, leaves, motion_on, motion_off, recenters;
+static unsigned confirmations, releases, motion_on, motion_off, recenters;
 static unsigned calibration_cancels;
 static app_gyro_calibration_status_t calibration;
 static unsigned keys, clicks, text_requests, triggers, saves, last_slot;
@@ -84,11 +84,10 @@ void app_pc_remote_set_motion(bool enabled)
     moving = enabled;
 }
 void app_pc_remote_recenter(void) { ++recenters; moving = false; }
-void app_pc_remote_leave(void)
+void app_pc_remote_release_controls(void)
 {
-    ++leaves;
+    ++releases;
     air_mode = moving = false;
-    app_pc_remote_set_enabled(false);
 }
 esp_err_t app_pc_remote_get_shortcut(unsigned slot, app_pc_shortcut_t *out)
 {
@@ -315,11 +314,11 @@ int main(int argc, char **argv)
     app_open_pc_remote(&ui);
     advance(170);
     assert(lv_obj_has_state(control(ui.screen, "发送文本"), LV_STATE_USER_1));
-    tap(control(ui.screen, "开启蓝牙"));
-    assert(status.requested && find_label(ui.screen, "等待电脑配对"));
+    tap(control(ui.screen, "开启键鼠"));
+    assert(status.requested && find_label(ui.screen, "等待设备配对"));
     status.reconnecting = true;
     advance(170);
-    assert(find_label(ui.screen, "正在重连电脑…"));
+    assert(find_label(ui.screen, "正在重连设备…"));
     assert(lv_obj_has_state(control(ui.screen, "发送文本"), LV_STATE_USER_1));
     status.reconnecting = false;
     status.confirm_pending = true; status.confirm_code = 12345;
@@ -336,9 +335,9 @@ int main(int argc, char **argv)
     assert(confirmations == 1 && !confirm_value && !find_class(ui.screen, &lv_msgbox_class));
     status.confirm_pending = false; advance(170);
     status.confirm_pending = true; status.confirm_code = 34567; advance(170);
-    tap(control(find_class(ui.screen, &lv_msgbox_class), "关闭蓝牙"));
+    tap(control(find_class(ui.screen, &lv_msgbox_class), "关闭键鼠"));
     assert(!status.requested && !find_class(ui.screen, &lv_msgbox_class));
-    tap(control(ui.screen, "开启蓝牙"));
+    tap(control(ui.screen, "开启键鼠"));
     status.confirm_pending = true; status.confirm_code = 45678; advance(170);
     tap(control(find_class(ui.screen, &lv_msgbox_class), "确认相同"));
     assert(confirmations == 2 && confirm_value && !find_class(ui.screen, &lv_msgbox_class));
@@ -347,7 +346,7 @@ int main(int argc, char **argv)
 
     lv_obj_t *text = find_class(ui.screen, &lv_textarea_class);
     lv_obj_t *keyboard = find_class(ui.screen, &lv_keyboard_class);
-    assert(text && keyboard && find_label(ui.screen, "电脑已连接"));
+    assert(text && keyboard && find_label(ui.screen, "设备已连接"));
     lv_obj_update_layout(ui.screen);
     lv_area_t field_area, keyboard_area, key_area;
     lv_obj_get_coords(text, &field_area);
@@ -463,8 +462,8 @@ int main(int argc, char **argv)
     assert(moving);
     app_open_obs_switcher(&ui);
     lift();
-    assert(leaves == 1 && !moving && !air_mode && !status.requested && !triggers);
-    puts("PASS air mode, missing/fresh gyro, hold renewal, release/press lost, input reset and navigation stop");
+    assert(releases == 1 && !moving && !air_mode && status.requested && status.connected && !triggers);
+    puts("PASS leaving the air mouse stops motion and OBS immediately reuses the existing HID link");
 
     lv_obj_t *scenes[4];
     lv_area_t area[4];
@@ -472,10 +471,13 @@ int main(int argc, char **argv)
         char name[24]; snprintf(name, sizeof(name), "场景 %u", i+1);
         scenes[i] = control(ui.screen, name);
         lv_obj_get_coords(scenes[i], &area[i]);
-        assert(lv_obj_has_state(scenes[i], LV_STATE_USER_1));
+        assert(!lv_obj_has_state(scenes[i], LV_STATE_USER_1));
     }
     assert(area[0].x1 == area[1].x1 && area[2].x1 == area[3].x1 && area[0].x1 < area[2].x1);
     assert(area[0].y1 == area[2].y1 && area[1].y1 == area[3].y1 && area[0].y1 < area[1].y1);
+    status.connected = false;
+    status.reconnecting = true;
+    advance(170);
     tap(control(ui.screen, "编辑快捷键"));
     tap(scenes[1]);
     assert(!triggers && find_label(ui.screen, "场景 2 快捷键"));
@@ -494,9 +496,10 @@ int main(int argc, char **argv)
     status.save_error = ESP_OK;
     tap(scenes[0]);
     assert(!triggers && find_label(ui.screen, "电脑尚未连接"));
-    tap(control(ui.screen, "开启蓝牙"));
     touch(scenes[0]);
     assert(!triggers);
+    assert(status.requested);
+    status.reconnecting = false;
     status.connected = true;
     lift();
     assert(triggers == 1 && last_slot == 0);
@@ -504,9 +507,22 @@ int main(int argc, char **argv)
     snapshot(display, argv[1], "obs-switcher");
     for (unsigned i = 0; i < 4; ++i) { tap(scenes[i]); assert(last_slot == i && triggers == i+2); }
     assert(find_label(ui.screen, "快捷键已提交"));
+    app_open_pc_remote(&ui);
+    advance(170);
+    assert(releases == 2 && find_label(ui.screen, "设备已连接"));
+    tap(control(ui.screen, "回车"));
+    assert(keys == 2 && last_key == 0x28);
+    status.connected = false;
+    status.confirm_pending = true;
     app_ui_begin_page(&ui, "首页");
     advance(170);
-    assert(leaves == 2 && !status.requested && !app_ui_modal_present(ui.screen));
+    assert(releases == 3 && status.requested && status.confirm_pending && !app_ui_modal_present(ui.screen));
+    app_open_pc_remote(&ui);
+    advance(170);
+    tap(control(find_class(ui.screen, &lv_msgbox_class), "关闭键鼠"));
+    assert(!status.requested && !app_ui_modal_present(ui.screen));
+    app_ui_begin_page(&ui, "首页");
+    advance(170);
     assert(lv_mem_test() == LV_RESULT_OK);
     lv_indev_delete(indev);
     lv_display_delete(display);

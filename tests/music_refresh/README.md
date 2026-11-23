@@ -14,7 +14,10 @@ UI admission; it does not measure physical SD/USB scan throughput.
 
 The test also navigates through 96 catalog entries with keyboard events and
 taps the final recycled row using a real LVGL pointer. It verifies the track
-index, the fixed pool of 12 rows and absence of additional catalog requests.
+index, the viewport-sized row pool and absence of additional catalog requests.
+Ten alternating fast drags verify that every visible caption follows its row,
+long Chinese filenames are ellipsized, caption storage is reused and playback
+keeps the same track.
 
 Prepared catalog delivery does not copy/rebuild the backend playlist on LVGL.
 While refresh owns the completion, old row indices cannot select a different

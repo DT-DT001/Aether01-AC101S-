@@ -144,7 +144,7 @@ static bool media_flash_busy(void *context)
 }
 
 typedef struct {
-    bool active, storage_gate, lease_gate, wifi_enabled, bluetooth_audio_requested, clock_pending;
+    bool active, storage_gate, lease_gate, wifi_enabled, bluetooth_audio_requested, bluetooth_hid_requested, clock_pending;
     bool ui_resume_requested;
     uint32_t clock_revision;
 } shutdown_context_t;
@@ -171,7 +171,10 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
         app_gps_cancel();
         /* Stop source admission promptly; cleanup shares the existing budget. */
         (void)app_otg_set_enabled(false);
-        app_pc_remote_leave();
+        aether_bluetooth_hid_status_t hid = {0};
+        if (bluetooth && aether_bluetooth_hid_get_status(bluetooth, &hid) == ESP_OK)
+            state->bluetooth_hid_requested = hid.requested;
+        app_pc_remote_shutdown();
         app_intercom_leave();
         app_displacement_cancel();
         aether_wifi_status_t wifi={0};aether_bluetooth_status_t bt={0};
@@ -264,6 +267,10 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
         if(state->bluetooth_audio_requested && bluetooth) {
             esp_err_t result=aether_bluetooth_set_enabled(bluetooth,true);
             if(result!=ESP_OK) ESP_LOGW(TAG,"shutdown cancel Bluetooth enable: %s",esp_err_to_name(result));
+        }
+        if (state->bluetooth_hid_requested && bluetooth) {
+            const esp_err_t result = aether_bluetooth_hid_set_enabled(bluetooth, true);
+            if (result != ESP_OK) ESP_LOGW(TAG, "shutdown cancel Bluetooth HID enable: %s", esp_err_to_name(result));
         }
         if(state->wifi_enabled && s_wifi) {
             esp_err_t result=aether_wifi_set_enabled(s_wifi,true);

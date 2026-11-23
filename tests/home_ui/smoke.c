@@ -64,9 +64,8 @@ void app_ui_set_user_key_exit(app_ui_t *ui,bool armed) {ui->user_key_exit_armed=
 APP(clock,1) APP(weather,2) APP(calendar,3) APP(notes,4)
 APP(music,5) APP(reader,6) APP(video,7) APP(files,8)
 APP(game,9) APP(nes,10) APP(recorder,11) APP(settings,12)
-APP(wifi,13) APP(bluetooth,14) APP(status,15) APP(motion,16)
-APP(barometer,17) APP(displacement,18) APP(pc_remote,19) APP(obs_switcher,20)
-APP(intercom,21) APP(gps,22) APP(camera,23) APP(gallery,24)
+APP(motion,13) APP(barometer,14) APP(displacement,15) APP(pc_remote,16)
+APP(obs_switcher,17) APP(intercom,18) APP(gps,19) APP(camera,20) APP(gallery,21)
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p)
 {const uint16_t *s=(const uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*s++;}lv_display_flush_ready(d);}
 static void read_input(lv_indev_t *in,lv_indev_data_t *data)
@@ -209,9 +208,9 @@ int main(int argc,char **argv)
     assert(opened==1);
     return_from_focused_app(&ui,keyboard_group,0,0);
     assert(lv_obj_get_scroll_y(ui.content)==0);
-    for(unsigned i=1;i<24;++i) lv_group_focus_next(keyboard_group);
+    for(unsigned i=1;i<app_home_app_count();++i) lv_group_focus_next(keyboard_group);
     advance(400);
-    assert(lv_group_get_focused(keyboard_group)==lv_obj_get_child(ui.content,23));
+    assert(lv_group_get_focused(keyboard_group)==lv_obj_get_child(ui.content,app_home_app_count()-1));
     const int32_t keyboard_scroll=lv_obj_get_scroll_y(ui.content);
     assert(keyboard_scroll>0);
     lv_group_focus_next(keyboard_group);
@@ -229,13 +228,14 @@ int main(int argc,char **argv)
     lv_obj_scroll_to_y(ui.content,0,LV_ANIM_OFF);
     puts("PASS Clock Back picks the Clock tile and keeps offset zero across async retirement; keyboard focus still scrolls the drawer");
     puts("PASS pointer double tap, short, sideways, sideways-dominant diagonal and down strokes stay on the desktop; one up stroke opens the drawer without also opening Clock");
-    assert(app_home_app_count()==24&&lv_obj_get_child_count(ui.content)==24);
+    assert(app_home_app_count()==21&&lv_obj_get_child_count(ui.content)==21);
     for(unsigned i=0;i<app_home_app_count();++i){
         lv_obj_t *tile=lv_obj_get_child(ui.content,i),*icon=lv_obj_get_child(tile,0);
         assert(lv_obj_get_width(tile)==102&&lv_obj_get_width(icon)==48&&lv_obj_get_height(icon)==48);
         lv_obj_send_event(tile,LV_EVENT_CLICKED,NULL);assert(opened==i+1);
     }
     assert(!find(ui.content,"指南针"));
+    assert(!find(ui.content,"无线网络")&&!find(ui.content,"蓝牙耳机")&&!find(ui.content,"设备状态"));
     assert(find(ui.content,"无线对讲")&&find(ui.content,"定位"));
     assert(find(ui.content,"USB 摄像头")&&find(ui.content,"图库"));
     capture(display,argv[1],"drawer-top");
@@ -245,16 +245,16 @@ int main(int argc,char **argv)
     lv_area_t area;lv_obj_get_coords(microphone,&area);
     point=(lv_point_t){.x=(area.x1+area.x2)/2,.y=area.y1+12};opened=0;
     held=true;advance(80);held=false;advance(80);assert(opened==11);
-    for(unsigned i=20;i<24;++i) {
+    for(unsigned i=17;i<app_home_app_count();++i) {
         lv_obj_t *tile=lv_obj_get_child(ui.content,i),*icon=lv_obj_get_child(tile,0);
-        if(i==21) assert(lv_obj_get_child_count(icon)==6);
+        if(i==18) assert(lv_obj_get_child_count(icon)==6);
         lv_obj_get_coords(icon,&area);opened=0;
         tap((area.x1+area.x2)/2,(area.y1+area.y2)/2);
         assert(opened==i+1);
     }
     const int32_t scroll=lv_obj_get_scroll_y(ui.content);
     assert(scroll>0);
-    return_from_focused_app(&ui,keyboard_group,23,scroll);
+    return_from_focused_app(&ui,keyboard_group,20,scroll);
     home_label=find(ui.screen,LV_SYMBOL_HOME);
     assert(home_label);
     lv_obj_t *home_button=lv_obj_get_parent(home_label);
@@ -264,9 +264,9 @@ int main(int argc,char **argv)
     lv_obj_t *drawer=ui.screen;
     tap((area.x1+area.x2)/2,(area.y1+area.y2)/2);
     assert(ui.screen!=drawer&&ui.home_time&&!ui.content&&!ui.user_key_exit_armed);
-    assert(opened==24&&!find(ui.screen,LV_SYMBOL_HOME)&&!lv_group_get_focused(keyboard_group));
+    assert(opened==21&&!find(ui.screen,LV_SYMBOL_HOME)&&!lv_group_get_focused(keyboard_group));
     swipe(240,380,240,141);
-    assert(ui.content&&ui.user_key_exit_armed&&!ui.home_time&&opened==24);
+    assert(ui.content&&ui.user_key_exit_armed&&!ui.home_time&&opened==21);
     assert(lv_obj_get_scroll_y(ui.content)==0&&
            lv_group_get_focused(keyboard_group)==lv_obj_get_child(ui.content,0));
     return_home(&ui);
@@ -300,5 +300,5 @@ int main(int argc,char **argv)
     tools.battery_error=ESP_FAIL;advance(1100);assert(find(ui.screen,"--")&&!find(ui.screen,"12"));
     lv_timer_delete(ui.timer);lv_obj_delete(ui.screen);lv_group_delete(keyboard_group);
     lv_indev_delete(input);lv_display_delete(display);lv_deinit();
-    puts("PASS production desktop: time, cached weather, status icons, upward swipe, scrollable drawer and 24 routes including AC101S extra apps");
+    puts("PASS production desktop colors and 21 scrollable drawer routes; Wi-Fi, Bluetooth and device status live in Settings");
 }

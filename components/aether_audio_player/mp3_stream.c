@@ -262,8 +262,13 @@ size_t aether_mp3_read(aether_mp3_stream_t *s, int16_t *output, size_t frames, e
 {
     *err = ESP_OK;
     size_t done = 0;
-    while (done < frames && s->phase / 48000 < s->total_frames) {
-        if (canceled(s)) { *err = ESP_ERR_INVALID_STATE; break; }
+    const uint32_t rate = (uint32_t)s->decoder.info.hz;
+    uint64_t target = s->phase / 48000;
+    uint32_t fraction = (uint32_t)(s->phase % 48000);
+    while (done < frames && target < s->total_frames) {
+        /* Checking the worker and TF lease locks for every sample competes
+         * with GUI work. Poll every 1.33 ms of PCM plus each file refill. */
+        if ((done % 64 == 0) && canceled(s)) { *err = ESP_ERR_INVALID_STATE; break; }
         if (!s->ready) {
             if (!next_sample(s, s->before)) goto truncated;
             if (s->current_frame + 1 < s->total_frames) {
@@ -271,7 +276,6 @@ size_t aether_mp3_read(aether_mp3_stream_t *s, int16_t *output, size_t frames, e
             } else memcpy(s->after, s->before, sizeof(s->after));
             s->ready = true;
         }
-        const uint64_t target = s->phase / 48000;
         while (s->current_frame < target) {
             memcpy(s->before, s->after, sizeof(s->before));
             ++s->current_frame;
@@ -279,15 +283,25 @@ size_t aether_mp3_read(aether_mp3_stream_t *s, int16_t *output, size_t frames, e
                 if (!next_sample(s, s->after)) goto truncated;
             } else memcpy(s->after, s->before, sizeof(s->after));
         }
-        const int32_t fraction = (int32_t)(s->phase % 48000);
-        for (unsigned ch = 0; ch < 2; ++ch) output[2 * done + ch] = (int16_t)(s->before[ch] +
-            ((int64_t)s->after[ch] - s->before[ch]) * fraction / 48000);
+        for (unsigned ch = 0; ch < 2; ++ch) {
+            const int32_t delta = (int32_t)s->after[ch] - s->before[ch];
+            /* 65535 * 47999 fits uint32_t. Applying the sign after division
+             * keeps the same truncation toward zero as signed interpolation. */
+            const int32_t offset = (int32_t)((uint32_t)abs(delta) * fraction / 48000);
+            output[2 * done + ch] = (int16_t)(s->before[ch] + (delta < 0 ? -offset : offset));
+        }
         ++done;
-        s->phase += s->decoder.info.hz;
+        fraction += rate;
+        if (fraction >= 48000) {
+            fraction -= 48000;
+            ++target;
+        }
     }
-    return done;
+    goto complete;
 truncated:
     *err = decoder_error(s, s->decoder.last_error);
     if (*err == ESP_OK) *err = ESP_ERR_INVALID_SIZE;
+complete:
+    s->phase += (uint64_t)done * rate;
     return done;
 }

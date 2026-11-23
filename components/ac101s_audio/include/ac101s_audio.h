@@ -57,12 +57,9 @@ typedef struct {
 esp_err_t ac101s_audio_new(const ac101s_audio_config_t *config,
                            ac101s_audio_handle_t *out_handle);
 
-/** Open ADC/DAC, set volume/gain, explicitly unmute, then enable the PA.
- * volume is logical 0..100; local speaker volume is capped by
- * AC101S_AUDIO_SPEAKER_VOLUME_MAX after combining it with the logical master.
- * Line-out gain and mute registers are read back before the local PA can turn on.
- * A failed setting/readback keeps it off unless restoring the previous volume
- * also passes the same hardware verification.
+/** Open ADC/DAC and verify the local speaker ceiling and mute registers
+ * before enabling the PA. The 0..100 stream and master levels attenuate
+ * the PCM at that ceiling. Starting at zero keeps the PA disabled.
  * Starting an already active codec returns ESP_ERR_INVALID_STATE. */
 esp_err_t ac101s_audio_start(ac101s_audio_handle_t handle, int volume, float mic_gain_db);
 
@@ -90,6 +87,10 @@ typedef struct {
  * snapshot under a spinlock; it never waits for the audio I/O mutex. */
 esp_err_t ac101s_audio_get_write_metrics(ac101s_audio_handle_t handle,
                                         ac101s_audio_write_metrics_t *out);
+#if AETHER_AUDIO_DIAG
+/* Local TX runs even when idle. Compare counter deltas during steady playback. */
+uint32_t ac101s_audio_diag_tx_overflows(ac101s_audio_handle_t handle);
+#endif
 esp_err_t ac101s_audio_read(ac101s_audio_handle_t handle, void *data, size_t bytes);
 /** Exclusive microphone session (selected board/USB input), independent of output.
  * Requires the configured 48kHz transport. Requests up to 42 dB are accepted and clamped
@@ -122,7 +123,9 @@ esp_err_t ac101s_audio_board_start(ac101s_audio_handle_t handle, const void *own
 esp_err_t ac101s_audio_board_pcm(ac101s_audio_handle_t handle, const void *owner,
                                 void *pcm, size_t bytes, uint32_t timeout_ms);
 esp_err_t ac101s_audio_board_stop(ac101s_audio_handle_t handle, const void *owner);
-/* Master values remain logical 0..100, independent of the speaker ceiling. */
+/* Publish/read the logical 0..100 PCM gain target without waiting for I/O.
+ * Active streams slew to it. A silent local stream gates the PA after its
+ * queued fade drains. Capture and codec teardown keep hardware mute. */
 esp_err_t ac101s_audio_set_master_volume(ac101s_audio_handle_t handle, uint8_t volume);
 esp_err_t ac101s_audio_get_master_volume(ac101s_audio_handle_t handle, uint8_t *volume);
 esp_err_t ac101s_audio_set_external_sink(ac101s_audio_handle_t handle, const ac101s_audio_sink_t *sink);

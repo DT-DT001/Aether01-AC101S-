@@ -275,7 +275,7 @@ static void gallery_cleanup(app_ui_t *ui)
 }
 
 static lv_obj_t *gallery_button(lv_obj_t *parent, const char *text, int x, int y, int width,
-                               lv_event_cb_t handler, app_ui_t *ui, intptr_t action, bool icon)
+                               lv_event_cb_t handler, app_ui_t *ui, intptr_t action)
 {
     lv_obj_t *button = lv_button_create(parent);
     lv_obj_set_pos(button, x, y);
@@ -283,8 +283,7 @@ static lv_obj_t *gallery_button(lv_obj_t *parent, const char *text, int x, int y
     app_catalog_control(button, 0x20344C);
     lv_obj_set_user_data(button, (void *)action);
     lv_obj_add_event_cb(button, handler, LV_EVENT_CLICKED, ui);
-    app_ui_add_text(button, text, LV_ALIGN_CENTER, 0, 0, icon ? 0x9DDCEB : 0xEAF2FF,
-                    icon ? &lv_font_montserrat_24 : NULL);
+    app_ui_add_text(button, text, LV_ALIGN_CENTER, 0, 0, 0x9DDCEB, &lv_font_montserrat_24);
     return button;
 }
 
@@ -306,7 +305,6 @@ static void viewer_action(lv_event_t *event)
     gallery_page_t *page = ui->page_context;
     const intptr_t action = (intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(event));
     if (!page || !page->viewer) return;
-    if (!action) { gallery_close_viewer(ui, page); return; }
     const size_t index = adjacent_photo(page, (int)action);
     if (!page->job && index != SIZE_MAX) gallery_show_image(ui, index);
 }
@@ -330,9 +328,8 @@ static void gallery_show_image(app_ui_t *ui, size_t index)
         page->image_label = app_ui_add_text(page->viewer, "", LV_ALIGN_TOP_LEFT, 8, 280, 0xB7CCE8, NULL);
         lv_obj_set_width(page->image_label, 392);
         lv_label_set_long_mode(page->image_label, LV_LABEL_LONG_DOT);
-        gallery_button(page->viewer, "返回列表", 8, 307, 140, viewer_action, ui, 0, false);
-        page->older = gallery_button(page->viewer, LV_SYMBOL_LEFT, 240, 307, 72, viewer_action, ui, -1, true);
-        page->newer = gallery_button(page->viewer, LV_SYMBOL_RIGHT, 328, 307, 72, viewer_action, ui, 1, true);
+        page->older = gallery_button(page->viewer, LV_SYMBOL_PREV, 240, 307, 72, viewer_action, ui, -1);
+        page->newer = gallery_button(page->viewer, LV_SYMBOL_NEXT, 328, 307, 72, viewer_action, ui, 1);
         page->list_back = ui->page_back;
         ui->page_back = gallery_viewer_back;
         lv_obj_stop_scroll_anim(page->rows.viewport);
@@ -562,7 +559,7 @@ void app_open_gallery(app_ui_t *ui)
     lv_obj_set_style_pad_all(content, 19, 0);
     app_ui_add_text(content, "全部图片", LV_ALIGN_TOP_LEFT, 2, 1, 0xEAF2FF, app_ui_chinese_font_size(24));
     page->source_label = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 3, 33, 0x90C0FF, NULL);
-    page->refresh = gallery_button(content, LV_SYMBOL_REFRESH, 354, 3, 54, gallery_action, ui, 0, true);
+    page->refresh = gallery_button(content, LV_SYMBOL_REFRESH, 354, 3, 54, gallery_action, ui, 0);
     lv_obj_t *list = lv_obj_create(content);
     lv_obj_set_pos(list, 0, 59);
     lv_obj_set_size(list, 408, 268);

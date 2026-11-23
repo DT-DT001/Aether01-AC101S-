@@ -5,6 +5,10 @@
 #include "app_ui_internal.h"
 #include "app_audio_system.h"
 #include "app_otg_control.h"
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
+#include "aether_bluetooth.h"
+#include "aether_wifi.h"
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +26,18 @@ static unsigned music_seek_requests;
 static uint32_t music_seek_position;
 static uint8_t requested_master,saved_master;
 static app_audio_system_snapshot_t master={.ready=true,.master_volume=17,.applied_volume=17};
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
+static aether_wifi_status_t station={.enabled=true,.connected=true};
+static aether_bluetooth_hid_status_t bluetooth_input={.requested=true};
+aether_wifi_handle_t aether_wifi_get_default(void) { return (void *)1; }
+esp_err_t aether_wifi_get_status(aether_wifi_handle_t handle, aether_wifi_status_t *status)
+{ assert(handle); *status=station; return ESP_OK; }
+aether_bluetooth_handle_t app_audio_system_bluetooth(void) { return (void *)1; }
+esp_err_t aether_bluetooth_get_status(aether_bluetooth_handle_t handle, aether_bluetooth_status_t *status)
+{ assert(handle); *status=(aether_bluetooth_status_t){0}; return ESP_OK; }
+esp_err_t aether_bluetooth_hid_get_status(aether_bluetooth_handle_t handle, aether_bluetooth_hid_status_t *status)
+{ assert(handle); *status=bluetooth_input; return ESP_OK; }
+#endif
 static aether_audio_player_status_t music={.active=true,.state=AETHER_AUDIO_PLAYING,.volume=100,.sample_rate=44100,.channels=2,.duration_ms=120000,.path="/sdcard/Music/test.mp3"};
 static app_io_usb_status_t usb={.media_present=true,.capacity_bytes=8ULL*1024*1024*1024};
 static unsigned usb_commands,usb_confirmed_commands;
@@ -84,6 +100,7 @@ const lv_font_t *app_ui_chinese_font(void){return &font_16;}
 void app_ui_label_text(lv_obj_t *o,const char *s){if(strcmp(lv_label_get_text(o),s))lv_label_set_text(o,s);}
 void app_ui_label_fmt(lv_obj_t *o,const char *f,...){char s[512];va_list a;va_start(a,f);vsnprintf(s,sizeof(s),f,a);va_end(a);app_ui_label_text(o,s);}
 lv_obj_t *app_ui_add_text(lv_obj_t *p,const char *s,lv_align_t a,int32_t x,int32_t y,uint32_t c,const lv_font_t *f){lv_obj_t *o=lv_label_create(p);lv_label_set_text(o,s);lv_obj_set_style_text_font(o,f,0);lv_obj_set_style_text_color(o,lv_color_hex(c),0);lv_obj_align(o,a,x,y);return o;}
+void app_ui_show_drawer(app_ui_t *ui) { app_ui_begin_page(ui, "应用列表"); }
 #ifdef AETHER_VOLUME_REAL_CHROME
 #include "app_tools.h"
 void app_tools_get_snapshot(app_tools_snapshot_t *snapshot)
@@ -94,6 +111,13 @@ void app_tools_get_snapshot(app_tools_snapshot_t *snapshot)
 void app_ui_set_user_key_exit(app_ui_t *ui, bool enabled) {(void)ui; (void)enabled;}
 lv_obj_t *app_ui_new_screen(app_ui_t *ui)
 #else
+static void test_header_back(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    if (lv_obj_get_parent(lv_event_get_current_target_obj(event)) != ui->screen) return;
+    if (ui->page_back) ui->page_back(ui);
+    else app_ui_show_drawer(ui);
+}
 lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 #endif
 {
@@ -107,6 +131,11 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
     return ui->screen;
 #else
     (void)title;
+    lv_obj_t *back = lv_button_create(ui->screen);
+    lv_obj_set_size(back, 48, 44);
+    lv_obj_set_pos(back, 14, 12);
+    lv_obj_add_event_cb(back, test_header_back, LV_EVENT_CLICKED, ui);
+    app_ui_add_text(back, LV_SYMBOL_LEFT, LV_ALIGN_CENTER, 0, 0, 0xBFD7FF, &lv_font_montserrat_16);
     ui->content=lv_obj_create(ui->screen);lv_obj_set_size(ui->content,448,394);lv_obj_align(ui->content,LV_ALIGN_BOTTOM_MID,0,-14);
     lv_obj_set_style_pad_all(ui->content,20,0);lv_obj_set_style_border_width(ui->content,0,0);
     lv_obj_set_style_bg_color(ui->content,lv_color_hex(0x10192A),0);
@@ -116,6 +145,11 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t ms){ui->timer=lv_timer_create(cb,ms,ui);}
 void app_ui_show_home(app_ui_t *ui){assert(lvgl_locked);app_ui_begin_page(ui,"主页");}
 void app_open_nes_controls(app_ui_t *ui){(void)ui;}
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
+void app_open_wifi(app_ui_t *ui) { app_ui_begin_page(ui, "Wi-Fi 网络"); }
+void app_open_bluetooth(app_ui_t *ui) { app_ui_begin_page(ui, "蓝牙"); }
+void app_open_status(app_ui_t *ui) { app_ui_begin_page(ui, "设备状态"); }
+#endif
 static unsigned music_page_releases;
 esp_err_t app_io_release_media(app_io_handle_t io){assert(io);++music_page_releases;music.active=false;music.state=AETHER_AUDIO_STOPPED;music.track_count=0;music.path[0]=0;music.position_ms=music.duration_ms=0;return ESP_OK;}
 #ifndef APP_VOLUME_UI_DOUBLES_ONLY
@@ -200,7 +234,7 @@ static void test_otg(app_ui_t *ui)
     lv_obj_add_state(s,LV_STATE_CHECKED);lv_obj_send_event(s,LV_EVENT_VALUE_CHANGED,NULL);advance(350);
     assert(otg_commands==1&&otg.enabled&&lv_obj_has_state(s,LV_STATE_CHECKED));
     assert(find(ui->screen,"等待 CC 确认受电设备…"));
-    lv_obj_scroll_to_y(ui->content,716,LV_ANIM_OFF);advance(100);capture("settings-otg-wait");
+    lv_obj_scroll_to_y(ui->content,890,LV_ANIM_OFF);advance(100);capture("settings-otg-wait");
     assert(lv_obj_has_state(settings_switch_for(ui->content, "USB 虚拟U盘"),LV_STATE_DISABLED));
     otg.cleanup_pending=true;otg.state=AETHER_OTG_STOPPING;advance(350);
     assert(!lv_obj_has_state(s,LV_STATE_DISABLED)); /* User can always turn an enabled host OFF. */
@@ -215,7 +249,7 @@ static void test_otg(app_ui_t *ui)
     advance(350);
     assert(find(ui->screen,"供电已验证；等待 USB 设备枚举…"));
     assert(find(ui->screen,"采样 VBUS:5.126 V TS:0.500 V\nCC:16 R19:16 R13:01 R50:1E 温度:00\nC0:07 ADC原码:1406\nERR:0 OFF:0 DIAG:0"));
-    lv_obj_scroll_to_y(ui->content,905,LV_ANIM_OFF);advance(100);capture("settings-otg-power");
+    lv_obj_scroll_to_y(ui->content,1079,LV_ANIM_OFF);advance(100);capture("settings-otg-power");
     otg_power.valid=otg_power.vbus_valid=otg_power.ts_valid=otg_power.output_verified=false;otg_power.age_ms=2500;
     advance(350);assert(find(ui->screen,"Host 已启动；供电状态待确认"));
     assert(find(ui->screen,"快照已过期 VBUS:未测或过期 TS:未测或过期\nCC:-- R19:-- R13:-- R50:-- 温度:--\nC0:-- ADC原码:----\nERR:0 OFF:0 DIAG:0"));
@@ -240,7 +274,7 @@ static void test_otg(app_ui_t *ui)
     otg.transfer_status=0;advance(350);
     assert(find(ui->screen,"USB HID 已连接：1 个接口"));
     assert(find(ui->screen,"USB 046D:C52B 输入:1 跳过:2\n阶段:可用 接口:0 类型:1/1\n描述符:63/63 字节 传输:0\n解析:0 HID错误:0\nUSB 音频 播放:未接入 录音:未接入\n音频错误:0 不支持:0\nUSB U盘:未接入 0 MiB\nU盘错误:0"));
-    lv_obj_scroll_to_y(ui->content,1056,LV_ANIM_OFF);advance(100);capture("settings-otg-receiver");
+    lv_obj_scroll_to_y(ui->content,1230,LV_ANIM_OFF);advance(100);capture("settings-otg-receiver");
     otg.hid_stage=AETHER_USB_HID_STAGE_REPORT_DESCRIPTOR;otg.last_interface=2;
     otg.report_received=0;otg.transfer_status=4;otg.hid_error=otg.last_error=(esp_err_t)0x108; /* INVALID_RESPONSE fixture. */
     advance(350);
@@ -340,6 +374,40 @@ static void test_settings_entry(app_ui_t *ui)
     lv_group_set_default(previous_group);
     lv_group_delete(group);
     puts("PASS Settings opens at top, touch and keyboard scroll, and return from transfer details starts at top");
+}
+
+static void test_settings_connections(app_ui_t *ui)
+{
+    app_open_settings(ui);
+    advance(350);
+    lv_obj_t *connections = lv_obj_get_child(ui->content, 0);
+    lv_obj_t *wifi = find(connections, "Wi-Fi");
+    lv_obj_t *bluetooth = find(connections, "蓝牙");
+    assert(find(connections, "连接") && wifi && bluetooth);
+    assert(find(lv_obj_get_parent(wifi), "已连接"));
+    assert(find(lv_obj_get_parent(bluetooth), "已开启"));
+    station.connected = false;
+    bluetooth_input.connected = true;
+    advance(350);
+    assert(find(lv_obj_get_parent(wifi), "已开启"));
+    assert(find(lv_obj_get_parent(bluetooth), "已连接"));
+    lv_obj_t *device = lv_obj_get_child(ui->content, -1);
+    assert(find(device, "设备") && find(device, "设备状态"));
+    const char *const rows[] = {"Wi-Fi", "蓝牙", "设备状态"};
+    const char *const titles[] = {"Wi-Fi 网络", "蓝牙", "设备状态"};
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        lv_obj_t *row = find(ui->content, rows[i]);
+        assert(row);
+        tap_switch(lv_obj_get_parent(row));
+        assert(ui->page_back == app_open_settings && find(ui->screen, titles[i]));
+        lv_obj_t *icon = find(ui->screen, LV_SYMBOL_LEFT);
+        assert(icon && lv_obj_get_parent(lv_obj_get_parent(icon)) == ui->screen);
+        assert(!find(ui->content, "返回"));
+        tap_switch(lv_obj_get_parent(icon));
+        assert(find(ui->screen, "设置") && !ui->page_back);
+        assert_settings_at_top(ui);
+    }
+    puts("PASS Settings places Wi-Fi and Bluetooth first, Device status last, and uses one header Back for all three pages");
 }
 
 /* Force a stale event past LVGL's disabled state to check the handler guard. */
@@ -592,9 +660,10 @@ static void test_music_eq(app_ui_t *ui)
     eq_submit_error=ESP_OK;
     click(ui,"恢复默认");
     assert(!music.eq.enabled&&!music.eq.bands_db[0]&&find(panel,"已恢复默认值"));
-    lv_obj_t *close=find(panel,"返回");assert(close);
-    lv_obj_send_event(lv_obj_get_parent(close),LV_EVENT_CLICKED,NULL);
-    assert(lv_obj_has_flag(panel,LV_OBJ_FLAG_HIDDEN));
+    assert(!find(panel,"返回"));
+    lv_obj_t *screen = ui->screen;
+    click(ui,LV_SYMBOL_LEFT);
+    assert(ui->screen == screen && lv_obj_has_flag(panel,LV_OBJ_FLAG_HIDDEN));
     puts("PASS AC101S Music EQ actual LVGL: open, band edit, bypass/re-enable, backend rollback, defaults and close");
 }
 static void modal_underlying(lv_event_t *event)
@@ -632,6 +701,7 @@ int main(int argc,char **argv)
     lv_indev_t *in=lv_indev_create();lv_indev_set_type(in,LV_INDEV_TYPE_POINTER);lv_indev_set_display(in,d);lv_indev_set_read_cb(in,read_pointer);
     app_power_t power={.brightness=75,.timeout=60};app_ui_t ui={.power=&power,.storage=(void*)1,.audio_player=(void*)2,.io=(void*)4};
     test_settings_entry(&ui);
+    test_settings_connections(&ui);
     app_open_settings(&ui);advance(200);unsigned seen=0;lv_obj_t *s=slider(ui.content,0,&seen);assert(s);
     drag(s,70,offset);assert(requested_master==70&&master.master_volume==70&&saved_master==70&&master_persist==1&&master_updates>=10);
     advance(1500);assert(lv_slider_get_value(s)==70&&master.master_volume==70);

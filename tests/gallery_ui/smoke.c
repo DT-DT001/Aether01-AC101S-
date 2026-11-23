@@ -15,7 +15,7 @@ static app_io_request_t request;
 static bool mounted[] = {true, false};
 static bool usb_blocked, pressed;
 static lv_point_t point;
-static unsigned catalog_queries, catalog_cancels, leases, task_creates;
+static unsigned catalog_queries, catalog_cancels, leases, task_creates, previous_page_calls;
 static uint32_t generations[] = {1, 1};
 static void (*worker)(void *);
 static void *worker_arg;
@@ -85,6 +85,12 @@ lv_obj_t *app_ui_add_text(lv_obj_t *parent, const char *text, lv_align_t align,
     lv_obj_align(label, align, x, y);
     return label;
 }
+static void header_back(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    if (lv_obj_get_parent(lv_event_get_current_target_obj(event)) == ui->screen && ui->page_back)
+        ui->page_back(ui);
+}
 lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
 {
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
@@ -95,6 +101,11 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_t *old = ui->screen;
     ui->screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x101321), 0);
+    lv_obj_t *back = lv_button_create(ui->screen);
+    lv_obj_set_size(back, 48, 44);
+    lv_obj_set_pos(back, 14, 12);
+    lv_obj_add_event_cb(back, header_back, LV_EVENT_CLICKED, ui);
+    app_ui_add_text(back, LV_SYMBOL_LEFT, LV_ALIGN_CENTER, 0, 0, 0xBFD7FF, &lv_font_montserrat_16);
     app_ui_add_text(ui->screen, title, LV_ALIGN_TOP_MID, 0, 20, 0xEAF2FF, &font_24);
     ui->content = lv_obj_create(ui->screen);
     lv_obj_set_size(ui->content, 448, 394);
@@ -179,7 +190,7 @@ static void tap(lv_obj_t *object)
     advance(55);
 }
 
-static void previous_page(app_ui_t *ui) { assert(ui); }
+static void previous_page(app_ui_t *ui) { assert(ui); ++previous_page_calls; }
 
 int main(void)
 {
@@ -198,22 +209,28 @@ int main(void)
 
     app_open_gallery(&ui);
     gallery_page_t *page = ui.page_context;
+    lv_obj_t *screen = ui.screen;
+    lv_obj_t *back = lv_obj_get_child(screen, 0);
     ui.page_back = previous_page;
     assert(page->loading && !request.path[0]);
     finish_catalog(&ui, GALLERY_CATALOG_LIMIT, GALLERY_CATALOG_LIMIT + 1);
     advance(50);
-    assert(lv_obj_get_child_count(page->rows.viewport) == APP_SCROLL_LIST_ROWS + 1);
+    assert(page->rows.row_count < APP_SCROLL_LIST_ROWS);
+    assert(lv_obj_get_child_count(page->rows.viewport) == page->rows.row_count + 1);
     assert(strstr(lv_label_get_text(page->summary), "4096 / 4097"));
     assert(catalog_queries == 1 && !task_creates);
     snapshot(display, "gallery-catalog.ppm");
     lv_obj_scroll_to_y(page->rows.viewport, GALLERY_CATALOG_LIMIT * page->rows.row_step, LV_ANIM_OFF);
     advance(50);
     const size_t tail = GALLERY_CATALOG_LIMIT - 1;
-    assert(page->rows.indices[tail % APP_SCROLL_LIST_ROWS] == tail);
+    const size_t tail_slot = tail % page->rows.row_count;
+    assert(page->rows.indices[tail_slot] == tail);
     const int32_t saved_scroll = lv_obj_get_scroll_y(page->rows.viewport);
-    tap(page->rows.rows[tail % APP_SCROLL_LIST_ROWS]);
+    tap(page->rows.rows[tail_slot]);
     assert(page->selected == tail && page->job && task_creates == 1);
     assert(ui.page_back == gallery_viewer_back && lv_obj_has_flag(page->rows.viewport, LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_get_child_count(page->viewer) == 4 && lv_obj_is_visible(back));
+    assert(!strcmp(lv_label_get_text(lv_obj_get_child(page->older, 0)), LV_SYMBOL_PREV));
     run_worker();
     advance(80);
     assert(!page->job && page->pixels && page->descriptor.header.w == 2 && page->descriptor.header.h == 2);
@@ -224,16 +241,18 @@ int main(void)
     run_worker();
     advance(80);
     assert(!page->job && !page->pixels);
-    ui.page_back(&ui);
+    tap(back);
     advance(50);
-    assert(!page->viewer && ui.page_back == previous_page);
+    assert(ui.screen == screen && !page->viewer && ui.page_back == previous_page && !previous_page_calls);
     assert(lv_obj_get_scroll_y(page->rows.viewport) == saved_scroll);
-    tap(page->rows.rows[tail % APP_SCROLL_LIST_ROWS]);
+    tap(back);
+    assert(previous_page_calls == 1);
+    tap(page->rows.rows[tail_slot]);
     assert(page->job && task_creates == 3);
     app_ui_begin_page(&ui, "桌面");
     run_worker();
     assert(!ui.page_context && !ui.timer);
-    puts("PASS AC101S Gallery: 4096 photo-only rows, 12 buttons, real BMP viewing, adjacent photo, Back restores scroll, and decode cancellation");
+    puts("PASS AC101S Gallery: 4096 photo-only entries, bounded row pool, real BMP viewing, adjacent photo, Back restores scroll, and decode cancellation");
 
     app_open_gallery(&ui);
     page = ui.page_context;

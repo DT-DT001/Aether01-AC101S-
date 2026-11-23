@@ -282,7 +282,11 @@ static esp_err_t play_stream(aether_audio_player_handle_t h, const char *path, b
     if (!file_buffer) { err = ESP_ERR_NO_MEM; stage = "allocate_file_cache"; goto done; }
     if (setvbuf(file, file_buffer, _IOFBF, 8192)) { err = ESP_FAIL; stage = "set_file_cache"; goto done; }
     stage = "allocate_pcm";
-    output = heap_caps_malloc(1024 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t pcm_bytes = 1024 * 2 * sizeof(int16_t);
+    /* Resampling, EQ and I2S all touch this block. Keep it off the external
+     * memory bus where possible while LVGL is composing and flushing a list. */
+    output = heap_caps_malloc(pcm_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!output) output = heap_caps_malloc(pcm_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!output) { err = ESP_ERR_NO_MEM; goto done; }
     /* Decode the actual container, including MP4/AAC files named .mp3. */
     unsigned char magic[16];
@@ -402,7 +406,9 @@ static esp_err_t play_stream(aether_audio_player_handle_t h, const char *path, b
         const uint32_t read_us=mp3 ? (uint32_t)(io_after.read_total_us-io_before.read_total_us) : 0;
         const uint32_t decode_us=mp3 && pull_us>read_us ? pull_us-read_us : 0;
         if (err != ESP_OK) break;
-        if (controls(h).seek_revision != applied_seek) continue;
+        const controls_t latest = controls(h);
+        if (latest.stop || latest.terminate || latest.seek_revision != applied_seek) continue;
+        if (!aether_media_fs_available(&h->media_lease)) { err = ESP_ERR_INVALID_STATE; stage = "card_removed"; break; }
         if (!frames) { *finished = true; break; }
         music_eq_process(&eq, &c.eq, output, frames);
         aether_pcm_gain(output, frames * 2, c.volume);
@@ -591,10 +597,22 @@ esp_err_t aether_audio_player_new(ac101s_audio_handle_t audio,
     h->status.volume = 65;
     h->status.repeat = AETHER_AUDIO_REPEAT_LIST;
     load_preferences(h); /* Called at startup, outside LVGL. */
+    if (!h->command_lock) {
+        free(h);
+        return ESP_ERR_NO_MEM;
+    }
     /* S31 GCC -O2 -fstack-usage measures mp3dec_decode_frame at 16656 bytes.
      * 24KiB leaves >7KiB for its call chain, stdio and FreeRTOS context. */
-    if (!h->command_lock || xTaskCreate(player_task, "music_player", 24576, h, MUSIC_TASK_PRIORITY, &h->task) != pdPASS) {
-        if (h->command_lock) vSemaphoreDelete(h->command_lock);
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    /* MP3 and EQ use the FPU, which pins a task to its current S31 core.
+     * Choose core 1 before decoding, away from the core 0 LVGL worker. */
+    const BaseType_t created = xTaskCreatePinnedToCore(player_task, "music_player", 24576, h,
+                                                     MUSIC_TASK_PRIORITY, &h->task, 1);
+#else
+    const BaseType_t created = xTaskCreate(player_task, "music_player", 24576, h, MUSIC_TASK_PRIORITY, &h->task);
+#endif
+    if (created != pdPASS) {
+        vSemaphoreDelete(h->command_lock);
         free(h);
         return ESP_ERR_NO_MEM;
     }

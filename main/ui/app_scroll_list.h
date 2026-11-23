@@ -10,6 +10,8 @@ typedef struct {
     lv_obj_t *rows[APP_SCROLL_LIST_ROWS];
     size_t indices[APP_SCROLL_LIST_ROWS];
     size_t count;
+    size_t row_count;
+    size_t first_bound;
     int32_t row_step;
     void (*bind_row)(lv_obj_t *row, size_t index, void *context);
     void *context;
@@ -20,20 +22,25 @@ static inline void app_scroll_list_update(app_scroll_list_t *list)
     const int32_t scroll = lv_obj_get_scroll_y(list->viewport);
     size_t first = scroll > 0 ? (size_t)(scroll / list->row_step) : 0U;
     if (first > 0U) --first;
+    if (first == list->first_bound) return;
+    list->first_bound = first;
 
-    for (size_t i = first; i < first + APP_SCROLL_LIST_ROWS; ++i) {
-        const size_t slot = i % APP_SCROLL_LIST_ROWS;
+    size_t slot = first % list->row_count;
+    for (size_t i = first; i < first + list->row_count; ++i) {
         lv_obj_t *row = list->rows[slot];
         if (i >= list->count) {
-            lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+            if (!lv_obj_has_flag(row, LV_OBJ_FLAG_HIDDEN))
+                lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
             list->indices[slot] = SIZE_MAX;
         } else if (list->indices[slot] != i) {
             list->indices[slot] = i;
             lv_obj_set_y(row, (int32_t)i * list->row_step);
             lv_obj_set_user_data(row, (void *)(uintptr_t)i);
             list->bind_row(row, i, list->context);
-            lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
+            if (lv_obj_has_flag(row, LV_OBJ_FLAG_HIDDEN))
+                lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         }
+        if (++slot == list->row_count) slot = 0;
     }
 }
 
@@ -60,8 +67,9 @@ static inline void app_scroll_list_key(lv_event_t *event)
     if (y < scroll) lv_obj_scroll_to_y(list->viewport, y, LV_ANIM_OFF);
     else if (y + list->row_step > scroll + height)
         lv_obj_scroll_to_y(list->viewport, y + list->row_step - height, LV_ANIM_OFF);
-    lv_obj_t *next_row = list->rows[next % APP_SCROLL_LIST_ROWS];
-    if (list->indices[next % APP_SCROLL_LIST_ROWS] == next && lv_obj_get_group(next_row))
+    const size_t slot = next % list->row_count;
+    lv_obj_t *next_row = list->rows[slot];
+    if (list->indices[slot] == next && lv_obj_get_group(next_row))
         lv_group_focus_obj(next_row);
 }
 
@@ -70,6 +78,8 @@ static inline void app_scroll_list_init(app_scroll_list_t *list, lv_obj_t *viewp
     void (*bind_row)(lv_obj_t *row, size_t index, void *context), void *context)
 {
     list->viewport = viewport;
+    list->count = 0;
+    list->first_bound = SIZE_MAX;
     list->row_step = row_step;
     list->bind_row = bind_row;
     list->context = context;
@@ -77,6 +87,14 @@ static inline void app_scroll_list_init(app_scroll_list_t *list, lv_obj_t *viewp
     lv_obj_remove_flag(viewport, LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_set_scroll_dir(viewport, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(viewport, LV_SCROLLBAR_MODE_AUTO);
+
+    /* The current catalogs use fixed-height viewports. Keep only enough
+     * rows for a partially visible row and one row above the viewport. */
+    lv_obj_update_layout(viewport);
+    const int32_t height = lv_obj_get_content_height(viewport);
+    list->row_count = height > 0 ?
+        (size_t)LV_MIN((height - 1) / row_step + 3, (int32_t)APP_SCROLL_LIST_ROWS) :
+        APP_SCROLL_LIST_ROWS;
 
     /* One transparent child fixes the native scroll range while a bounded
      * pool of real buttons follows the visible part of the catalog. */
@@ -86,7 +104,7 @@ static inline void app_scroll_list_init(app_scroll_list_t *list, lv_obj_t *viewp
     lv_obj_set_size(list->spacer, 1, 1);
     lv_obj_set_pos(list->spacer, 0, 0);
 
-    for (size_t i = 0; i < APP_SCROLL_LIST_ROWS; ++i) {
+    for (size_t i = 0; i < list->row_count; ++i) {
         lv_obj_t *row = create_row(viewport, context);
         list->rows[i] = row;
         list->indices[i] = SIZE_MAX;
@@ -102,7 +120,8 @@ static inline void app_scroll_list_set_count(app_scroll_list_t *list, size_t cou
     lv_obj_stop_scroll_anim(list->viewport);
     list->count = count;
     lv_obj_set_height(list->spacer, count ? (int32_t)count * list->row_step : 1);
-    for (size_t i = 0; i < APP_SCROLL_LIST_ROWS; ++i) list->indices[i] = SIZE_MAX;
+    list->first_bound = SIZE_MAX;
+    for (size_t i = 0; i < list->row_count; ++i) list->indices[i] = SIZE_MAX;
     lv_obj_scroll_to_y(list->viewport, 0, LV_ANIM_OFF);
     app_scroll_list_update(list);
 }
@@ -111,7 +130,7 @@ static inline void app_scroll_list_deinit(app_scroll_list_t *list)
 {
     if (!list->viewport) return;
     lv_obj_remove_event_cb_with_user_data(list->viewport, app_scroll_list_event, list);
-    for (size_t i = 0; i < APP_SCROLL_LIST_ROWS; ++i)
+    for (size_t i = 0; i < list->row_count; ++i)
         lv_obj_remove_event_cb_with_user_data(list->rows[i], app_scroll_list_key, list);
     list->viewport = NULL;
 }

@@ -125,6 +125,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     ++ui->page_generation;
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
     if (ui->page_cleanup) { ui->page_cleanup(ui); ui->page_cleanup = NULL; }
+    ui->page_back = NULL;
     lv_obj_t *old = ui->screen;
     ui->screen = lv_obj_create(NULL); lv_obj_remove_flag(ui->screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x070A12), 0);

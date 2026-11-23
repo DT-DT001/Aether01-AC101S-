@@ -147,10 +147,11 @@ static void test_music_eq(app_ui_t *ui)
     assert(compare);
     lv_obj_send_event(lv_obj_get_parent(compare), LV_EVENT_CLICKED, NULL);
     assert(!music.eq.enabled && music.eq.bands_db[0] == 2 && music.eq.gain_db == 4);
-    lv_obj_t *back = find(panel, "返回");
-    assert(back);
+    lv_obj_t *back = find(ui->screen, LV_SYMBOL_LEFT);
+    lv_obj_t *screen = ui->screen;
+    assert(back && lv_obj_get_parent(lv_obj_get_parent(back)) == screen && !find(panel, "返回"));
     lv_obj_send_event(lv_obj_get_parent(back), LV_EVENT_CLICKED, NULL);
-    assert(lv_obj_has_flag(panel, LV_OBJ_FLAG_HIDDEN));
+    assert(ui->screen == screen && lv_obj_has_flag(panel, LV_OBJ_FLAG_HIDDEN));
 
     lv_obj_send_event(lv_obj_get_parent(entry), LV_EVENT_CLICKED, NULL);
     assert(lv_slider_get_value(sliders[0]) == 2);
@@ -161,7 +162,7 @@ static void test_music_eq(app_ui_t *ui)
     assert(!music.eq.enabled && !music.eq.gain_db && !music.eq.bands_db[0]);
     assert(!lv_slider_get_value(sliders[0]) && !lv_slider_get_value(sliders[AETHER_AUDIO_EQ_BANDS]));
     lv_obj_send_event(lv_obj_get_parent(back), LV_EVENT_CLICKED, NULL);
-    assert(music.active && music.state == AETHER_AUDIO_PLAYING && !music_page_releases);
+    assert(ui->screen == screen && music.active && music.state == AETHER_AUDIO_PLAYING && !music_page_releases);
     puts("PASS live music EQ controls, bypass, reopen and reset preserve playback");
 }
 
@@ -176,6 +177,121 @@ static void click_label(app_ui_t *ui, const char *text)
     lv_obj_t *label = find(ui->screen, text);
     assert(label);
     lv_obj_send_event(lv_obj_get_parent(label), LV_EVENT_CLICKED, NULL);
+}
+
+static void tap_object(lv_obj_t *object)
+{
+    lv_area_t bounds;
+    lv_obj_get_coords(object, &bounds);
+    pointer = (lv_point_t){(bounds.x1 + bounds.x2) / 2, (bounds.y1 + bounds.y2) / 2};
+    held = true; advance(80); held = false; advance(80);
+}
+
+static unsigned parent_back_calls;
+static void music_parent_back(app_ui_t *ui) { assert(ui); ++parent_back_calls; }
+
+static void test_library_rapid_scroll(lv_obj_t *list, lv_indev_t *input)
+{
+    enum { ROW_STEP = 48, ROW_HEIGHT = 43, REVERSALS = 10, CATALOG_COUNT = 96 };
+    const int32_t height = lv_obj_get_content_height(list);
+    const uint32_t row_count = lv_obj_get_child_count(list) - 1;
+    assert(row_count == (uint32_t)(height - 1) / ROW_STEP + 3);
+    const char *captions[12];
+    assert(row_count < sizeof(captions) / sizeof(captions[0]));
+    for (uint32_t i = 0; i < row_count; ++i) {
+        lv_obj_t *row = lv_obj_get_child(list, i + 1);
+        captions[i] = lv_label_get_text(lv_obj_get_child(row, 0));
+        assert(!lv_obj_get_style_shadow_width(row, LV_PART_MAIN));
+        assert(!lv_obj_get_style_transition(row, LV_PART_MAIN));
+    }
+
+    const unsigned selections = ui_playlist_selects, releases = music_page_releases;
+    lv_obj_scroll_to_y(list, 36 * ROW_STEP, LV_ANIM_OFF);
+    advance(16);
+    lv_obj_t *long_label = NULL;
+    for (uint32_t i = 0; i < row_count; ++i) {
+        lv_obj_t *row = lv_obj_get_child(list, i + 1);
+        if ((size_t)(uintptr_t)lv_obj_get_user_data(row) == 38) long_label = lv_obj_get_child(row, 0);
+    }
+    assert(long_label && lv_obj_is_visible(long_label));
+    const char *long_text = lv_label_get_text(long_label);
+    assert(!strncmp(long_text, "风吹过长街", strlen("风吹过长街")) && strstr(long_text, "..."));
+    lv_area_t bounds;
+    lv_obj_get_coords(list, &bounds);
+    const int32_t x = (bounds.x1 + bounds.x2) / 2;
+    const int32_t y = (bounds.y1 + bounds.y2) / 2;
+    lv_indev_set_mode(input, LV_INDEV_MODE_EVENT);
+    for (int swipe = 0; swipe < REVERSALS; ++swipe) {
+        const int32_t direction = swipe % 2 ? -1 : 1;
+        const int32_t start = lv_obj_get_scroll_y(list);
+        held = true;
+        for (int step = 0; step <= 3; ++step) {
+            pointer = (lv_point_t){x, y + direction * (108 - 72 * step)};
+            lv_indev_read(input);
+            advance(12);
+        }
+        const int32_t scroll = lv_obj_get_scroll_y(list);
+        assert((scroll - start) * direction >= 144);
+        for (int32_t track = (scroll + ROW_STEP - 1) / ROW_STEP; track < CATALOG_COUNT &&
+             track * ROW_STEP + ROW_HEIGHT <= scroll + height; ++track) {
+            if (track == 38) continue;
+            char name[24];
+            snprintf(name, sizeof(name), "track-%02u.mp3", (unsigned)track);
+            lv_obj_t *label = find(list, name);
+            assert(label && lv_obj_is_visible(label));
+        }
+        held = false;
+        lv_indev_read(input);
+        advance(12);
+    }
+    lv_indev_reset(input, list);
+    lv_indev_set_mode(input, LV_INDEV_MODE_TIMER);
+    lv_obj_scroll_to_y(list, 0, LV_ANIM_OFF);
+    advance(32);
+    for (uint32_t i = 0; i < row_count; ++i) {
+        lv_obj_t *label = lv_obj_get_child(lv_obj_get_child(list, i + 1), 0);
+        assert(lv_label_get_text(label) == captions[i]);
+    }
+    assert(ui_playlist_selects == selections && music_page_releases == releases && music.active);
+    puts("PASS ten fast music drags bind every visible row, retain caption buffers and never select or stop a track");
+}
+
+static void test_library_inertial_back(app_ui_t *ui, lv_indev_t *input, lv_obj_t *launcher,
+                                      lv_obj_t *list, lv_obj_t *header_back)
+{
+    tap_object(launcher);
+    lv_obj_scroll_to_y(list, 512, LV_ANIM_OFF);
+    advance(20);
+    lv_area_t bounds;
+    lv_obj_get_coords(list, &bounds);
+    const int32_t center_x = (bounds.x1 + bounds.x2) / 2;
+    const int32_t center_y = (bounds.y1 + bounds.y2) / 2;
+    lv_indev_set_mode(input, LV_INDEV_MODE_EVENT);
+    held = true;
+    for (int step = 0; step <= 6; ++step) {
+        pointer = (lv_point_t){center_x, center_y + 72 - step * 24};
+        lv_indev_read(input);
+        advance(16);
+    }
+    held = false;
+    lv_indev_read(input);
+    const int32_t released_at = lv_obj_get_scroll_y(list);
+    advance(24);
+    assert(lv_indev_get_scroll_obj(input) == list && lv_obj_get_scroll_y(list) > released_at);
+
+    const unsigned releases = music_page_releases, selections = ui_playlist_selects;
+    lv_obj_t *screen = ui->screen;
+    /* Activating Back independently leaves the pointer throw live until the
+     * production panel handler cancels it. Another pointer press would stop it first. */
+    lv_obj_send_event(header_back, LV_EVENT_CLICKED, NULL);
+    const int32_t closed_at = lv_obj_get_scroll_y(list);
+    assert(!lv_indev_get_scroll_obj(input));
+    advance(1300);
+    lv_indev_set_mode(input, LV_INDEV_MODE_TIMER);
+    assert(ui->screen == screen && ui->page_back == music_parent_back && !lv_obj_is_visible(list));
+    assert(music.active && music.state == AETHER_AUDIO_PLAYING && lv_obj_get_scroll_y(list) == closed_at);
+    assert(music_page_releases == releases && ui_playlist_selects == selections);
+    puts("PASS header Back cancels live list momentum without stopping music or resuming hidden scroll");
 }
 
 static void test_resume(app_ui_t *ui)
@@ -271,12 +387,12 @@ static void test_recording_playlist_scope(app_ui_t *ui)
     puts("PASS recording playlist and standalone music playlist stay isolated across async session release");
 }
 
-static lv_obj_t *progress_slider(app_ui_t *ui)
+static lv_obj_t *find_progress(lv_obj_t *parent)
 {
-    for (uint32_t i = 0; i < lv_obj_get_child_count(ui->content); ++i) {
-        lv_obj_t *child = lv_obj_get_child(ui->content, i);
-        if (lv_obj_check_type(child, &lv_slider_class) && lv_slider_get_max_value(child) == 1000)
-            return child;
+    if (lv_obj_check_type(parent, &lv_slider_class) && lv_slider_get_max_value(parent) == 1000) return parent;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(parent); ++i) {
+        lv_obj_t *slider = find_progress(lv_obj_get_child(parent, i));
+        if (slider) return slider;
     }
     return NULL;
 }
@@ -289,7 +405,7 @@ static void recordings_cleanup(app_ui_t *ui)
 static void test_seek_screen_handoff(app_ui_t *ui, lv_indev_t *input)
 {
     lv_obj_t *old_screen = ui->screen;
-    lv_obj_t *old_slider = progress_slider(ui);
+    lv_obj_t *old_slider = find_progress(ui->content);
     assert(old_slider);
     music.active = true;
     music.state = AETHER_AUDIO_PLAYING;
@@ -323,13 +439,13 @@ static void test_seek_screen_handoff(app_ui_t *ui, lv_indev_t *input)
     open_music(ui, track.path);
     complete_catalog(ui, &catalog);
     old_screen = ui->screen;
-    old_slider = progress_slider(ui);
+    old_slider = find_progress(ui->content);
     assert(old_slider);
     lv_obj_send_event(old_slider, LV_EVENT_PRESSED, input);
 
     open_music(ui, track.path);
     complete_catalog(ui, &catalog);
-    lv_obj_t *current_slider = progress_slider(ui);
+    lv_obj_t *current_slider = find_progress(ui->content);
     assert(current_slider && current_slider != old_slider && lv_obj_is_valid(old_slider));
     music.active = true;
     music.state = AETHER_AUDIO_PLAYING;
@@ -349,7 +465,7 @@ static void test_seek_screen_handoff(app_ui_t *ui, lv_indev_t *input)
 
 static void test_seek_feedback(app_ui_t *ui, lv_indev_t *input)
 {
-    lv_obj_t *slider = progress_slider(ui);
+    lv_obj_t *slider = find_progress(ui->content);
     assert(slider);
     music.state = AETHER_AUDIO_PLAYING;
     music.active = true;
@@ -513,14 +629,24 @@ int main(void)
     app_io_entry_t long_catalog[LONG_CATALOG_COUNT] = {0};
     for (size_t i=0;i<LONG_CATALOG_COUNT;++i)
         snprintf(long_catalog[i].path,sizeof(long_catalog[i].path),"/sdcard/Music/track-%02u.mp3",(unsigned)i);
+    strlcpy(long_catalog[38].path,
+            "/sdcard/Music/风吹过长街风吹过长街风吹过长街风吹过长街风吹过长街风吹过长街.mp3",
+            sizeof(long_catalog[38].path));
     lv_obj_send_event(refresh,LV_EVENT_CLICKED,NULL);assert(pending_complete);
     prepared.entries=long_catalog;prepared.count=prepared.total_count=LONG_CATALOG_COUNT;
     complete_catalog(&ui,&prepared);
     lv_obj_t *library_button=lv_obj_get_parent(find(ui.screen,"曲库"));
+    lv_obj_t *header_back=lv_obj_get_parent(find(ui.screen,LV_SYMBOL_LEFT));
+    lv_obj_t *music_screen=ui.screen;
+    ui.page_back=music_parent_back;
+    lv_group_focus_obj(library_button);
     lv_obj_send_event(library_button,LV_EVENT_CLICKED,NULL);advance(120);
     lv_obj_t *first=find(ui.screen,"track-00.mp3");assert(first&&lv_obj_is_visible(first));
     lv_obj_t *list=lv_obj_get_parent(lv_obj_get_parent(first));
-    assert(lv_obj_get_child_count(list)==13&&!find(ui.screen,"上一页")&&!find(ui.screen,"下一页"));
+    assert(!find(ui.screen,"上一页")&&!find(ui.screen,"下一页")&&
+           !find(ui.screen,"返回")&&!lv_obj_is_visible(library_button)&&lv_obj_is_visible(header_back));
+    assert(lv_obj_get_group(header_back)==group&&lv_group_get_focused(group)!=library_button);
+    test_library_rapid_scroll(list, input);
     const unsigned scans=io_requests;
     lv_group_focus_obj(lv_obj_get_parent(first));
     for (size_t i=1;i<LONG_CATALOG_COUNT;++i) {
@@ -530,11 +656,22 @@ int main(void)
     }
     advance(120);
     lv_obj_t *last=find(ui.screen,"track-95.mp3");assert(last&&lv_obj_is_visible(last));
-    lv_area_t bounds;lv_obj_get_coords(lv_obj_get_parent(last),&bounds);
-    pointer=(lv_point_t){(bounds.x1+bounds.x2)/2,(bounds.y1+bounds.y2)/2};
-    held=true;advance(80);held=false;advance(80);
+    const int32_t list_position=lv_obj_get_scroll_y(list);
+    music.position_ms = 62000;
+    tap_object(header_back);
+    assert(ui.screen==music_screen&&ui.page_back==music_parent_back&&!parent_back_calls&&
+           music.active&&!music_page_releases&&lv_obj_is_visible(library_button)&&!lv_obj_is_visible(list));
+    advance(130);
+    assert(find(ui.screen, "01:02"));
+    tap_object(header_back);
+    assert(parent_back_calls==1);
+    tap_object(library_button);
+    assert(lv_obj_get_scroll_y(list)==list_position&&lv_obj_is_visible(last));
+    tap_object(lv_obj_get_parent(last));
     assert(ui_playlist_selects==old_selects+1&&ui_playlist_selected_index==95&&io_requests==scans);
-    puts("PASS music catalog keyboard navigation reaches recycled offscreen rows and pointer selects the actual track index");
+    assert(ui.page_back==music_parent_back&&lv_obj_is_visible(library_button)&&!lv_obj_is_visible(list));
+    puts("PASS music catalog keyboard scrolling, single header Back, retained scroll and pointer selection of recycled rows");
+    test_library_inertial_back(&ui, input, library_button, list, header_back);
     assert(music.active&&music.state==AETHER_AUDIO_PLAYING&&music.volume==100&&!music_updates);
     test_music_eq(&ui);
     test_resume(&ui);

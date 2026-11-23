@@ -201,6 +201,31 @@ static void test_rejection_and_cancel(void)
     puts("PASS empty Xing/non-MP3 rejection and cancelable initial/fallback scans");
 }
 
+static void test_render_cancel_budget(void)
+{
+    FILE *file = wrapped(0, -1, true);
+    aether_mp3_stream_t *stream = NULL;
+    assert(aether_mp3_open(file, cancel, NULL, &stream) == ESP_OK);
+    int16_t pcm[1024];
+    esp_err_t error;
+    /* Prime the decoder so this test counts render polling independently of
+     * the still-eager storage checks on a refill. */
+    assert(aether_mp3_read(stream, pcm, 1, &error) == 1 && error == ESP_OK);
+    cancel_at = UINT32_MAX;
+    cancel_calls = 0;
+    assert(aether_mp3_read(stream, pcm, 257, &error) == 257 && error == ESP_OK);
+    assert(cancel_calls == 5);
+    cancel_at = 2;
+    cancel_calls = 0;
+    assert(aether_mp3_read(stream, pcm, 512, &error) == 64 && error == ESP_ERR_INVALID_STATE);
+    assert(cancel_calls == 2 && aether_mp3_position_ms(stream) == 6);
+    assert(aether_mp3_read(stream, pcm, 512, &error) == 0 && error == ESP_ERR_INVALID_STATE);
+    cancel_at = 0;
+    aether_mp3_close(stream);
+    fclose(file);
+    puts("PASS MP3 render checks cancellation every 64 frames and preserves partial-read position");
+}
+
 static void test_mpeg_rates(void)
 {
     const struct { uint8_t header[4]; unsigned rate, bytes, samples; } formats[] = {
@@ -250,6 +275,7 @@ int main(void)
     test_wrappers();
     test_seek_index_prefix();
     test_rejection_and_cancel();
+    test_render_cancel_budget();
     test_mpeg_rates();
     return 0;
 }

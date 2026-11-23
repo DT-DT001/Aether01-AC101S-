@@ -9,6 +9,7 @@ static struct {
     portMUX_TYPE lock;
     ac101s_audio_handle_t audio;
     aether_bluetooth_handle_t bluetooth;
+    bool bluetooth_volume_dirty;
     bool usb_initialized;
     TaskHandle_t task;
     app_audio_system_snapshot_t view;
@@ -72,11 +73,12 @@ static void service_once(void)
         s.view.controls_quiesced = quiesced;
         const uint32_t revision = s.revision;
         const bool pending = revision != s.applied_revision;
-        const uint8_t volume = s.view.master_volume;
-        const uint8_t previous_volume = s.view.applied_volume;
+        const uint8_t volume = s.view.applied_volume;
         const app_audio_output_t output = s.view.output;
         const app_audio_input_t input = s.view.input, previous_input = s.view.applied_input;
         aether_bluetooth_handle_t bluetooth = s.bluetooth;
+        const bool announce_volume = !quiesced && bluetooth && s.bluetooth_volume_dirty;
+        if (announce_volume) s.bluetooth_volume_dirty = false;
         const app_audio_output_t previous_output = s.view.applied_output;
         portEXIT_CRITICAL(&s.lock);
         aether_bluetooth_status_t bt = {0};
@@ -88,11 +90,8 @@ static void service_once(void)
         const bool retry_deferred = s.retry_apply && s.retry_revision == revision && s.retry_output == target &&
             (TickType_t)(xTaskGetTickCount() - s.retry_changed) < pdMS_TO_TICKS(250);
         if (!quiesced && (pending || target != previous_output || input != previous_input) && !retry_deferred) {
-            /* A disconnected route can remain pending for a long time. Do
-             * not toggle the speaker PA or reprogram unchanged codec gain on
-             * each 250ms route retry. Readback still verifies the real state. */
-            esp_err_t error = volume != previous_volume ? ac101s_audio_set_master_volume(s.audio, volume) : ESP_OK;
-            if (error == ESP_OK && input != previous_input)
+            esp_err_t error = ESP_OK;
+            if (input != previous_input)
                 error = ac101s_audio_set_input(s.audio, input == APP_AUDIO_INPUT_USB ? AC101S_INPUT_USB : AC101S_INPUT_BOARD);
             if (error == ESP_OK) {
                 if (target == APP_AUDIO_OUTPUT_BLUETOOTH && !connected && previous_output != APP_AUDIO_OUTPUT_BLUETOOTH)
@@ -100,25 +99,26 @@ static void service_once(void)
                 else if (target == APP_AUDIO_OUTPUT_USB && !usb_out) error = ESP_ERR_INVALID_STATE;
                 else error = ac101s_audio_set_output(s.audio, codec_output(target));
             }
-            uint8_t applied_volume;
             ac101s_audio_output_t applied_output;
             ac101s_audio_input_t applied_input;
-            const esp_err_t volume_error = ac101s_audio_get_master_volume(s.audio, &applied_volume);
             const esp_err_t output_error = ac101s_audio_get_output(s.audio, &applied_output);
             const esp_err_t input_error = ac101s_audio_get_input(s.audio, &applied_input);
-            if (error == ESP_OK) error = volume_error != ESP_OK ? volume_error : output_error;
+            if (error == ESP_OK) error = output_error;
             if (error == ESP_OK) error = input_error;
             s.retry_apply = error != ESP_OK;
             s.retry_revision = revision; s.retry_output = target; s.retry_changed = xTaskGetTickCount();
             portENTER_CRITICAL(&s.lock);
             if (error == ESP_OK) s.applied_revision = revision;
-            if (volume_error == ESP_OK) s.view.applied_volume = applied_volume;
             if (output_error == ESP_OK) s.view.applied_output = public_output(applied_output);
             if (input_error == ESP_OK) s.view.applied_input = applied_input == AC101S_INPUT_USB ? APP_AUDIO_INPUT_USB : APP_AUDIO_INPUT_BOARD;
             s.view.error = error;
             s.view.pending = s.revision != s.applied_revision;
             portEXIT_CRITICAL(&s.lock);
-            if (bluetooth && volume_error == ESP_OK) aether_bluetooth_set_volume(bluetooth, applied_volume);
+        }
+        if (announce_volume && aether_bluetooth_set_volume(bluetooth, volume) != ESP_OK) {
+            portENTER_CRITICAL(&s.lock);
+            s.bluetooth_volume_dirty = true;
+            portEXIT_CRITICAL(&s.lock);
         }
         portENTER_CRITICAL(&s.lock);
         if (s.view.output == APP_AUDIO_OUTPUT_BLUETOOTH && s.view.applied_output == APP_AUDIO_OUTPUT_BLUETOOTH) {
@@ -199,11 +199,12 @@ esp_err_t app_audio_system_init(ac101s_audio_handle_t audio)
         if (nvs_get_u8(nvs, "unmute", &value) == ESP_OK && value && value <= 100) last = value;
         nvs_close(nvs);
     }
+    const esp_err_t volume_error = ac101s_audio_set_master_volume(audio, volume);
+    if (volume_error != ESP_OK) return volume_error;
     s.audio = audio;
     s.last_nonzero = volume ? volume : last;
-    s.view = (app_audio_system_snapshot_t){.master_volume = volume, .applied_volume = 100,
-        .pending = true, .persistence_error = error == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : error};
-    s.revision = 1;
+    s.view = (app_audio_system_snapshot_t){.master_volume = volume, .applied_volume = volume,
+        .persistence_error = error == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : error};
     if (xTaskCreate(service, "audio_system", 4096, NULL, 4, &s.task) != pdPASS) {
         s.audio = NULL;
         return ESP_ERR_NO_MEM;
@@ -225,16 +226,23 @@ esp_err_t app_audio_system_set_volume(uint8_t volume, bool persist)
     if (volume > 100) return ESP_ERR_INVALID_ARG;
     portENTER_CRITICAL(&s.lock);
     if (!s.view.ready || s.quiesce_requested) { portEXIT_CRITICAL(&s.lock); return ESP_ERR_INVALID_STATE; }
+    const bool changed = volume != s.view.master_volume;
+    if (changed) {
+        /* This setter only publishes an atomic target. The PCM writer slews
+         * to it while route changes and radio metadata stay on the service. */
+        const esp_err_t result = ac101s_audio_set_master_volume(s.audio, volume);
+        if (result != ESP_OK) { portEXIT_CRITICAL(&s.lock); return result; }
+        s.view.master_volume = s.view.applied_volume = volume;
+        s.bluetooth_volume_dirty = true;
+    }
     if (volume) s.last_nonzero = volume;
-    s.view.master_volume = volume;
-    s.view.pending = true;
-    ++s.revision;
     s.changed = xTaskGetTickCount();
     if (persist) { s.view.persistence_pending = true; ++s.save_revision; }
     /* A preview may supersede a value already awaiting persistence. */
     else if (s.view.persistence_pending) ++s.save_revision;
+    const bool wake_service = persist || (changed && s.bluetooth);
     portEXIT_CRITICAL(&s.lock);
-    notify();
+    if (wake_service) notify();
     return ESP_OK;
 }
 
@@ -300,7 +308,10 @@ void app_audio_system_set_bluetooth(aether_bluetooth_handle_t bluetooth)
     esp_err_t error = bluetooth ? aether_bluetooth_get_sink(bluetooth, &sink) : ESP_OK;
     if (error == ESP_OK) error = ac101s_audio_set_external_sink(s.audio, bluetooth ? &sink : NULL);
     portENTER_CRITICAL(&s.lock);
-    if (error == ESP_OK) s.bluetooth = bluetooth;
+    if (error == ESP_OK) {
+        s.bluetooth = bluetooth;
+        s.bluetooth_volume_dirty = bluetooth != NULL;
+    }
     else s.view.error = error;
     portEXIT_CRITICAL(&s.lock);
     notify();

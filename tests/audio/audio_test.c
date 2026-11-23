@@ -9,7 +9,7 @@ struct test_mutex { bool locked; };
 static int pa;
 static bool codec_open, muted, bad_order;
 static int fail_stage, stage, close_calls;
-static int actual_volume, fail_volumes;
+static int actual_volume;
 static bool fail_close;
 static bool check_local_pcm;
 static uint32_t local_pcm;
@@ -18,6 +18,10 @@ static int local_write_error;
 static bool checking_alert, short_alert_write;
 static unsigned alert_writes;
 static size_t alert_bytes;
+static bool capture_local;
+static size_t short_write;
+static int16_t captured[4096];
+static size_t captured_samples;
 esp_err_t gpio_input_enable(gpio_num_t pin) { assert(pin == 42); return ESP_OK; }
 esp_err_t gpio_set_direction(gpio_num_t pin, int mode) { assert(pin == 42 && mode == GPIO_MODE_OUTPUT); return ESP_OK; }
 int gpio_get_level(gpio_num_t pin) { assert(pin == 42); return pa; }
@@ -70,7 +74,6 @@ esp_err_t ac101s_codec_set_speaker(i2c_master_dev_handle_t dev, unsigned volume)
     assert(dev && volume <= 70);
     if (pa) bad_order = true;
     ++stage;
-    if (fail_volumes) { --fail_volumes; return ESP_FAIL; }
     if (fail_stage == stage) return ESP_FAIL;
     actual_volume = (int)volume;
     muted = volume == 0;
@@ -84,10 +87,16 @@ int i2s_channel_write(i2s_chan_handle_t tx, const void *data, size_t size, size_
         assert(size && size <= 240 * 4 && !(size % 4) && timeout <= 100 && pa);
         ++alert_writes;
         alert_bytes += size;
-    } else assert(size == 4);
+    } else assert(size == 4 || (capture_local && size <= AUDIO_DMA_FRAMES * PCM16_STEREO_BYTES));
     ticks += local_write_ticks;
     if (check_local_pcm) memcpy(&local_pcm, data, 4);
     *sent = checking_alert && short_alert_write ? 0 : size;
+    if (capture_local) {
+        if (short_write) { *sent = short_write; short_write = 0; }
+        assert(captured_samples + *sent / 2 <= sizeof(captured) / sizeof(*captured));
+        memcpy(captured + captured_samples, data, *sent);
+        captured_samples += *sent / 2;
+    }
     return local_write_error;
 }
 
@@ -105,8 +114,6 @@ static bool fail_sink_start;
 static unsigned fail_sink_stop;
 static ac101s_audio_handle_t publish_stop_during_cleanup;
 static TickType_t sink_ticks;
-static int16_t captured[4096];
-static size_t captured_samples;
 static esp_err_t transport_start(void *context)
 { assert(context == &peer_connected && !pa && !codec_open); ++sink_starts; return fail_sink_start ? ESP_FAIL : ESP_OK; }
 static esp_err_t transport_stop(void *context)
@@ -124,11 +131,26 @@ static esp_err_t transport_write(void *context, const void *data, size_t bytes, 
     return ESP_OK;
 }
 
+static void write_tone(ac101s_audio_handle_t audio, size_t frames)
+{
+    int16_t pcm[2880];
+    assert(frames * 2 <= sizeof(pcm) / sizeof(*pcm));
+    for (size_t i = 0; i < frames * 2; i += 2) { pcm[i] = 30000; pcm[i + 1] = -30000; }
+    captured_samples = 0;
+    assert(ac101s_audio_write(audio, pcm, frames * PCM16_STEREO_BYTES) == ESP_OK);
+    assert(captured_samples == frames * 2);
+    for (size_t i = 0; i < frames * 2; i += 2) {
+        assert(pcm[i] == 30000 && pcm[i + 1] == -30000);
+        assert(captured[i] == -captured[i + 1]);
+    }
+}
+
 int main(void)
 {
     struct test_mutex mutex = {0};
     struct ac101s_audio_dev_t audio = {.codec = (void *)1, .tx = (void *)2, .rx = (void *)3, .pa_enable = 42,
                                      .sample_rate_hz = 48000, .mutex = &mutex, .master_volume = 100,
+                                     .speaker_ring_frames = 6 * AUDIO_DMA_FRAMES,
                                      .route_lock = portMUX_INITIALIZER_UNLOCKED};
     uint32_t frame = 0;
     ac101s_audio_write_metrics_t initial_metrics;
@@ -138,7 +160,7 @@ int main(void)
     for (unsigned session = 0; session < 100; ++session) {
         stage = 0;
         assert(ac101s_audio_start(&audio, 70, 24.0f) == ESP_OK);
-        assert(actual_volume == 49);
+        assert(actual_volume == 70);
         assert(pa == 1 && !muted && audio.started && !bad_order);
         assert(ac101s_audio_start(&audio, 70, 24.0f) == ESP_ERR_INVALID_STATE);
         assert(pa == 1 && !muted);
@@ -207,18 +229,54 @@ int main(void)
     assert(ac101s_audio_stop(&audio)==ESP_OK);
     puts("PASS cached write metrics separate mutex wait/output time, retain timeout and output-failure peaks, and read without acquiring the held audio mutex");
 
-    /* Master zero must actually mute and gate PA, including restarts. */
-    stage=0; assert(ac101s_audio_start(&audio,70,24)==ESP_OK);
-    assert(ac101s_audio_set_master_volume(&audio,50)==ESP_OK && actual_volume==25 && pa);
-    assert(ac101s_audio_set_master_volume(&audio,0)==ESP_OK && actual_volume==0 && muted && !pa);
+    /* The PCM follows while codec/PA and the shared I/O mutex stay untouched. */
+    stage=0; assert(ac101s_audio_start(&audio,100,24)==ESP_OK);
+    capture_local=true;
+    mutex.locked=true;
+    const TickType_t before_volume=ticks;
+    assert(ac101s_audio_set_master_volume(&audio,50)==ESP_OK);
+    uint8_t master;
+    assert(ac101s_audio_get_master_volume(&audio,&master)==ESP_OK && master==50 && ticks==before_volume);
+    mutex.locked=false;
+    short_write=12;
+    write_tone(&audio, PLAYBACK_GAIN_RAMP_FRAMES);
+    assert(captured[0] > 29900 && captured[captured_samples-2]==5334);
+    for(size_t i=2;i<captured_samples;i+=2) {
+        assert(captured[i]<=captured[i-2] && captured[i-2]-captured[i]<=50);
+    }
+    assert(ac101s_audio_set_master_volume(&audio,0)==ESP_OK);
+    write_tone(&audio, PLAYBACK_GAIN_RAMP_FRAMES);
+    assert(captured[0]>5300 && !captured[captured_samples-2] && pa && stage==2);
+    write_tone(&audio, audio.speaker_ring_frames - 1);
+    assert(pa);
+    for(size_t i=0;i<captured_samples;++i) assert(!captured[i]);
+    write_tone(&audio, 1);
+    assert(!pa && stage==2 && actual_volume==70);
     assert(ac101s_audio_stop(&audio)==ESP_OK);
-    stage=0; assert(ac101s_audio_start(&audio,70,24)==ESP_OK && !pa && muted && !actual_volume);
-    assert(ac101s_audio_set_master_volume(&audio,100)==ESP_OK && pa && !muted && actual_volume==49);
-    fail_volumes=1; assert(ac101s_audio_set_master_volume(&audio,25)==ESP_FAIL);
-    assert(audio.master_volume==100 && actual_volume==49 && pa && !muted);
-    fail_volumes=2; assert(ac101s_audio_set_master_volume(&audio,25)==ESP_FAIL && !pa);
+    stage=0; assert(ac101s_audio_start(&audio,100,24)==ESP_OK && !pa);
+    write_tone(&audio, 8);
+    assert(!captured[0] && !pa);
+    assert(ac101s_audio_set_master_volume(&audio,100)==ESP_OK);
+    write_tone(&audio, 100);
+    const int previous=captured[captured_samples-2];
+    assert(previous>5000 && previous<6000 && pa);
+    assert(ac101s_audio_set_master_volume(&audio,2)==ESP_OK);
+    write_tone(&audio, PLAYBACK_GAIN_RAMP_FRAMES);
+    assert(captured[0]<=previous && previous-captured[0]<16 && captured[captured_samples-2]==268);
+    /* These settled amplitudes preserve the old -27, -15 and -9 dB anchors
+     * relative to 100%. Between anchors every volume has a finer PCM level. */
+    static const struct { uint8_t level; int amplitude; } anchors[] = {
+        {10, 1340}, {50, 5334}, {70, 10644}, {100, 30000},
+    };
+    for (size_t i=0;i<sizeof(anchors)/sizeof(*anchors);++i) {
+        assert(ac101s_audio_set_master_volume(&audio,anchors[i].level)==ESP_OK);
+        write_tone(&audio,PLAYBACK_GAIN_RAMP_FRAMES);
+        assert(captured[captured_samples-2]==anchors[i].amplitude);
+    }
+    assert(stage==2 && actual_volume==70 && pa);
+    capture_local=false;
     assert(ac101s_audio_stop(&audio)==ESP_OK);
-    puts("PASS master volume, true mute, restart and failed volume rollback");
+    puts("PASS lock-free master preview, stereo 512-frame ramp across partial writes, retargeting continuity, speaker 10/50/70/100 anchors and digital zero/DMA drain");
 
     assert(ac101s_audio_start(&audio,70,24)==ESP_OK && pa);
     fail_close = true;
@@ -248,10 +306,15 @@ int main(void)
     assert(ac101s_audio_set_master_volume(&audio,50)==ESP_OK);
     assert(ac101s_audio_write(&audio,pcm,sizeof(pcm))==ESP_OK && captured_samples==1500);
     assert(!memcmp(original,pcm,sizeof(pcm)));
-    for(unsigned i=0;i<1500;++i) assert(captured[i]==(int16_t)((int32_t)original[i]*1225/10000));
+    for(unsigned i=0;i<1500;++i) {
+        const int gain=(int32_t)original[i]*1225/10000;
+        if(i>=2*PLAYBACK_GAIN_RAMP_FRAMES) assert(abs(captured[i]-gain)<=1);
+        else assert(abs(captured[i])+1>=abs(gain));
+    }
     captured_samples=0; assert(ac101s_audio_set_master_volume(&audio,0)==ESP_OK);
     assert(ac101s_audio_write(&audio,pcm,sizeof(pcm))==ESP_OK);
-    for(unsigned i=0;i<1500;++i) assert(!captured[i]);
+    assert(captured[0]<-3600);
+    for(unsigned i=2*PLAYBACK_GAIN_RAMP_FRAMES;i<1500;++i) assert(!captured[i]);
     assert(!memcmp(original,pcm,sizeof(pcm)) && !pa);
     sink_ticks=600;captured_samples=0;
     assert(ac101s_audio_write(&audio,pcm,sizeof(pcm))==ESP_ERR_TIMEOUT);
@@ -274,18 +337,13 @@ int main(void)
         stage=0;assert(ac101s_audio_start(&audio,(int)stream,24)==ESP_OK);
         for(unsigned master=0;master<=100;++master){
             assert(ac101s_audio_set_master_volume(&audio,(uint8_t)master)==ESP_OK);
-            const unsigned old_level=stream*master/100;
-            assert(actual_volume<=70);
-            /* Ceiling division characterized without copying its expression. */
-            assert((unsigned)actual_volume*100>=old_level*70);
-            if(actual_volume) assert((unsigned)(actual_volume-1)*100<old_level*70);
-            assert((actual_volume>0)==(old_level>0));
-            assert((bool)pa==(old_level>0)&&muted==(old_level==0));
+            assert(actual_volume==(stream ? 70 : 0));
+            assert((bool)pa==(stream>0)&&muted==(stream==0) && stage==2);
             uint8_t logical=255;assert(ac101s_audio_get_master_volume(&audio,&logical)==ESP_OK&&logical==master);
         }
         assert(ac101s_audio_stop(&audio)==ESP_OK&&!pa&&muted);
     }
-    puts("PASS 10,201 real stream/master combinations: codec <=70, logical getter unchanged, no new low-volume mute, zero PA off");
+    puts("PASS 10,201 stream/master combinations: speaker ceiling programmed once, logical values exact, preview has no codec or PA side effects");
 
     /* A persisted logical 100 is reapplied unchanged by the service. Neither
      * restarting nor routing back from headphones may bypass the ceiling. */
@@ -309,15 +367,16 @@ int main(void)
         int16_t pcm[]={INT16_MIN,INT16_MAX};captured_samples=0;
         assert(ac101s_audio_write(&audio,pcm,4)==ESP_OK&&captured_samples==2&&!memcmp(captured,pcm,4));
         assert(ac101s_audio_set_master_volume(&audio,50)==ESP_OK);captured_samples=0;
+        write_tone(&audio,PLAYBACK_GAIN_RAMP_FRAMES);
+        captured_samples=0;
         assert(ac101s_audio_write(&audio,pcm,4)==ESP_OK&&captured[0]==-8192&&captured[1]==8191);
         assert(ac101s_audio_set_output(&audio,AC101S_OUTPUT_EXTERNAL)==ESP_OK&&!pa);
         assert(ac101s_audio_write(&audio,pcm,4)==ESP_OK);
         assert(ac101s_audio_set_output(&audio,AC101S_OUTPUT_USB)==ESP_OK);
-        /* Removal is handled on the write task before a decoder can see it;
-         * speaker receives original PCM, with gain applied by local hardware. */
+        /* Removal applies local gain once to the original source PCM. */
         peer_connected=false;check_local_pcm=true;
         assert(ac101s_audio_write(&audio,pcm,4)==ESP_OK&&audio.started&&!audio.external_started);
-        assert(audio.output==AC101S_OUTPUT_SPEAKER&&local_pcm==0x7fff8000U&&actual_volume==35&&pa);
+        assert(audio.output==AC101S_OUTPUT_SPEAKER&&local_pcm==0x16c2e93dU&&actual_volume==70&&pa);
         check_local_pcm=false;peer_connected=true;
         assert(ac101s_audio_stop(&audio)==ESP_OK);
         assert(ac101s_audio_set_master_volume(&audio,100)==ESP_OK);

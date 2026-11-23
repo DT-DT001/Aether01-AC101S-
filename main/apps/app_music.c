@@ -4,7 +4,7 @@
 #include "aether_media_fs.h"
 #include "ui/app_scroll_list.h"
 #include "app_text.h"
-#include "app_usb_input.h"
+#include "src/misc/lv_text_private.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +16,7 @@
 enum { MUSIC_EQ_GAIN_ROW = AETHER_AUDIO_EQ_BANDS, MUSIC_EQ_ROWS = MUSIC_EQ_GAIN_ROW + 1 };
 enum { LYRIC_PREVIOUS, LYRIC_ACTIVE, LYRIC_NEXT, LYRIC_PANEL_ROWS };
 enum { MUSIC_SURFACE = 0x121D28, MUSIC_BUTTON = 0x253749, MUSIC_ACCENT = 0x79DBB7 };
+enum { MUSIC_TRACK_CAPTION_WIDTH = 350 };
 
 typedef struct {
     app_ui_t *ui;
@@ -34,7 +35,11 @@ typedef struct {
     int64_t retry_at_us;
     char requested_path[192];
     char library_dir[192];
+    lv_obj_t *player_view, *active_panel, *panel_launcher;
+    void (*player_back)(app_ui_t *ui);
     lv_obj_t *title, *status, *elapsed, *duration, *track_count, *progress, *volume, *volume_label;
+    char volume_caption[24];
+    uint8_t shown_volume;
     lv_obj_t *play_label, *repeat_label, *library, *library_count;
     lv_obj_t *eq_panel, *eq_toggle_label, *eq_status;
     lv_obj_t *eq_sliders[MUSIC_EQ_ROWS], *eq_levels[MUSIC_EQ_ROWS];
@@ -65,7 +70,8 @@ static void music_cleanup(app_ui_t *ui);
 static music_page_t *page(lv_event_t *e)
 {
     app_ui_t *ui = lv_event_get_user_data(e);
-    return ui && ui->page_cleanup == music_cleanup ? ui->page_context : NULL;
+    return ui && ui->page_cleanup == music_cleanup &&
+        lv_obj_get_screen(lv_event_get_current_target_obj(e)) == ui->screen ? ui->page_context : NULL;
 }
 
 static void show_title(music_page_t *p, const char *path)
@@ -169,6 +175,42 @@ static lv_obj_t *button(music_page_t *p, lv_obj_t *parent, const char *text,
     return b;
 }
 
+static void music_panel_back(app_ui_t *ui)
+{
+    music_page_t *p = ui->page_context;
+    if (!p || !p->active_panel) return;
+    if (p->active_panel == p->library) {
+        lv_obj_t *viewport = p->tracks.viewport;
+        lv_obj_stop_scroll_anim(viewport);
+        for (lv_indev_t *input = lv_indev_get_next(NULL); input; input = lv_indev_get_next(input)) {
+            if (lv_indev_get_scroll_obj(input) == viewport) lv_indev_reset(input, viewport);
+        }
+    }
+    const bool restore_focus = lv_obj_get_group(p->panel_launcher) != NULL;
+    lv_obj_remove_flag(p->player_view, LV_OBJ_FLAG_HIDDEN);
+    if (restore_focus) lv_group_focus_obj(p->panel_launcher);
+    lv_obj_add_flag(p->active_panel, LV_OBJ_FLAG_HIDDEN);
+    p->active_panel = p->panel_launcher = NULL;
+    ui->page_back = p->player_back;
+    p->player_back = NULL;
+}
+
+static void music_show_panel(music_page_t *p, lv_obj_t *panel, lv_obj_t *launcher)
+{
+    if (p->active_panel) return;
+    p->player_back = p->ui->page_back;
+    p->ui->page_back = music_panel_back;
+    p->active_panel = panel;
+    p->panel_launcher = launcher;
+    p->dragging_seek = false;
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(p->player_view, LV_OBJ_FLAG_HIDDEN);
+    lv_group_t *group = lv_obj_get_group(launcher);
+    /* Focus the header before the panel rows so reopening a scrolled list
+     * cannot jump to the first recycled button in the keypad group. */
+    if (group && lv_group_get_focused(group) == launcher) lv_group_focus_prev(group);
+}
+
 static bool select_path(music_page_t *p, const char *path)
 {
     if (p->loading || !p->ui->audio_player || !path || !path[0]) return false;
@@ -190,8 +232,7 @@ static bool select_path(music_page_t *p, const char *path)
     }
     const esp_err_t err = aether_audio_player_select(p->ui->audio_player, selected);
     if (err != ESP_OK) { app_ui_label_fmt(p->status, "选歌失败：%s", esp_err_to_name(err)); return false; }
-    app_usb_input_modal_close(p->library);
-    lv_obj_add_flag(p->library, LV_OBJ_FLAG_HIDDEN);
+    if (p->active_panel == p->library) music_panel_back(p->ui);
     show_title(p, path);
     app_ui_label_text(p->status, "正在切换歌曲…");
     return true;
@@ -200,29 +241,75 @@ static bool select_path(music_page_t *p, const char *path)
 static void select_track(lv_event_t *e)
 {
     music_page_t *p = page(e);
-    if (!p || p->loading) return;
+    if (!p || p->loading || p->active_panel != p->library) return;
     const size_t index = (size_t)(uintptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
     if (index < p->count) select_path(p, p->entries[index].path);
+}
+
+static void free_track_caption(lv_event_t *event)
+{
+    free(lv_event_get_user_data(event));
 }
 
 static lv_obj_t *create_track_row(lv_obj_t *parent, void *context)
 {
     music_page_t *p = context;
-    lv_obj_t *row = button(p, parent, "", 0, 0, 382, 43, select_track);
-    lv_obj_t *label = lv_obj_get_child(row, 0);
-    lv_obj_set_width(label, 350);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-    lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t *row = lv_button_create(parent);
+    /* Use direct draw styles so fast drags don't recreate theme shadows or
+     * start a size animation as the pointer passes through a row. */
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 382, 43);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(MUSIC_BUTTON), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x38566D), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x466A80), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_add_event_cb(row, select_track, LV_EVENT_CLICKED, p->ui);
+    const lv_font_t *font = app_ui_chinese_font();
+    lv_obj_t *label = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 12, 0, 0xFFFFFF, font);
+    lv_obj_set_size(label, MUSIC_TRACK_CAPTION_WIDTH, lv_font_get_line_height(font));
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    char *caption = calloc(1, sizeof(p->entries[0].path));
+    if (caption && lv_obj_add_event_cb(label, free_track_caption, LV_EVENT_DELETE, caption)) {
+        lv_obj_set_user_data(label, caption);
+        lv_label_set_text_static(label, caption);
+    } else {
+        free(caption);
+    }
     return row;
 }
 
 static void bind_track_row(lv_obj_t *row, size_t index, void *context)
 {
     const music_page_t *p = context;
+    lv_obj_t *label = lv_obj_get_child(row, 0);
     char name[sizeof(p->entries[index].path)];
     strlcpy(name, filename(p->entries[index].path), sizeof(name));
-    app_text_sanitize_utf8(name, strlen(name));
-    app_ui_label_text(lv_obj_get_child(row, 0), name);
+    const size_t length = app_text_sanitize_utf8(name, strlen(name));
+    for (size_t i = 0; i < length; ++i) {
+        if ((uint8_t)name[i] < 0x20) name[i] = ' ';
+    }
+    const lv_font_t *font = app_ui_chinese_font();
+    lv_text_attributes_t attributes = {.max_width = MUSIC_TRACK_CAPTION_WIDTH,
+                                       .text_flags = LV_TEXT_FLAG_BREAK_ALL};
+    if (lv_text_get_next_line(name, length, font, NULL, &attributes) < length) {
+        const char dots[] = "...";
+        attributes.max_width -= lv_text_get_width(dots, sizeof(dots) - 1, font, &attributes);
+        size_t end = lv_text_get_next_line(name, length, font, NULL, &attributes);
+        if (end + sizeof(dots) > sizeof(name)) {
+            end = sizeof(name) - sizeof(dots);
+            while (((uint8_t)name[end] & 0xc0) == 0x80) --end;
+        }
+        while (end && name[end - 1] == ' ') --end;
+        memcpy(name + end, dots, sizeof(dots));
+    }
+    char *caption = lv_obj_get_user_data(label);
+    if (!caption) {
+        app_ui_label_text(label, name);
+    } else if (strcmp(caption, name) != 0) {
+        strlcpy(caption, name, sizeof(name));
+        lv_label_set_text_static(label, NULL);
+    }
 }
 
 static void render_library(music_page_t *p)
@@ -232,19 +319,10 @@ static void render_library(music_page_t *p)
     else app_ui_label_text(p->library_count, "曲库为空");
 }
 
-static void list_close(lv_event_t *e)
-{
-    music_page_t *p = page(e);
-    if (p) { app_usb_input_modal_close(p->library); lv_obj_add_flag(p->library, LV_OBJ_FLAG_HIDDEN); }
-}
-
 static void list_show(lv_event_t *e)
 {
     music_page_t *p = page(e);
-    if (p) {
-        lv_obj_remove_flag(p->library, LV_OBJ_FLAG_HIDDEN);
-        app_usb_input_modal_open(p->library, NULL);
-    }
+    if (p) music_show_panel(p, p->library, lv_event_get_current_target_obj(e));
 }
 
 static void eq_level(music_page_t *p, unsigned row, int value)
@@ -311,14 +389,6 @@ static void eq_reset(lv_event_t *e)
     }
 }
 
-static void eq_close(lv_event_t *e)
-{
-    music_page_t *p = page(e);
-    if (!p) return;
-    app_usb_input_modal_close(p->eq_panel);
-    lv_obj_add_flag(p->eq_panel, LV_OBJ_FLAG_HIDDEN);
-}
-
 static void eq_show(lv_event_t *e)
 {
     music_page_t *p = page(e);
@@ -332,8 +402,7 @@ static void eq_show(lv_event_t *e)
     p->eq = s.eq;
     eq_sync(p);
     app_ui_label_text(p->eq_status, p->eq.enabled ? "EQ 已启用" : "拖动滑块即可启用 EQ");
-    lv_obj_remove_flag(p->eq_panel, LV_OBJ_FLAG_HIDDEN);
-    app_usb_input_modal_open(p->eq_panel, NULL);
+    music_show_panel(p, p->eq_panel, lv_event_get_current_target_obj(e));
 }
 
 static void build_eq_panel(music_page_t *p, lv_obj_t *parent)
@@ -347,8 +416,7 @@ static void build_eq_panel(music_page_t *p, lv_obj_t *parent)
     lv_obj_set_style_bg_opa(p->eq_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(p->eq_panel, 0, 0);
     lv_obj_remove_flag(p->eq_panel, LV_OBJ_FLAG_SCROLLABLE);
-    button(p, p->eq_panel, "返回", 0, 0, 66, 36, eq_close);
-    app_ui_add_text(p->eq_panel, "均衡器", LV_ALIGN_TOP_LEFT, 79, 9, 0xF6C175, app_ui_chinese_font());
+    app_ui_add_text(p->eq_panel, "均衡器", LV_ALIGN_TOP_LEFT, 3, 9, 0xF6C175, app_ui_chinese_font());
     lv_obj_t *toggle = button(p, p->eq_panel, "启用 EQ", 151, 0, 111, 36, eq_toggle);
     p->eq_toggle_label = lv_obj_get_child(toggle, 0);
     button(p, p->eq_panel, "恢复默认", 274, 0, 118, 36, eq_reset);
@@ -559,13 +627,21 @@ static void repeat_event(lv_event_t *e)
         aether_audio_player_set_repeat(p->ui->audio_player, (s.repeat + 1) % 3);
 }
 
+static void show_volume(music_page_t *p, uint8_t volume)
+{
+    if (p->volume_caption[0] && p->shown_volume == volume) return;
+    p->shown_volume = volume;
+    snprintf(p->volume_caption, sizeof(p->volume_caption), "系统音量 %u%%", (unsigned)volume);
+    lv_label_set_text_static(p->volume_label, p->volume_caption);
+}
+
 static void volume_event(lv_event_t *e)
 {
     music_page_t *p = page(e);
     if (!p) return;
     const uint8_t value = (uint8_t)lv_slider_get_value(p->volume);
     const esp_err_t error = app_audio_system_set_volume(value, lv_event_get_code(e) == LV_EVENT_RELEASED);
-    app_ui_label_fmt(p->volume_label, "系统音量 %u%%", value);
+    show_volume(p, value);
     if (error != ESP_OK) app_ui_label_fmt(p->status, "调整音量失败：%s", esp_err_to_name(error));
 }
 
@@ -575,7 +651,7 @@ static void refresh_volume(music_page_t *p)
     app_audio_system_get_snapshot(&audio);
     if (!lv_obj_has_state(p->volume, LV_STATE_PRESSED))
         lv_slider_set_value(p->volume, audio.master_volume, LV_ANIM_OFF);
-    app_ui_label_fmt(p->volume_label, "系统音量 %u%%", (unsigned)lv_slider_get_value(p->volume));
+    show_volume(p, (uint8_t)lv_slider_get_value(p->volume));
     if (audio.ready) lv_obj_remove_state(p->volume, LV_STATE_DISABLED);
     else lv_obj_add_state(p->volume, LV_STATE_DISABLED);
 }
@@ -657,7 +733,7 @@ static void music_timer(lv_timer_t *timer)
     app_ui_t *ui = lv_timer_get_user_data(timer);
     music_page_t *p = ui->page_context;
     if (!p) return;
-    refresh_volume(p);
+    if (!p->active_panel) refresh_volume(p);
     if (!ui->audio_player) return;
     aether_audio_player_status_t s = {0};
     /* The outgoing page can still be releasing a recording or song. */
@@ -686,6 +762,10 @@ static void music_timer(lv_timer_t *timer)
     }
     if (p->refresh_pending && !p->loading && !p->lyric_loading) refresh_catalog(p);
     if (p->retry_at_us && !p->loading && esp_timer_get_time() >= p->retry_at_us) refresh_catalog(p);
+    /* A subpage owns the visible surface. Resume transport updates and LRC
+     * lookup on return, leaving the card bus and rendering time to playback
+     * and the scrolling list in the meantime. */
+    if (p->active_panel) return;
     if (s.path[0]) show_title(p, s.path);
     update_lyrics(p, &s, !s.path[0] || music_storage_ready(ui, s.path));
     sync_progress(p, &s);
@@ -713,9 +793,8 @@ static void music_cleanup(app_ui_t *ui)
 {
     music_page_t *p = ui->page_context;
     if (!p) return;
-    app_usb_input_modal_close(p->eq_panel);
-    app_usb_input_modal_close(p->library);
     app_scroll_list_deinit(&p->tracks);
+    lv_label_set_text_static(p->volume_label, "");
     free(p->entries);
     free(p->lyrics);
     free(p);
@@ -768,9 +847,9 @@ void app_open_music_path(app_ui_t *ui, const char *path)
 {
     char requested[192] = {0};
     if (path) strlcpy(requested, path, sizeof(requested));
-    lv_obj_t *content = app_ui_begin_page(ui, "音乐播放器");
+    lv_obj_t *body = app_ui_begin_page(ui, "音乐播放器");
     music_page_t *p = calloc(1, sizeof(*p));
-    if (!p) { app_ui_add_text(content, "内存不足", LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, app_ui_chinese_font()); return; }
+    if (!p) { app_ui_add_text(body, "内存不足", LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, app_ui_chinese_font()); return; }
     p->ui = ui;
     p->was_mounted = music_storage_ready(ui, requested);
     p->resume_checked = requested[0] != '\0';
@@ -781,8 +860,12 @@ void app_open_music_path(app_ui_t *ui, const char *path)
     else p->library_dir[0] = '\0';
     ui->page_context = p;
     ui->page_cleanup = music_cleanup;
-    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(content, lv_color_hex(MUSIC_SURFACE), 0);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(body, lv_color_hex(MUSIC_SURFACE), 0);
+    lv_obj_t *content = p->player_view = lv_obj_create(body);
+    lv_obj_remove_style_all(content);
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(content, lv_pct(100), lv_pct(100));
     p->title = app_ui_add_text(content, "请选择音乐", LV_ALIGN_TOP_LEFT, 4, 0, 0xF0F7FF, app_ui_chinese_font_size(24));
     lv_obj_set_width(p->title, 396);
     lv_label_set_long_mode(p->title, LV_LABEL_LONG_DOT);
@@ -809,6 +892,8 @@ void app_open_music_path(app_ui_t *ui, const char *path)
     p->volume = lv_slider_create(content);
     lv_obj_set_pos(p->volume, 115, 284); lv_obj_set_size(p->volume, 278, 18);
     lv_obj_set_ext_click_area(p->volume, 14);
+    lv_obj_set_style_transform_width(p->volume, 0, LV_PART_KNOB | LV_STATE_PRESSED);
+    lv_obj_set_style_transform_height(p->volume, 0, LV_PART_KNOB | LV_STATE_PRESSED);
     lv_slider_set_range(p->volume, 0, 100);
     lv_obj_add_event_cb(p->volume, volume_event, LV_EVENT_VALUE_CHANGED, ui);
     lv_obj_add_event_cb(p->volume, volume_event, LV_EVENT_RELEASED, ui);
@@ -819,23 +904,27 @@ void app_open_music_path(app_ui_t *ui, const char *path)
     button(p, content, "刷新", 211, 315, 81, 38, refresh_event);
     lv_obj_t *eq = button(p, content, "均衡器", 301, 315, 103, 38, eq_show);
     if (!ui->audio_player) lv_obj_add_state(eq, LV_STATE_DISABLED);
-    p->library = lv_obj_create(content);
+    p->library = lv_obj_create(body);
     lv_obj_set_pos(p->library, 0, 0); lv_obj_set_size(p->library, 408, 354);
     lv_obj_set_style_pad_all(p->library, 8, 0);
     lv_obj_set_style_bg_color(p->library, lv_color_hex(MUSIC_SURFACE), 0);
     lv_obj_set_style_border_width(p->library, 0, 0);
     lv_obj_remove_flag(p->library, LV_OBJ_FLAG_SCROLLABLE);
-    button(p, p->library, "返回", 0, 0, 68, 36, list_close);
-    p->library_count = app_ui_add_text(p->library, "曲库", LV_ALIGN_TOP_RIGHT, -4, 8, 0xF6C175, app_ui_chinese_font());
+    app_ui_add_text(p->library, "曲库", LV_ALIGN_TOP_LEFT, 3, 8, 0xF6C175, app_ui_chinese_font());
+    p->library_count = app_ui_add_text(p->library, "曲库为空", LV_ALIGN_TOP_RIGHT, -4, 8, 0xF6C175, app_ui_chinese_font());
     lv_obj_t *rows = lv_obj_create(p->library);
     lv_obj_set_pos(rows, 0, 44);
     lv_obj_set_size(rows, 392, 294);
     lv_obj_set_style_pad_all(rows, 0, 0);
     lv_obj_set_style_border_width(rows, 0, 0);
-    lv_obj_set_style_bg_opa(rows, LV_OPA_TRANSP, 0);
+    /* A solid viewport with the same fill as the library lets LVGL start a
+     * list-only redraw here rather than repainting the surrounding layers. */
+    lv_obj_set_style_radius(rows, 0, 0);
+    lv_obj_set_style_bg_color(rows, lv_color_hex(MUSIC_SURFACE), 0);
+    lv_obj_set_style_bg_opa(rows, LV_OPA_COVER, 0);
     app_scroll_list_init(&p->tracks, rows, 48, create_track_row, bind_track_row, p);
     lv_obj_add_flag(p->library, LV_OBJ_FLAG_HIDDEN);
-    build_eq_panel(p, content);
+    build_eq_panel(p, body);
     app_ui_set_timer(ui, music_timer, 120);
     if (!ui->audio_player) app_ui_label_text(p->status, "音频驱动未就绪，请检查 AC101S 供电和总线");
     else refresh_catalog(p);

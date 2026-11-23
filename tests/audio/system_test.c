@@ -7,7 +7,7 @@ static TickType_t ticks;
 static bool fail_task,have_preferences,media_busy,peer_connected;
 static aether_bluetooth_state_t peer_state=AETHER_BT_CONNECTED;
 static uint8_t stored_master=100,stored_unmute=100,staged_master,staged_unmute;
-static int fail_set_volume,fail_get_volume,fail_get_route,fail_commit;
+static int fail_set_volume,fail_get_route,fail_commit;
 static uint8_t actual_volume=100;
 static ac101s_audio_output_t actual_output;
 static ac101s_audio_input_t actual_input;
@@ -15,10 +15,11 @@ static bool usb_out, usb_in, capture_busy;
 static ac101s_audio_sink_t usb_sink;
 static ac101s_audio_source_t usb_source;
 static unsigned volume_calls,route_calls,commits,control_calls,polls;
-static unsigned change_during_volume,change_during_commit;
+static unsigned change_during_commit,bt_volume_calls;
+static uint8_t bt_announced_volume;
 static aether_bluetooth_remote_event_t remote[40];
 static size_t remote_count,remote_head;
-static bool run_service_during_poll, quiesce_during_volume;
+static bool run_service_during_poll, quiesce_during_route;
 
 TickType_t xTaskGetTickCount(void){return ticks;}
 BaseType_t xTaskCreate(void(*fn)(void*),const char*n,uint32_t stack,void*arg,int priority,TaskHandle_t*out)
@@ -32,11 +33,9 @@ esp_err_t nvs_set_u8(nvs_handle_t h,const char*key,uint8_t value){assert(h==1);i
 esp_err_t nvs_commit(nvs_handle_t h){assert(h==1);++commits;if(change_during_commit){unsigned v=change_during_commit;change_during_commit=0;assert(app_audio_system_set_volume((uint8_t)v,true)==ESP_OK);}if(fail_commit){--fail_commit;return ESP_FAIL;}stored_master=staged_master;stored_unmute=staged_unmute;have_preferences=true;return ESP_OK;}
 void nvs_close(nvs_handle_t h){assert(h==1);}
 esp_err_t ac101s_audio_set_master_volume(ac101s_audio_handle_t h,uint8_t value)
-{assert(h==(void*)1);++volume_calls;if(quiesce_during_volume){quiesce_during_volume=false;app_audio_system_quiesce_controls(true);}if(change_during_volume){unsigned v=change_during_volume;change_during_volume=0;assert(app_audio_system_set_volume((uint8_t)v,false)==ESP_OK);}if(fail_set_volume){--fail_set_volume;return ESP_ERR_TIMEOUT;}actual_volume=value;return ESP_OK;}
+{assert(h==(void*)1);++volume_calls;if(fail_set_volume){--fail_set_volume;return ESP_ERR_TIMEOUT;}actual_volume=value;return ESP_OK;}
 esp_err_t ac101s_audio_set_output(ac101s_audio_handle_t h,ac101s_audio_output_t output)
-{assert(h==(void*)1);++route_calls;if(output==AC101S_OUTPUT_EXTERNAL&&!peer_connected&&actual_output!=output)return ESP_ERR_INVALID_STATE;actual_output=output;return ESP_OK;}
-esp_err_t ac101s_audio_get_master_volume(ac101s_audio_handle_t h,uint8_t*out)
-{assert(h==(void*)1);if(fail_get_volume){--fail_get_volume;return ESP_ERR_TIMEOUT;}*out=actual_volume;return ESP_OK;}
+{assert(h==(void*)1);++route_calls;if(quiesce_during_route){quiesce_during_route=false;app_audio_system_quiesce_controls(true);}if(output==AC101S_OUTPUT_EXTERNAL&&!peer_connected&&actual_output!=output)return ESP_ERR_INVALID_STATE;actual_output=output;return ESP_OK;}
 esp_err_t ac101s_audio_get_output(ac101s_audio_handle_t h,ac101s_audio_output_t*out)
 {assert(h==(void*)1);if(fail_get_route){--fail_get_route;return ESP_ERR_TIMEOUT;}*out=actual_output;return ESP_OK;}
 esp_err_t ac101s_audio_set_external_sink(ac101s_audio_handle_t h,const ac101s_audio_sink_t*sink)
@@ -62,7 +61,8 @@ esp_err_t aether_usb_audio_capture_read(void*pcm,size_t bytes,uint32_t timeout)
 esp_err_t aether_bluetooth_get_sink(aether_bluetooth_handle_t h,ac101s_audio_sink_t*out){assert(h==(void*)3);memset(out,0,sizeof(*out));return ESP_OK;}
 esp_err_t aether_bluetooth_get_status(aether_bluetooth_handle_t h,aether_bluetooth_status_t*out)
 {assert(h==(void*)3);*out=(aether_bluetooth_status_t){.enabled=true,.connected=peer_connected,.state=peer_state,.sample_rate=peer_connected?48000:0,.channels=2};return ESP_OK;}
-esp_err_t aether_bluetooth_set_volume(aether_bluetooth_handle_t h,uint8_t volume){assert(h==(void*)3&&volume<=100);return ESP_OK;}
+esp_err_t aether_bluetooth_set_volume(aether_bluetooth_handle_t h,uint8_t volume)
+{assert(h==(void*)3&&volume<=100);++bt_volume_calls;bt_announced_volume=volume;return ESP_OK;}
 bool aether_bluetooth_poll_remote(aether_bluetooth_handle_t h,aether_bluetooth_remote_event_t*out)
 {assert(h==(void*)3);++polls;if(run_service_during_poll){run_service_during_poll=false;service_once();}if(remote_head==remote_count)return false;*out=remote[remote_head++];return true;}
 static bool busy(void*context){assert(context==&media_busy);return media_busy;}
@@ -73,8 +73,8 @@ static app_audio_system_snapshot_t view(void){app_audio_system_snapshot_t v;app_
 static void test_shutdown_controls(void)
 {
     /* A request made while codec apply is in flight is not yet an owner ACK. */
-    assert(app_audio_system_set_volume(46,false)==ESP_OK);
-    quiesce_during_volume=true;service_once();
+    assert(app_audio_system_set_output(APP_AUDIO_OUTPUT_SPEAKER)==ESP_OK);
+    quiesce_during_route=true;service_once();
     assert(!view().controls_quiesced);
     assert(app_audio_system_set_volume(80,true)==ESP_ERR_INVALID_STATE);
     assert(app_audio_system_set_output(APP_AUDIO_OUTPUT_BLUETOOTH)==ESP_ERR_INVALID_STATE);
@@ -117,22 +117,30 @@ int main(void)
     fail_task=false;have_preferences=true;stored_master=0;stored_unmute=65;
     assert(app_audio_system_init((void*)1)==ESP_OK);assert(app_audio_system_init((void*)1)==ESP_ERR_INVALID_STATE);
     service_once();assert(actual_volume==0&&!view().pending&&view().applied_volume==0);
-    assert(app_audio_system_toggle_mute(false)==ESP_OK);service_once();assert(actual_volume==65&&view().master_volume==65);
-    /* Timeout must retain pending and retry after 250ms, including tick wrap. */
-    ticks=UINT32_MAX-100;fail_set_volume=1;assert(app_audio_system_set_volume(40,false)==ESP_OK);service_once();
-    assert(view().pending&&view().error==ESP_ERR_TIMEOUT&&view().applied_volume==65);unsigned calls=volume_calls;
-    ticks+=249;service_once();assert(volume_calls==calls);ticks+=1;service_once();assert(actual_volume==40&&!view().pending);
-    /* A failed getter must preserve the previous confirmed snapshot. */
-    fail_get_volume=1;fail_get_route=1;assert(app_audio_system_set_volume(35,false)==ESP_OK);service_once();
-    assert(actual_volume==35&&view().applied_volume==40&&view().pending&&view().applied_output==APP_AUDIO_OUTPUT_SPEAKER);
-    ticks+=250;service_once();assert(view().applied_volume==35&&!view().pending);
-    change_during_volume=80;assert(app_audio_system_set_volume(20,false)==ESP_OK);service_once();assert(actual_volume==20&&view().master_volume==80&&view().pending);service_once();assert(actual_volume==80&&!view().pending);
+    assert(app_audio_system_toggle_mute(false)==ESP_OK&&actual_volume==65&&view().master_volume==65);
+    fail_set_volume=1;assert(app_audio_system_set_volume(40,false)==ESP_ERR_TIMEOUT);
+    assert(!view().pending&&view().master_volume==65&&view().applied_volume==65&&actual_volume==65);
+    const unsigned before_preview=route_calls;
+    for(uint8_t value=0;value<=100;++value) {
+        assert(app_audio_system_set_volume(value,false)==ESP_OK);
+        assert(actual_volume==value&&view().master_volume==value&&view().applied_volume==value);
+        service_once();assert(!view().pending&&route_calls==before_preview);
+    }
     /* Route stays external when the peer leaves: never unexpectedly externalize audio. */
     app_audio_system_set_bluetooth((void*)3);assert(app_audio_system_bluetooth()==(void*)3);
+    assert(app_audio_system_set_volume(60,false)==ESP_OK&&app_audio_system_set_volume(80,false)==ESP_OK);
+    assert(actual_volume==80&&bt_volume_calls==0);
+    service_once();assert(bt_volume_calls==1&&bt_announced_volume==80&&route_calls==before_preview);
+    ticks=UINT32_MAX-100;
     assert(app_audio_system_set_output(APP_AUDIO_OUTPUT_BLUETOOTH)==ESP_OK);service_once();assert(actual_output==AC101S_OUTPUT_SPEAKER&&view().pending);
-    calls=volume_calls;ticks+=1000;service_once();assert(volume_calls==calls); /* No 4Hz PA/gain writes while route is unavailable. */
-    peer_connected=true;peer_state=AETHER_BT_DISCONNECTING;ticks+=250;service_once();assert(actual_output==AC101S_OUTPUT_SPEAKER&&view().pending);
+    unsigned calls=volume_calls;ticks+=249;service_once();assert(volume_calls==calls&&view().pending);
+    peer_connected=true;peer_state=AETHER_BT_DISCONNECTING;ticks+=1;service_once();assert(actual_output==AC101S_OUTPUT_SPEAKER&&view().pending);
     peer_state=AETHER_BT_CONNECTED;
+    /* Volume can still change immediately while a route request is deferred. */
+    assert(app_audio_system_set_volume(40,false)==ESP_OK&&actual_volume==40&&view().pending);
+    service_once();assert(actual_output==AC101S_OUTPUT_SPEAKER&&bt_announced_volume==40);
+    fail_get_route=1;ticks+=250;service_once();
+    assert(actual_output==AC101S_OUTPUT_EXTERNAL&&view().applied_output==APP_AUDIO_OUTPUT_SPEAKER&&view().pending);
     peer_connected=true;ticks+=250;service_once();assert(actual_output==AC101S_OUTPUT_EXTERNAL&&!view().pending);
     calls=route_calls;peer_connected=false;service_once();assert(route_calls==calls&&actual_output==AC101S_OUTPUT_EXTERNAL&&view().error==ESP_ERR_INVALID_STATE);
     peer_connected=true;service_once();assert(actual_output==AC101S_OUTPUT_EXTERNAL&&view().error==ESP_OK&&route_calls==calls);
@@ -182,6 +190,6 @@ int main(void)
     app_audio_system_quiesce_controls(false);
     puts("PASS USB normalized sink/source registration, bounded wrappers, cached availability, disconnected-route rejection, active-capture ownership, unplug fallback and shutdown controls");
     test_shutdown_controls();
-    puts("PASS production audio service: NVS/init, mute, timeout/getter retry+tick wrap, stale updates, retained BT route, commit/media ordering and bounded remote queue");
+    puts("PASS production audio service: immediate gain target, no route operations across 101 previews, coalesced Bluetooth status, route retry/tick wrap, NVS and bounded remote queue");
     return 0;
 }

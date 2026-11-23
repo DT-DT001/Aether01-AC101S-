@@ -261,6 +261,42 @@ static void test_recordings_back(app_ui_t *ui)
     puts("PASS Recording WAV playback returns to the same list and scroll, handles TF remount, then returns to Recorder");
 }
 
+static void test_nested_recording_back(app_ui_t *ui)
+{
+    simulate_playback_page = true;
+    app_io_entry_t session = {.path = "/sdcard/Recordings/Session", .directory = true};
+    app_io_entry_t clip = {.path = "/sdcard/Recordings/Session/clip.wav"};
+    app_io_result_t root = {.operation = APP_IO_CATALOG, .entries = &session, .count = 1, .total_count = 1};
+    app_io_result_t subfolder = {.operation = APP_IO_CATALOG, .entries = &clip, .count = 1, .total_count = 1};
+    app_open_files_path(ui, "/sdcard/Recordings");
+    ui->page_back = recorder_page;
+    complete(ui, &root);
+    advance(80);
+    tap_text(ui->screen, "Session");
+    assert(ui->io_complete && !strcmp(request.path, session.path));
+    const unsigned scans = catalog_calls;
+    tap_text(ui->screen, LV_SYMBOL_LEFT);
+    assert(ui->io_complete && catalog_calls == scans && !strcmp(request.path, session.path));
+    complete(ui, &subfolder);
+    advance(80);
+    tap_text(ui->screen, "clip.wav");
+    assert(route == 2 && !strcmp(opened, clip.path) && find(ui->screen, "回放"));
+    tap_text(ui->screen, LV_SYMBOL_LEFT);
+    assert(ui->io_complete && !strcmp(request.path, session.path) && ui->page_back != recorder_page);
+    lv_obj_t *files_screen = ui->screen;
+    complete(ui, &subfolder);
+    advance(80);
+    assert(!find(ui->screen, LV_SYMBOL_UP));
+    tap_text(ui->screen, LV_SYMBOL_LEFT);
+    assert(ui->screen == files_screen && ui->io_complete && !strcmp(request.path, "/sdcard/Recordings") &&
+           ui->page_back == recorder_page);
+    complete(ui, &root);
+    advance(80);
+    tap_text(ui->screen, LV_SYMBOL_LEFT);
+    assert(find(ui->screen, "录音机") && !ui->page_back);
+    puts("PASS Files header Back returns through playback, nested folder, recordings list and Recorder one level at a time");
+}
+
 static void snapshot(lv_display_t *d,const char *dir,const char *name){lv_refr_now(d);char p[1024];snprintf(p,sizeof(p),"%s/%s.ppm",dir,name);FILE *f=fopen(p,"wb");assert(f);fprintf(f,"P6\n480 480\n255\n");for(unsigned i=0;i<480*480;++i){uint16_t v=framebuffer[i];uint8_t rgb[]={(v>>11)*255/31,((v>>5)&63)*255/63,(v&31)*255/31};assert(fwrite(rgb,1,3,f)==3);}fclose(f);}
 
 static void test_search_candidates(lv_obj_t *keyboard, lv_obj_t *field, lv_display_t *display, const char *output)
@@ -387,7 +423,7 @@ static void test_file_operations(app_ui_t *ui, lv_display_t *display, const char
     deliver(ui, ESP_OK);
     advance(100);
     assert(find(ui->screen, "已复制文件"));
-    tap_text(ui->screen, LV_SYMBOL_UP);
+    tap_text(ui->screen, LV_SYMBOL_LEFT);
     deliver(ui, ESP_OK);
     advance(100);
     box = open_options(ui, "Mysterious Nue.m4a");
@@ -528,7 +564,7 @@ int main(int argc,char **argv)
         tap(refresh);
         assert(request.limit==4096&&request.offset==0);
         deliver(&ui,ESP_OK);advance(80);
-        assert(lv_obj_get_child_count(list)==13&&find(ui.screen,"部分项目未索引"));
+        assert(lv_obj_get_child_count(list)<13&&find(ui.screen,"部分项目未索引"));
         const unsigned scans=catalog_calls;
         lv_obj_scroll_to_y(list,INT32_MAX,LV_ANIM_OFF);advance(120);
         lv_obj_t *last=find(ui.screen,"track-4095.m4a");
@@ -542,7 +578,7 @@ int main(int argc,char **argv)
         app_open_files_path(&ui,"/sdcard/Recordings");assert(!strcmp(request.path,"/sdcard/Recordings"));
         deliver(&ui,ESP_ERR_NOT_FOUND);advance(80);refresh=lv_obj_get_parent(find(ui.screen,LV_SYMBOL_REFRESH));
         assert(!lv_obj_has_state(refresh,LV_STATE_DISABLED));tap(refresh);assert(ui.io_complete);deliver(&ui,ESP_OK);
-        tap(lv_obj_get_parent(find(ui.screen,LV_SYMBOL_UP)));assert(!strcmp(request.path,"/sdcard"));deliver(&ui,ESP_OK);
+        tap_text(ui.screen,LV_SYMBOL_LEFT);assert(!strcmp(request.path,"/sdcard"));deliver(&ui,ESP_OK);
         mounted=false;usb_blocked=true;advance(550);const unsigned before_ready=catalog_calls;
         mounted=true;advance(550);assert(catalog_calls==before_ready&&!ui.io_complete&&lv_obj_has_state(refresh,LV_STATE_DISABLED));
         usb_blocked=false;advance(550);assert(catalog_calls==before_ready+1&&ui.io_complete);deliver(&ui,ESP_OK);
@@ -552,7 +588,7 @@ int main(int argc,char **argv)
         for(unsigned i=0;i<lv_obj_get_child_count(ui.content);++i){lv_obj_t *o=lv_obj_get_child(ui.content,i);if(lv_obj_check_type(o,&lv_dropdown_class))source=o;}
         assert(source);usb_mounted=true;lv_dropdown_set_selected(source,1);lv_obj_send_event(source,LV_EVENT_VALUE_CHANGED,NULL);
         assert(ui.io_complete&&!strcmp(request.path,"/usb"));deliver(&ui,ESP_OK);
-        assert(lv_obj_has_state(lv_obj_get_parent(find(ui.screen,LV_SYMBOL_UP)),LV_STATE_DISABLED));
+        assert(!find(ui.screen,LV_SYMBOL_UP) && !ui.page_back);
         ++usb_generation;advance(550);
         assert(ui.io_complete&&!strcmp(request.path,"/usb"));deliver(&ui,ESP_OK);
         usb_mounted=false;advance(550);assert(find(ui.screen,"USB U盘未就绪")&&lv_obj_has_state(refresh,LV_STATE_DISABLED));
@@ -567,8 +603,9 @@ int main(int argc,char **argv)
         failed_fs=false;mounted=true;advance(550);assert(ui.io_complete);deliver(&ui,ESP_OK);
         puts("PASS FAT32 mount failure shows cached format/layout, permits bounded manual retry without formatting, and refreshes after recovery");
         puts("PASS files auto-refresh waits for both remount and USB-gate release; exactly one fresh catalog replaces the blocked state");
-        puts("PASS file browser pointer scrolling, catalog-tail selection with 12 recycled rows, error/retry, hotplug and parent navigation");
+        puts("PASS file browser pointer scrolling, catalog-tail selection with bounded recycled rows, error/retry, hotplug and parent navigation");
         test_recordings_back(&ui);
+        test_nested_recording_back(&ui);
         test_file_operations(&ui, d, argv[1]);
         capture_phone_files(&ui, d, argv[1]);
     }

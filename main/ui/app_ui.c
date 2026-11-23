@@ -141,7 +141,9 @@ bool app_ui_go_back(app_ui_t *ui)
 
 static void back_event_cb(lv_event_t *event)
 {
-    (void)app_ui_go_back(lv_event_get_user_data(event));
+    app_ui_t *ui = lv_event_get_user_data(event);
+    if (lv_obj_get_parent(lv_event_get_current_target_obj(event)) == ui->screen)
+        (void)app_ui_go_back(ui);
 }
 
 void app_ui_set_user_key_exit(app_ui_t *ui, bool enabled)

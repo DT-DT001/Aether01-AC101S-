@@ -227,9 +227,15 @@ void app_pc_remote_set_motion(bool enabled)
     portEXIT_CRITICAL(&s_lock);
 }
 
-void app_pc_remote_leave(void)
+void app_pc_remote_release_controls(void)
 {
     app_pc_remote_set_air_mode(false);
+    if (s_bluetooth) (void)aether_bluetooth_hid_cancel_input(s_bluetooth);
+}
+
+void app_pc_remote_shutdown(void)
+{
+    app_pc_remote_release_controls();
     if (s_bluetooth) (void)aether_bluetooth_hid_set_enabled(s_bluetooth, false);
 }
 

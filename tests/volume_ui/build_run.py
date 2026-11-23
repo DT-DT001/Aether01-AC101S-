@@ -19,7 +19,7 @@ system=(root/'main/apps/app_system.c').read_text(encoding='utf-8')
 helpers=system[system.index('static lv_obj_t *action('):system.index('static const char *component_status(')]
 settings=system[system.index('typedef struct {\n    lv_obj_t *volume,'):]
 source=out/'settings.c'
-source.write_text('#include "app_ui_internal.h"\n#include "app_otg_control.h"\n#include "app_audio_system.h"\n#include "aether_usb_audio.h"\n#include "aether_usb_storage.h"\n#include "aether_media_fs.h"\n#include <stdlib.h>\n#include <stdio.h>\n'+helpers+settings, encoding='utf-8')
+source.write_text('#include "app_ui_internal.h"\n#include "app_connection_style.h"\n#include "app_otg_control.h"\n#include "app_audio_system.h"\n#include "aether_bluetooth.h"\n#include "aether_wifi.h"\n#include "aether_usb_audio.h"\n#include "aether_usb_storage.h"\n#include "aether_media_fs.h"\n#include <stdlib.h>\n#include <stdio.h>\n'+helpers+settings, encoding='utf-8')
 ui=(root/'main/ui/app_ui.c').read_text(encoding='utf-8')
 shutdown=out/'shutdown.c'
 shutdown.write_text('#include "app_ui_internal.h"\n#include "app_ui_modal.h"\n'+
@@ -30,15 +30,16 @@ chrome=out/'page_chrome.c'
 chrome.write_text('#include "app_ui_internal.h"\n#include "app_battery.h"\n#include "app_screen.h"\n'
     'lv_obj_t *app_ui_new_screen(app_ui_t *ui);\n'
     'void app_ui_set_user_key_exit(app_ui_t *ui, bool enabled);\n'
-    'static void back_event_cb(lv_event_t *event) {\n'
-    '    app_ui_t *ui = lv_event_get_user_data(event);\n'
-    '    if (ui->page_back) ui->page_back(ui);\n}\n'+
+    'void app_ui_show_drawer(app_ui_t *ui);\n'+
+    ui[ui.index('static bool navigate('):ui.index('static bool request_home(')]+
+    ui[ui.index('bool app_ui_go_back('):ui.index('void app_ui_set_user_key_exit(')]+
     ui[ui.index('lv_obj_t *app_ui_begin_page('):ui.index('static void shutdown_notice_close(')], encoding='utf-8')
 flags=[compiler,'-std=c11','-O0','-g','-Wall','-Wextra','-Werror','-ffunction-sections','-fdata-sections',
        '-DLV_CONF_INCLUDE_SIMPLE','-DLV_CONF_SUPPRESS_DEFINE_CHECK=1','-D_DEFAULT_SOURCE','-DAETHER_VOLUME_REAL_CHROME',
        '-DLV_FONT_MONTSERRAT_20=1',
        *['-I'+str(p) for p in [test/'stubs',root/'tests/reader_ui/stubs',root/'tests/home_ui/stubs',
-          root/'tests/battery_ui/stubs',root/'tests/reader_ui',root/'main',root/'main/ui',
+          root/'tests/battery_ui/stubs',root/'tests/reader_ui',root/'main',root/'main/ui',root/'main/apps',
+          root/'components/aether_wifi/include',
           root/'components/aether_usb_host/include',root/'components/aether_usb_audio/include',
           root/'components/aether_usb_storage/include',root/'components/tg29/include',
           root/'components/pcf85063/include',lvgl]]]

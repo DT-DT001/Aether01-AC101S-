@@ -192,7 +192,9 @@ int main(void)
     imu.gyro_calibrating = false;
     sample_after(20);
     assert(moves == 2 && !motion_queued);
-    app_pc_remote_leave();
+    app_pc_remote_release_controls();
+    assert(interest == 0 && hid.requested && hid.connected && !queued_clicks && !motion_queued);
+    app_pc_remote_shutdown();
     assert(interest == 0 && !hid.requested && !hid.connected && !queued_clicks && !motion_queued);
     power_status.shutdown_state = APP_POWER_SHUTDOWN_PREPARING;
     app_pc_remote_set_air_mode(true);
@@ -212,7 +214,7 @@ int main(void)
     sample_after(20);
     sample_after(20);
     assert(moves == 3 && motion_queued);
-    app_pc_remote_leave();
+    app_pc_remote_shutdown();
     puts("PASS air-mouse calibration, pending-motion cancellation, hold timeout and fresh input after reopening");
     return 0;
 }

@@ -503,7 +503,7 @@ static void refresh_pairing(remote_page_t *page, const app_pc_remote_status_t *s
     lv_obj_set_style_text_font(code, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_align(code, LV_TEXT_ALIGN_CENTER, 0);
     page->pair_error = lv_msgbox_add_text(box, "仅在数字一致时确认。");
-    static const char *const choices[] = {"确认相同", "拒绝配对", "关闭蓝牙"};
+    static const char *const choices[] = {"确认相同", "拒绝配对", "关闭键鼠"};
     static const uintptr_t actions[] = {ACTION_CONFIRM, ACTION_REJECT, ACTION_PAIR_OFF};
     lv_obj_t *reject = NULL;
     for (size_t i = 0; i < ARRAY_COUNT(choices); ++i) {
@@ -527,15 +527,15 @@ static void refresh(remote_page_t *page)
     const bool ready = can_send(&status);
     const char *state = !status.available ? "蓝牙键鼠不可用" : !status.requested ? "蓝牙键鼠已关闭" :
         status.confirm_pending ? (page->pair_replied ? "正在确认配对…" : "请核对配对码") :
-        status.connected ? "电脑已连接" : status.reconnecting ? "正在重连电脑…" :
-        status.discoverable ? "等待电脑配对" : "正在开启蓝牙…";
+        status.connected ? "设备已连接" : status.reconnecting ? "正在重连设备…" :
+        status.discoverable ? "等待设备配对" : "正在开启蓝牙…";
     app_ui_label_text(page->state, state);
     const uint32_t color = ready ? 0x8FE0BA : status.confirm_pending ? 0xE8C388 : 0xD9E8FF;
     if (page->state_color != color) {
         page->state_color = color;
         lv_obj_set_style_text_color(page->state, lv_color_hex(color), 0);
     }
-    app_ui_label_text(lv_obj_get_child(page->toggle, 0), status.requested ? "关闭蓝牙" : "开启蓝牙");
+    app_ui_label_text(lv_obj_get_child(page->toggle, 0), status.requested ? "关闭键鼠" : "开启键鼠");
     set_enabled(page->toggle, status.available || status.requested);
     if (page->view == REMOTE_OBS && status.save_error != ESP_OK)
         app_ui_label_fmt(page->hint, "快捷键保存失败 %s", esp_err_to_name(status.save_error));
@@ -543,13 +543,13 @@ static void refresh(remote_page_t *page)
         app_ui_label_text(page->hint, "正在保存快捷键…");
     else if (page->notice[0] && lv_tick_elaps(page->notice_tick) < 2800)
         app_ui_label_text(page->hint, page->notice);
-    else if (status.reconnecting) app_ui_label_text(page->hint, "请保持电脑蓝牙开启");
+    else if (status.reconnecting) app_ui_label_text(page->hint, "请保持对方蓝牙开启");
     else if (status.last_error != ESP_OK)
         app_ui_label_fmt(page->hint, "蓝牙 %s", esp_err_to_name(status.last_error));
     else if (ready && page->view == REMOTE_KEYBOARD)
         app_ui_label_text(page->hint, "使用美式键盘布局");
     else if (ready || !status.requested) app_ui_label_text(page->hint, "");
-    else app_ui_label_text(page->hint, "在电脑蓝牙中选择 Aether01");
+    else app_ui_label_text(page->hint, "在对方蓝牙列表选 Aether01");
 
     if (page->view == REMOTE_OBS) {
         for (unsigned i = 0; i < APP_PC_REMOTE_SCENES; ++i) {
@@ -636,7 +636,7 @@ static void page_cleanup(app_ui_t *ui)
     if (!page) return;
     app_ui_gyro_calibration_close(&page->calibration);
     release_motion(page);
-    app_pc_remote_leave();
+    app_pc_remote_release_controls();
     close_pairing(page);
     free(page);
     ui->page_context = NULL;
@@ -661,7 +661,7 @@ static void open_page(app_ui_t *ui, remote_view_t view, const char *title)
     page->hint = label(status_card, "", 24, 240, 20, CONNECTION_DETAIL);
     lv_obj_set_x(page->state, 34);
     lv_obj_set_x(page->hint, 34);
-    page->toggle = button(page, content, "开启蓝牙", 280, 2, 122, 44, ACTION_ENABLE);
+    page->toggle = button(page, content, "开启键鼠", 280, 2, 122, 44, ACTION_ENABLE);
     if (view == REMOTE_OBS) build_obs(page, content);
     else {
         page->tabs[0] = button(page, content, "键盘", 0, 54, 196, 44, ACTION_KEYBOARD);
