@@ -316,8 +316,11 @@ static esp_err_t play_stream(aether_audio_player_handle_t h, const char *path, b
     /* A restored position is a startup seek. Wait for the actual duration
      * and let a newer user seek take precedence. A replaced, shorter file
      * starts from the beginning instead of immediately advancing at EOF. */
-    if (!h->seek_revision && h->seek_ms && h->seek_ms < h->status.duration_ms)
+    if (!h->seek_revision && h->seek_ms && h->seek_ms < h->status.duration_ms) {
         h->seek_revision = 1;
+        h->status.seek_requested_ms = h->seek_ms;
+        h->status.seeking = true;
+    }
     h->status.mp3 = mp3 != NULL;
     h->status.aac = aac != NULL;
     h->status.detail[0] = 0;
@@ -341,8 +344,8 @@ static esp_err_t play_stream(aether_audio_player_handle_t h, const char *path, b
             if (codec_started) {
                 stage = "codec_stop_seek";
                 err = ac101s_audio_stop(h->audio);
-                codec_started = false;
                 if (err != ESP_OK) break;
+                codec_started = false;
             }
             stage = aac ? "aac_seek" : mp3 ? "mp3_seek" : "wav_seek";
             err = aac ? aether_mp4_audio_seek(aac, c.seek_ms) : mp3 ? aether_mp3_seek(mp3, c.seek_ms) : aether_wav_seek(stream, c.seek_ms);
@@ -352,16 +355,22 @@ static esp_err_t play_stream(aether_audio_player_handle_t h, const char *path, b
             if(mp3) aether_mp3_clear_metrics(mp3);
             if (aac) aether_mp4_audio_get_info(aac, &aac_info);
             portENTER_CRITICAL(&h->state_lock);
-            h->status.position_ms = aac ? aac_info.position_ms : mp3 ? aether_mp3_position_ms(mp3) : aether_wav_position_ms(stream);
+            if (h->seek_revision == applied_seek) {
+                h->status.position_ms = aac ? aac_info.position_ms : mp3 ? aether_mp3_position_ms(mp3) : aether_wav_position_ms(stream);
+                h->status.seeking = false;
+            }
             portEXIT_CRITICAL(&h->state_lock);
+            /* Catch up to requests made during decoding before starting the
+             * transport or writing a block from a superseded destination. */
+            continue;
         }
         if (c.pause) {
             previous_write_end=0; /* Intentional pause/seek is not starvation. */
             if (codec_started) {
                 stage = "codec_stop_pause";
                 err = ac101s_audio_stop(h->audio);
-                codec_started = false;
                 if (err != ESP_OK) break;
+                codec_started = false;
             }
             portENTER_CRITICAL(&h->state_lock);
             h->status.state = AETHER_AUDIO_PAUSED;
@@ -393,6 +402,7 @@ static esp_err_t play_stream(aether_audio_player_handle_t h, const char *path, b
         const uint32_t read_us=mp3 ? (uint32_t)(io_after.read_total_us-io_before.read_total_us) : 0;
         const uint32_t decode_us=mp3 && pull_us>read_us ? pull_us-read_us : 0;
         if (err != ESP_OK) break;
+        if (controls(h).seek_revision != applied_seek) continue;
         if (!frames) { *finished = true; break; }
         music_eq_process(&eq, &c.eq, output, frames);
         aether_pcm_gain(output, frames * 2, c.volume);
@@ -464,21 +474,32 @@ static void finish_session_release(aether_audio_player_handle_t h)
 {
     /* play/set_playlist scan paths under command_lock. Never free a list while
      * a foreground caller still owns that lock, or from an ISR/LVGL callback. */
-    if (xSemaphoreTake(h->command_lock, 0) != pdTRUE) return;
-    char (*old)[192] = NULL;
     portENTER_CRITICAL(&h->state_lock);
-    if (h->status.closing && !h->status.active) {
-        old = h->playlist; h->playlist = NULL;
-        h->status.track_count = h->status.track_index = 0;
-        h->status.position_ms = h->status.duration_ms = 0;
-        h->status.path[0] = 0; h->status.mp3 = h->status.aac = false;
-        h->status.state = AETHER_AUDIO_STOPPED;
-        h->status.closing = false;
-        h->resume_selected = false;
+    const bool ready_to_release = h->status.closing && !h->status.active;
+    portEXIT_CRITICAL(&h->state_lock);
+    if (!ready_to_release) return;
+    if (xSemaphoreTake(h->command_lock, 0) != pdTRUE) return;
+    portENTER_CRITICAL(&h->state_lock);
+    if (!h->status.closing || h->status.active) {
+        portEXIT_CRITICAL(&h->state_lock);
+        xSemaphoreGive(h->command_lock);
+        return;
     }
+    const uint32_t release_serial = h->release_serial;
+    char (*old)[192] = h->playlist;
+    h->playlist = NULL;
+    h->status.track_count = h->status.track_index = 0;
+    h->status.position_ms = h->status.duration_ms = 0;
+    h->status.path[0] = 0; h->status.mp3 = h->status.aac = false;
+    h->status.state = AETHER_AUDIO_STOPPED;
+    h->resume_selected = false;
     portEXIT_CRITICAL(&h->state_lock);
     free(old);
     xSemaphoreGive(h->command_lock);
+    /* A page polling closing=false must already be able to submit commands. */
+    portENTER_CRITICAL(&h->state_lock);
+    if (h->release_serial == release_serial) h->status.closing = false;
+    portEXIT_CRITICAL(&h->state_lock);
 }
 
 static void player_task(void *argument)
@@ -505,6 +526,8 @@ static void player_task(void *argument)
                 err != ESP_OK ? AETHER_AUDIO_ERROR :
                 finished ? AETHER_AUDIO_FINISHED : AETHER_AUDIO_STOPPED;
             h->status.active = false; /* Codec/file/lease cleanup is complete. */
+            h->status.seeking = false;
+            h->status.seek_requested_ms = 0;
             bool next = h->advance_requested || (finished && h->autoplay && err == ESP_OK);
             if (h->terminate || !inserted || !h->playlist || !h->status.track_count) next = false;
             if (!next && position_known) remember_position_locked(h);
@@ -619,6 +642,8 @@ esp_err_t aether_audio_player_play(aether_audio_player_handle_t h, const char *p
     h->stop_requested = h->pause_requested = false;
     h->seek_ms = position;
     h->seek_revision = 0;
+    h->status.seeking = false;
+    h->status.seek_requested_ms = 0;
     portEXIT_CRITICAL(&h->state_lock);
     xTaskNotifyGive(h->task);
     xSemaphoreGive(h->command_lock);
@@ -676,6 +701,8 @@ esp_err_t aether_audio_player_seek(aether_audio_player_handle_t h, uint32_t posi
     }
     h->seek_ms = position_ms > h->status.duration_ms ? h->status.duration_ms : position_ms;
     ++h->seek_revision;
+    h->status.seek_requested_ms = h->seek_ms;
+    h->status.seeking = true;
     portEXIT_CRITICAL(&h->state_lock);
     xTaskNotifyGive(h->task);
     return ESP_OK;

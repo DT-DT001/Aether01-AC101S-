@@ -560,6 +560,7 @@ static bool test_ime_locked(lv_obj_t *screen)
     unsigned key_count = 0;
     bool pointer_created = false, first_letter = false, tap_composition = false;
     bool tap_candidate = false, swipe_composition = false, swipe_candidate = false;
+    bool dynamic_keys = false;
     if (keyboard) {
         ime_keys_t keys = {0};
         lv_obj_add_event_cb(keyboard, collect_ime_keys, LV_EVENT_DRAW_TASK_ADDED, &keys);
@@ -606,6 +607,25 @@ static bool test_ime_locked(lv_obj_t *screen)
             ime_sample(pointer, &sample, drift, true);
             ime_sample(pointer, &sample, drift, false);
             short_tap = find_label(dock, "q", false) != NULL;
+            app_text_input_show(dock, false);
+            app_text_input_show(dock, true);
+            lv_obj_update_layout(scope);
+            const lv_point_t c = keys.center['c' - 'a'], g = keys.center['g' - 'a'];
+            const lv_point_t h = keys.center['h' - 'a'];
+            const lv_point_t gh_edge = {(g.x + h.x) / 2 - 2, g.y};
+            ime_sample(pointer, &sample, c, true);
+            ime_sample(pointer, &sample, c, false);
+            ime_sample(pointer, &sample, gh_edge, true);
+            ime_sample(pointer, &sample, gh_edge, false);
+            const bool corrected_edge = find_label(dock, "ch", false) != NULL;
+            app_text_input_show(dock, false);
+            app_text_input_show(dock, true);
+            lv_obj_update_layout(scope);
+            ime_sample(pointer, &sample, c, true);
+            ime_sample(pointer, &sample, c, false);
+            ime_sample(pointer, &sample, g, true);
+            ime_sample(pointer, &sample, g, false);
+            dynamic_keys = corrected_edge && find_label(dock, "cg", false) != NULL;
             app_text_input_show(dock, false);
             app_text_input_show(dock, true);
             lv_obj_update_layout(scope);
@@ -691,15 +711,15 @@ static bool test_ime_locked(lv_obj_t *screen)
     lv_obj_delete(scope);
     ESP_LOGI(TAG, "CHECK notes-ime keys=%u pointer=%u first_letter=%u tap_composition=%u tap_candidate=%u"
              " swipe_composition=%u swipe_candidate=%u synthetic_key_taps=%u synthetic_swipe=%u"
-             " segmented_swipe=%u segmented_us=%" PRIi64 " homophone_swipe=%u edge_tap=%u short_tap=%u sparse_glide=%u"
+             " segmented_swipe=%u segmented_us=%" PRIi64 " homophone_swipe=%u edge_tap=%u short_tap=%u dynamic_keys=%u sparse_glide=%u"
              " actions_guarded=%u requested_words=%u meal_glide=%u edge_glide=%u shifted_meal=%u meal_questions=0x%x"
              " cold_available=%u cold_glide=%u"
              " sentence_glide=%u sentence_us=%" PRIi64 " sentence_parts=%u disposable_text=1",
              key_count, pointer_created, first_letter, tap_composition, tap_candidate,
              swipe_composition, swipe_candidate, typed, swiped, segmented_swipe, segmented_us,
-             homophone_swipe, edge_tap, short_tap, sparse_glide, actions_guarded, requested_words, meal_glide, edge_glide, shifted_meal,
+             homophone_swipe, edge_tap, short_tap, dynamic_keys, sparse_glide, actions_guarded, requested_words, meal_glide, edge_glide, shifted_meal,
              meal_questions, cold_available, cold_glide, sentence_glide, sentence_us, sentence_parts);
-    return typed && swiped && segmented_swipe && homophone_swipe && edge_tap && short_tap &&
+    return typed && swiped && segmented_swipe && homophone_swipe && edge_tap && short_tap && dynamic_keys &&
            sparse_glide && actions_guarded && requested_words && meal_glide && edge_glide && shifted_meal &&
            meal_questions == 7U && (!cold_available || cold_glide) &&
            sentence_glide && sentence_parts;
@@ -767,13 +787,39 @@ static bool test_music(probe_t *probe)
         pause_ms(POLL_MS);
         if (aether_audio_player_get_status(probe->ui->audio_player, &audio) != ESP_OK ||
             audio.state == AETHER_AUDIO_ERROR) break;
-        if (audio.position_ms >= 100 && audio.sample_rate) {
+        if (audio.state == AETHER_AUDIO_PLAYING && audio.position_ms >= 100 && audio.sample_rate) {
             ++probe->media_passed;
             ESP_LOGI(TAG, "PASS music-playback position=%" PRIu32 "ms source=%" PRIu32 "Hz",
                      audio.position_ms, audio.sample_rate);
-            return true;
+            break;
         }
     } while (esp_timer_get_time() < deadline);
+    if (audio.active && audio.state == AETHER_AUDIO_PLAYING && audio.position_ms >= 100 && audio.sample_rate) {
+        if (audio.duration_ms < 3000) {
+            ESP_LOGI(TAG, "SKIP music-seek track too short");
+            return true;
+        }
+        /* A position advancing past the target requires PCM to reach the
+         * output API after the decoder and playback route have repositioned. */
+        const uint32_t targets[] = {audio.duration_ms / 8, audio.duration_ms / 16};
+        for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
+            const uint32_t target = targets[i];
+            const int64_t start = esp_timer_get_time();
+            if (aether_audio_player_seek(probe->ui->audio_player, target) != ESP_OK) return false;
+            do {
+                pause_ms(10);
+                if (aether_audio_player_get_status(probe->ui->audio_player, &audio) != ESP_OK ||
+                    audio.state == AETHER_AUDIO_ERROR) return false;
+                if (!audio.seeking && audio.position_ms > target + 25 && audio.position_ms < target + 160) break;
+            } while (esp_timer_get_time() - start < PAGE_TIMEOUT_MS * INT64_C(1000));
+            const bool reached = !audio.seeking && audio.position_ms > target + 25 && audio.position_ms < target + 160;
+            ESP_LOGI(TAG, "CHECK music-seek step=%u mp3=%u target_ms=%" PRIu32 " position_ms=%" PRIu32
+                     " elapsed_us=%" PRIi64 " result=%s", (unsigned)i, audio.mp3, target, audio.position_ms,
+                     esp_timer_get_time() - start, reached ? "PASS" : "FAIL");
+            if (!reached) return false;
+        }
+        return true;
+    }
     ESP_LOGE(TAG, "FAIL music-playback state=%d error=%s", audio.state,
              esp_err_to_name(audio.last_error));
     return false;

@@ -435,6 +435,31 @@ static void test_stop_barrier(aether_audio_player_handle_t h, const char *path)
     puts("PASS stop barrier rejects concurrent selection/next/play while real worker drains codec write");
 }
 
+static void test_queued_seek(aether_audio_player_handle_t player, const char *path)
+{
+    hold_codec_write = true;
+    codec_write_entered = false;
+    assert(aether_audio_player_play(player, path, 55) == ESP_OK);
+    for (unsigned i = 0; i < 1000 && !codec_write_entered; ++i) vTaskDelay(1);
+    assert(codec_write_entered);
+    const unsigned starts_before_seek = starts;
+    assert(aether_audio_player_seek(player, 27000) == ESP_OK);
+    assert(aether_audio_player_seek(player, 6000) == ESP_OK);
+    aether_audio_player_status_t status;
+    assert(aether_audio_player_get_status(player, &status) == ESP_OK);
+    assert(status.seeking && status.seek_requested_ms == 6000 && status.position_ms < 100);
+    hold_codec_write = false;
+    for (unsigned i = 0; i < 1000; ++i) {
+        assert(aether_audio_player_get_status(player, &status) == ESP_OK);
+        if (!status.seeking && status.position_ms > 6000 && starts > starts_before_seek) break;
+        vTaskDelay(1);
+    }
+    assert(!status.seeking && status.position_ms > 6000 && status.position_ms < 6500);
+    assert(starts == starts_before_seek + 1);
+    assert(aether_audio_player_stop_wait(player, 1000) == ESP_OK);
+    puts("PASS latest queued seek replaces a stale target while codec output is busy");
+}
+
 static void test_player(void)
 {
     char first[] = "/tmp/aether_music_one_XXXXXX", second[] = "/tmp/aether_music_two_XXXXXX";
@@ -493,6 +518,7 @@ static void test_player(void)
     const char *paths[] = {first, second};
     assert(aether_audio_player_set_playlist(h, paths, 2) == ESP_OK);
     test_stop_barrier(h, first);
+    test_queued_seek(h, first);
     assert(aether_audio_player_play(h, first, 55) == ESP_OK);
     wait_state(h, AETHER_AUDIO_PLAYING);
     assert(aether_audio_player_next(h, 1) == ESP_OK);

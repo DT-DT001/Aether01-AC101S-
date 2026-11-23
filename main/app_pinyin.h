@@ -15,6 +15,10 @@ typedef struct {
 size_t app_pinyin_lookup(const char *spelling, size_t offset, app_pinyin_candidate_t *out,
                         size_t capacity, bool *has_more);
 
+/* Plausible next letters (bit 0 = a) for an unfinished syllable. Complete,
+ * empty and invalid compositions have no preference. */
+uint32_t app_pinyin_next_letters(const char *composition);
+
 /* Complete spellings only, for gesture recognition. Out-of-range returns NULL. */
 size_t app_pinyin_syllable_count(void);
 size_t app_pinyin_spelling_count(void);

@@ -122,6 +122,56 @@ static void test_wrappers(void)
     free(reference.pcm);
 }
 
+static void test_seek_index_prefix(void)
+{
+    const unsigned copies = 96;
+    FILE *tagged = wrapped(250000, 38 * copies, false);
+    FILE *reference = wrapped(0, -1, false);
+    /* Omit the fixture's truncated 39th frame before concatenating it. */
+    uint8_t complete_frames[15846];
+    FILE *fixture = fopen("tests/player/fixtures/sine-stereo.mp3", "rb");
+    assert(fixture && fread(complete_frames, sizeof(complete_frames), 1, fixture) == 1);
+    fclose(fixture);
+    assert(fseek(tagged, 0, SEEK_END) == 0);
+    for (unsigned i = 0; i < copies; ++i) {
+        assert(fwrite(complete_frames, sizeof(complete_frames), 1, tagged) == 1);
+        assert(fwrite(complete_frames, sizeof(complete_frames), 1, reference) == 1);
+    }
+    rewind(tagged);
+    rewind(reference);
+
+    aether_mp3_stream_t *stream = NULL, *baseline = NULL;
+    assert(aether_mp3_open(tagged, NULL, NULL, &stream) == ESP_OK);
+    assert(aether_mp3_open(reference, NULL, NULL, &baseline) == ESP_OK);
+    assert(aether_mp3_duration_ms(stream) == aether_mp3_duration_ms(baseline));
+
+    const unsigned targets[] = {2000, 1200, 3200, 73121, 71160, 82052, 0, 3100};
+    unsigned reads[sizeof(targets) / sizeof(targets[0])];
+    for (size_t index = 0; index < sizeof(targets) / sizeof(targets[0]); ++index) {
+        aether_mp3_clear_metrics(stream);
+        assert(aether_mp3_seek(stream, targets[index]) == ESP_OK);
+        aether_mp3_metrics_t metrics;
+        aether_mp3_get_metrics(stream, &metrics);
+        reads[index] = metrics.read_calls;
+        assert(aether_mp3_seek(baseline, targets[index]) == ESP_OK);
+        assert(aether_mp3_position_ms(stream) == aether_mp3_position_ms(baseline));
+        int16_t actual[1024], expected[1024];
+        esp_err_t error;
+        assert(aether_mp3_read(stream, actual, 512, &error) == 512 && error == ESP_OK);
+        assert(aether_mp3_read(baseline, expected, 512, &error) == 512 && error == ESP_OK);
+        for (size_t sample = 0; sample < 1024; ++sample)
+            assert(abs((int)actual[sample] - expected[sample]) <= 2);
+    }
+    assert(reads[0] <= 12 && reads[1] <= 4 && reads[2] <= 9);
+    assert(reads[3] > 60 && reads[4] <= 4 && reads[5] <= 24);
+    printf("PASS 95s Xing MP3 exact forward/backwards seek; first early seek %u reads, cached seek %u reads, prefix extension %u reads\n",
+           reads[0], reads[1], reads[2]);
+    aether_mp3_close(stream);
+    aether_mp3_close(baseline);
+    fclose(tagged);
+    fclose(reference);
+}
+
 static void test_rejection_and_cancel(void)
 {
     aether_mp3_stream_t *stream = (void *)1;
@@ -198,6 +248,7 @@ int main(void)
 {
     setbuf(stdout, NULL);
     test_wrappers();
+    test_seek_index_prefix();
     test_rejection_and_cancel();
     test_mpeg_rates();
     return 0;

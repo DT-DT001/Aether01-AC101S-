@@ -52,6 +52,8 @@ struct aether_mp3_stream {
     bool io_error, canceled, ready;
     aether_mp3_metrics_t metrics;
     uint64_t source_base;
+    uint64_t index_next_byte, index_samples;
+    bool index_primed, index_eof;
     uint64_t phase, current_frame, total_frames;
     int16_t before[2], after[2];
     int16_t pcm[2048];
@@ -122,9 +124,8 @@ esp_err_t aether_mp3_open(FILE *file, aether_mp3_cancel_cb_t cancel, void *conte
     memset(s, 0, sizeof(*s));
     s->file = file; s->cancel = cancel; s->context = context;
     s->io = (mp3dec_io_t){.read = file_read, .read_data = s, .seek = file_seek, .seek_data = s};
-    /* Xing/LAME duration is used when present. Otherwise the worker scans the
-     * stream; reads/seeks remain cancelable on stop or card removal. A first
-     * nonzero seek may build the sample index, also on this worker. */
+    /* Xing/LAME provides duration without reading the entire file. The worker
+     * extends the exact sample index on demand for tagged streams. */
     int rc = mp3dec_ex_open_cb(&s->decoder, &s->io, MP3D_SEEK_TO_SAMPLE);
     esp_err_t err = decoder_error(s, rc);
     if (err == ESP_OK && s->decoder.vbr_tag_found && !s->decoder.samples &&
@@ -173,12 +174,70 @@ uint32_t aether_mp3_duration_ms(const aether_mp3_stream_t *s)
 uint32_t aether_mp3_position_ms(const aether_mp3_stream_t *s)
 { return (uint32_t)(s->phase / 48 / (unsigned)s->decoder.info.hz); }
 
+typedef struct {
+    aether_mp3_stream_t *stream;
+    uint64_t first_byte;
+    uint64_t target;
+} mp3_index_range_t;
+
+static int index_seek(uint64_t offset, void *context)
+{
+    const mp3_index_range_t *range = context;
+    return file_seek(range->first_byte + offset, range->stream);
+}
+
+static int index_frame(void *context, const uint8_t *frame, int bytes, int free_format,
+                       size_t available, uint64_t offset, mp3dec_frame_info_t *info)
+{
+    const mp3_index_range_t *range = context;
+    aether_mp3_stream_t *s = range->stream;
+    const uint64_t position = range->first_byte + offset;
+    const int result = mp3dec_load_index(&s->decoder, frame, bytes, free_format, available, position, info);
+    if (result) return result;
+    s->index_next_byte = position + bytes;
+    return s->decoder.samples > range->target ? MP3D_E_USER : 0;
+}
+
+static esp_err_t extend_index(aether_mp3_stream_t *s, uint64_t target)
+{
+    mp3dec_ex_t *dec = &s->decoder;
+    if (!dec->vbr_tag_found || !target || s->index_eof || s->index_samples > target)
+        return ESP_OK;
+
+    /* Reuse minimp3's frame validation and exact sample counts. Stop at the
+     * requested frame, retaining the prefix for later backwards/forward seeks. */
+    mp3_index_range_t range = {.stream = s, .target = target,
+        .first_byte = s->index_next_byte ? s->index_next_byte : dec->start_offset};
+    mp3dec_io_t io = {.read = file_read, .read_data = s, .seek = index_seek, .seek_data = &range};
+    int result = index_seek(0, &range);
+    if (result) return decoder_error(s, MP3D_E_IOERROR);
+
+    const uint64_t duration_samples = dec->samples;
+    dec->samples = s->index_samples;
+    dec->buffer_samples = s->index_primed;
+    if (!s->index_primed) mp3dec_init(&dec->mp3d);
+    result = mp3dec_iterate_cb(&io, (uint8_t *)dec->file.buffer, dec->file.size, index_frame, &range);
+    s->index_samples = dec->samples;
+    s->index_primed = dec->buffer_samples != 0;
+    dec->samples = duration_samples;
+
+    const esp_err_t error = decoder_error(s, result == MP3D_E_USER ? 0 : result);
+    if (error != ESP_OK) return error;
+    if (!dec->index.num_frames) return ESP_ERR_INVALID_SIZE;
+    s->index_eof = result == 0;
+    dec->indexes_built = 1; /* The cached prefix now covers the requested sample. */
+    return ESP_OK;
+}
+
 esp_err_t aether_mp3_seek(aether_mp3_stream_t *s, uint32_t position_ms)
 {
     if (!s) return ESP_ERR_INVALID_ARG;
     uint64_t frame = (uint64_t)position_ms * s->decoder.info.hz / 1000;
     if (frame > s->total_frames) frame = s->total_frames;
-    const esp_err_t err = decoder_error(s, mp3dec_ex_seek(&s->decoder, frame * s->decoder.info.channels));
+    const uint64_t sample = frame * s->decoder.info.channels;
+    esp_err_t err = extend_index(s, sample + s->decoder.start_delay);
+    if (err != ESP_OK) return err;
+    err = decoder_error(s, mp3dec_ex_seek(&s->decoder, sample));
     if (err != ESP_OK) return err;
     s->phase = frame * 48000;
     s->current_frame = frame;

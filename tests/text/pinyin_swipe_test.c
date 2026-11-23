@@ -512,6 +512,35 @@ static void test_question_pronunciations(void)
     puts("PASS both pronunciations of 你是谁 with sparse centered and offset traces");
 }
 
+static void test_contextual_start(void)
+{
+    const point_t g = centers['g' - 'a'];
+    const point_t h = centers['h' - 'a'];
+    const uint32_t continuation = app_pinyin_next_letters("nic");
+    const uint32_t both = continuation | (UINT32_C(1) << ('g' - 'a'));
+    for (int dy = -4; dy <= 4; dy += 4) {
+        /* The G side of the G/H seam, followed by the same A-N-G stem. */
+        point_t points[APP_PINYIN_SWIPE_MAX_POINTS];
+        const size_t count = draw(points, "gang", 0);
+        const point_t start = {(g.x + h.x) / 2 - 3, g.y + dy};
+        const point_t a = centers['a' - 'a'];
+        for (int i = 0; i < 3; ++i)
+            points[i] = (point_t){start.x + (a.x - start.x) * i / 3, start.y + (a.y - start.y) * i / 3};
+        char match[1][APP_PINYIN_SWIPE_MAX_SPELLING + 1];
+        assert(app_pinyin_swipe_decode(points, count, centers, match, 1) && !strcmp(match[0], "gang"));
+        assert(app_pinyin_swipe_decode_context(points, count, centers, both, match, 1) &&
+               !strcmp(match[0], "gang"));
+        assert(app_pinyin_swipe_decode_context(points, count, centers, continuation, match, 1) &&
+               !strcmp(match[0], "hang"));
+    }
+    point_t centered[APP_PINYIN_SWIPE_MAX_POINTS];
+    const size_t count = draw(centered, "gang", 0);
+    char match[1][APP_PINYIN_SWIPE_MAX_SPELLING + 1];
+    assert(app_pinyin_swipe_decode_context(centered, count, centers, continuation, match, 1) &&
+           !strcmp(match[0], "gang"));
+    puts("PASS contextual glide favors H on ambiguous G/H starts and respects intentional G starts");
+}
+
 static void check_dense_swipe(const char *word, int steps, int noise)
 {
     point_t points[APP_PINYIN_SWIPE_MAX_POINTS] = {centers[word[0] - 'a']};
@@ -556,6 +585,7 @@ int main(void)
     test_biased_sentence_swipes();
     test_shallow_h_routes();
     test_question_pronunciations();
+    test_contextual_start();
     test_compaction_keeps_early_bends();
     check_dense_swipe("shezhinaozhong", 20, 3);
     check_dense_swipe("wuxianwangluo", 24, 1);

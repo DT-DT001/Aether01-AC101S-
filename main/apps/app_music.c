@@ -23,7 +23,9 @@ typedef struct {
     size_t count;
     app_scroll_list_t tracks;
     bool loading;
-    bool seeking;
+    bool dragging_seek;
+    uint32_t drag_duration_ms;
+    char drag_track[192];
     bool was_mounted;
     bool resume_checked;
     bool resume_directory;
@@ -578,23 +580,76 @@ static void refresh_volume(music_page_t *p)
     else lv_obj_add_state(p->volume, LV_STATE_DISABLED);
 }
 
+static bool can_seek(const aether_audio_player_status_t *s)
+{
+    return s->active && !s->closing && s->duration_ms &&
+        (s->state == AETHER_AUDIO_PLAYING || s->state == AETHER_AUDIO_PAUSED);
+}
+
+static bool same_seek_track(const music_page_t *p, const aether_audio_player_status_t *s)
+{
+    return can_seek(s) && p->drag_duration_ms == s->duration_ms && !strcmp(p->drag_track, s->path);
+}
+
+static uint32_t drag_position_ms(const music_page_t *p)
+{
+    return (uint32_t)((uint64_t)p->drag_duration_ms * lv_slider_get_value(p->progress) / 1000);
+}
+
+static void show_elapsed(music_page_t *p, uint32_t position_ms)
+{
+    const uint32_t seconds = position_ms / 1000;
+    app_ui_label_fmt(p->elapsed, "%02lu:%02lu", (unsigned long)(seconds / 60), (unsigned long)(seconds % 60));
+}
+
+static void sync_progress(music_page_t *p, const aether_audio_player_status_t *s)
+{
+    if (p->dragging_seek && !same_seek_track(p, s)) p->dragging_seek = false;
+    if (p->dragging_seek) return;
+    const uint32_t position = can_seek(s) && s->seeking ? s->seek_requested_ms : s->position_ms;
+    const uint32_t slider_ms = position > s->duration_ms ? s->duration_ms : position;
+    lv_slider_set_value(p->progress, s->duration_ms ?
+        (int32_t)(((uint64_t)slider_ms * 1000 + s->duration_ms / 2) / s->duration_ms) : 0, LV_ANIM_OFF);
+    show_elapsed(p, position);
+}
+
 static void seek_event(lv_event_t *e)
 {
     const lv_event_code_t code = lv_event_get_code(e);
     if (code != LV_EVENT_PRESSED && code != LV_EVENT_RELEASED &&
-        code != LV_EVENT_PRESS_LOST && code != LV_EVENT_INDEV_RESET) return;
+        code != LV_EVENT_PRESS_LOST && code != LV_EVENT_INDEV_RESET && code != LV_EVENT_VALUE_CHANGED) return;
     /* The old screen can still receive input and deletion events while its
      * successor owns the shared UI context. Only the live slider may seek. */
     music_page_t *p = page(e);
     if (!p || lv_event_get_current_target_obj(e) != p->progress || !p->ui->audio_player) return;
-    if (code == LV_EVENT_PRESSED) p->seeking = true;
-    if (code == LV_EVENT_RELEASED && p->seeking) {
-        aether_audio_player_status_t s;
-        aether_audio_player_get_status(p->ui->audio_player, &s);
-        if (s.active) aether_audio_player_seek(p->ui->audio_player,
-            (uint32_t)((uint64_t)s.duration_ms * lv_slider_get_value(p->progress) / 1000));
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        if (p->dragging_seek) show_elapsed(p, drag_position_ms(p));
+        return;
     }
-    if (code != LV_EVENT_PRESSED) p->seeking = false;
+    aether_audio_player_status_t s;
+    if (aether_audio_player_get_status(p->ui->audio_player, &s) != ESP_OK || s.closing) {
+        p->dragging_seek = false;
+        return;
+    }
+    if (code == LV_EVENT_PRESSED) {
+        p->dragging_seek = can_seek(&s);
+        if (p->dragging_seek) {
+            p->drag_duration_ms = s.duration_ms;
+            strlcpy(p->drag_track, s.path, sizeof(p->drag_track));
+            show_elapsed(p, drag_position_ms(p));
+        }
+        return;
+    }
+    const bool commit = code == LV_EVENT_RELEASED && p->dragging_seek && same_seek_track(p, &s);
+    p->dragging_seek = false;
+    if (commit) {
+        const uint32_t target = drag_position_ms(p);
+        if (aether_audio_player_seek(p->ui->audio_player, target) == ESP_OK) {
+            show_elapsed(p, target);
+            return;
+        }
+    }
+    sync_progress(p, &s);
 }
 
 static void music_timer(lv_timer_t *timer)
@@ -606,9 +661,15 @@ static void music_timer(lv_timer_t *timer)
     if (!ui->audio_player) return;
     aether_audio_player_status_t s = {0};
     /* The outgoing page can still be releasing a recording or song. */
-    if (aether_audio_player_get_status(ui->audio_player, &s) != ESP_OK || s.closing) return;
+    if (aether_audio_player_get_status(ui->audio_player, &s) != ESP_OK || s.closing) {
+        p->dragging_seek = false;
+        return;
+    }
     const bool mounted = music_storage_ready(ui, s.active ? s.path : p->library_dir);
     if (!mounted) {
+        p->dragging_seek = false;
+        s.seeking = false;
+        sync_progress(p, &s);
         update_lyrics(p, &s, false);
         if (p->resume_directory && !s.active && !p->loading && music_storage_ready(ui, NULL)) {
             refresh_default_catalog(p);
@@ -627,19 +688,18 @@ static void music_timer(lv_timer_t *timer)
     if (p->retry_at_us && !p->loading && esp_timer_get_time() >= p->retry_at_us) refresh_catalog(p);
     if (s.path[0]) show_title(p, s.path);
     update_lyrics(p, &s, !s.path[0] || music_storage_ready(ui, s.path));
-    const uint32_t seconds = s.position_ms / 1000, total = s.duration_ms / 1000;
-    app_ui_label_fmt(p->elapsed, "%02lu:%02lu", (unsigned long)(seconds / 60), (unsigned long)(seconds % 60));
+    sync_progress(p, &s);
+    const uint32_t total = s.duration_ms / 1000;
     app_ui_label_fmt(p->duration, "%02lu:%02lu", (unsigned long)(total / 60), (unsigned long)(total % 60));
     if (s.track_count) app_ui_label_fmt(p->track_count, "%u / %u", s.track_index + 1, s.track_count);
     else app_ui_label_text(p->track_count, "");
-    if (!p->seeking) lv_slider_set_value(p->progress, s.duration_ms ?
-        (int32_t)((uint64_t)s.position_ms * 1000 / s.duration_ms) : 0, LV_ANIM_OFF);
     app_ui_label_text(p->play_label, s.state == AETHER_AUDIO_PLAYING ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     static const char *const modes[] = {"列表循环", "单曲循环", "随机播放"};
     app_ui_label_text(p->repeat_label, modes[s.repeat <= AETHER_AUDIO_SHUFFLE ? s.repeat : 0]);
     if (!p->loading) {
         if (s.state == AETHER_AUDIO_ERROR) app_ui_label_fmt(p->status, "播放失败：%s", esp_err_to_name(s.last_error));
         else if (s.state == AETHER_AUDIO_STARTING) app_ui_label_text(p->status, "正在打开音乐…");
+        else if (s.seeking && can_seek(&s)) app_ui_label_text(p->status, "正在定位…");
         else if (s.state == AETHER_AUDIO_PLAYING || s.state == AETHER_AUDIO_PAUSED) {
             app_ui_label_fmt(p->status, "%s  %lu Hz · %s · %s",
                 s.state == AETHER_AUDIO_PAUSED ? "已暂停" : "播放中",

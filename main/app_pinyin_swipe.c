@@ -313,10 +313,35 @@ typedef struct {
     const char **words;
     uint32_t scores[APP_PINYIN_SWIPE_MAX_MATCHES];
     size_t count, capacity;
+    uint32_t preferred_starts, start_bonus;
 } swipe_ranking_t;
+
+static uint32_t preferred_starts(const swipe_path_t *path, const point_t centers[26], uint32_t next_letters)
+{
+    if (!next_letters) return 0;
+    const uint32_t unit = path->width * path->width;
+    uint32_t distances[26];
+    uint32_t nearest = UINT32_MAX;
+    for (unsigned i = 0; i < 26; ++i) {
+        distances[i] = squared_distance(path->points[0], centers[i]);
+        if (distances[i] < nearest) nearest = distances[i];
+    }
+    if (nearest < unit / 9U) return 0;
+
+    /* Keep context within 60% of a key pitch and close to the nearest key.
+     * A preference needs both a plausible favored and unfavored start. */
+    uint32_t nearby = 0;
+    for (unsigned i = 0; i < 26; ++i) {
+        if (distances[i] <= 9U * unit / 25U && distances[i] - nearest <= unit / 6U)
+            nearby |= UINT32_C(1) << i;
+    }
+    return nearby & ~next_letters ? nearby & next_letters : 0;
+}
 
 static void rank_candidate(swipe_ranking_t *ranking, const char *word, uint32_t score)
 {
+    if (ranking->preferred_starts & (UINT32_C(1) << (word[0] - 'a')))
+        score -= score < ranking->start_bonus ? score : ranking->start_bonus;
     size_t index = 0;
     for (; index < ranking->count && ranking->scores[index] <= score; ++index)
         if (!strcmp(ranking->words[index], word)) return;
@@ -899,15 +924,19 @@ static void rank_common_words(const swipe_path_t *path, const point_t centers[26
     }
 }
 
-size_t app_pinyin_swipe_decode(const point_t *points, size_t point_count, const point_t centers[26],
-                              char matches[][APP_PINYIN_SWIPE_MAX_SPELLING + 1], size_t match_capacity)
+size_t app_pinyin_swipe_decode_context(const point_t *points, size_t point_count, const point_t centers[26],
+                                      uint32_t next_letters,
+                                      char matches[][APP_PINYIN_SWIPE_MAX_SPELLING + 1], size_t match_capacity)
 {
     swipe_path_t path;
     if (!matches || !match_capacity || !prepare_path(points, point_count, centers, true, &path)) return 0;
     if (match_capacity > APP_PINYIN_SWIPE_MAX_MATCHES) match_capacity = APP_PINYIN_SWIPE_MAX_MATCHES;
     const char *known[APP_PINYIN_SWIPE_MAX_MATCHES];
-    swipe_ranking_t ranking = {.words = known, .capacity = match_capacity};
     const uint32_t unit = path.width * path.width;
+    swipe_ranking_t ranking = {
+        .words = known, .capacity = match_capacity,
+        .preferred_starts = preferred_starts(&path, centers, next_letters), .start_bonus = unit / 4U,
+    };
     rank_words(&path, centers, app_pinyin_spelling_count(), dictionary_word, NULL, true, &ranking);
     const bool needs_syllables = !ranking.count || ranking.scores[0] > 2U * unit;
     rank_common_words(&path, centers, &ranking, false);
@@ -954,4 +983,10 @@ size_t app_pinyin_swipe_decode(const point_t *points, size_t point_count, const 
         }
     }
     return copied;
+}
+
+size_t app_pinyin_swipe_decode(const point_t *points, size_t point_count, const point_t centers[26],
+                              char matches[][APP_PINYIN_SWIPE_MAX_SPELLING + 1], size_t match_capacity)
+{
+    return app_pinyin_swipe_decode_context(points, point_count, centers, 0, matches, match_capacity);
 }

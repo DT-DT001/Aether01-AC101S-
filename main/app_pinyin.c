@@ -55,6 +55,37 @@ const char *app_pinyin_spelling_at(size_t index)
     return index < ARRAY_COUNT(phrases) ? phrases[index].spelling : NULL;
 }
 
+uint32_t app_pinyin_next_letters(const char *composition)
+{
+    if (!composition) return 0;
+    size_t length = 0;
+    while (length < APP_PINYIN_MAX_SPELLING &&
+           composition[length] >= 'a' && composition[length] <= 'z') ++length;
+    if (!length || length == APP_PINYIN_MAX_SPELLING || composition[length]) return 0;
+
+    /* A partial suffix contributes only if every preceding syllable is valid.
+     * One complete segmentation is enough to keep the next key unconstrained. */
+    bool boundary[APP_PINYIN_MAX_SPELLING + 1] = {true};
+    uint32_t letters = 0;
+    for (size_t start = 0; start < length; ++start) {
+        if (!boundary[start]) continue;
+        const char *tail = composition + start;
+        for (size_t i = 0; i < ARRAY_COUNT(syllables); ++i) {
+            const char *syllable = syllables[i].spelling;
+            if (*syllable != *tail) continue;
+            size_t matched = 1;
+            while (syllable[matched] && syllable[matched] == tail[matched]) ++matched;
+            if (!syllable[matched]) {
+                if (start + matched == length) return 0;
+                boundary[start + matched] = true;
+            } else if (!tail[matched]) {
+                letters |= UINT32_C(1) << (syllable[matched] - 'a');
+            }
+        }
+    }
+    return letters;
+}
+
 size_t app_pinyin_common_phrase_count(void)
 {
     return COMMON_PHRASE_COUNT;

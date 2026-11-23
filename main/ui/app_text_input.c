@@ -69,7 +69,7 @@ typedef struct {
     char alternatives[SWIPE_MATCHES - 1][APP_PINYIN_SWIPE_MAX_SPELLING + 1];
     size_t alternative_count, alternative_prefix, candidate_offset, next_offset;
     app_pinyin_swipe_point_t centers[26], trace[APP_PINYIN_SWIPE_MAX_POINTS];
-    uint32_t center_mask;
+    uint32_t center_mask, trace_next_letters;
     size_t trace_count;
     meteor_sample_t meteor[METEOR_POINTS];
     size_t meteor_count;
@@ -533,19 +533,47 @@ static void sample_trace(text_input_t *input, app_pinyin_swipe_point_t point, bo
     record_meteor(input, point);
 }
 
-static char initial_letter(const text_input_t *input, app_pinyin_swipe_point_t sample)
+static int key_distance(app_pinyin_swipe_point_t point, app_pinyin_swipe_point_t center)
+{
+    const int x = point.x - center.x, y = point.y - center.y;
+    return x * x + y * y;
+}
+
+static char initial_letter(text_input_t *input, app_pinyin_swipe_point_t sample)
 {
     const char *key = selected_key(input->keyboard);
-    if (key) return letter_key(key) ? key[0] : '\0';
+    if (key && !letter_key(key)) return '\0';
+
     /* A start between two letter caps can still begin the stroke. Explicit
      * symbol, space and action keys keep their original hit targets. */
     int best = 29 * 29;
-    char letter = '\0';
+    char letter = key ? key[0] : '\0';
+    if (!letter) {
+        for (unsigned i = 0; i < 26; ++i) {
+            if (!(input->center_mask & (1UL << i))) continue;
+            const int distance = key_distance(sample, input->centers[i]);
+            if (distance < best) {
+                best = distance;
+                letter = (char)('a' + i);
+            }
+        }
+    }
+    if (!letter) return '\0';
+
+    input->trace_next_letters = app_pinyin_next_letters(input->composition);
+    const unsigned index = letter - 'a';
+    if (!input->trace_next_letters || !(input->center_mask & (1UL << index)) ||
+        (input->trace_next_letters & (1UL << index))) return letter;
+
+    /* Shift a boundary by at most about a tenth of a key's pitch. A tap on
+     * the center of any key remains intentional, even with an invalid prefix. */
+    const int pitch = input->centers['s' - 'a'].x - input->centers[0].x;
+    if (pitch <= 0) return letter;
+    best = key_distance(sample, input->centers[index]) + pitch * pitch / 5;
+    const uint32_t eligible = input->trace_next_letters & input->center_mask;
     for (unsigned i = 0; i < 26; ++i) {
-        if (!(input->center_mask & (1UL << i))) continue;
-        const int x = sample.x - input->centers[i].x;
-        const int y = sample.y - input->centers[i].y;
-        const int distance = x * x + y * y;
+        if (!(eligible & (1UL << i))) continue;
+        const int distance = key_distance(sample, input->centers[i]);
         if (distance < best) {
             best = distance;
             letter = (char)('a' + i);
@@ -641,8 +669,8 @@ static void keyboard_pointer(lv_event_t *event)
         if (append_spelling(input, tap)) composition_changed(input);
     } else if (input->center_mask == ((1UL << 26) - 1)) {
         const size_t points = trim_edge_excursions(input);
-        const size_t count = app_pinyin_swipe_decode(input->trace, points, input->centers,
-                                                    input->matches, SWIPE_MATCHES);
+        const size_t count = app_pinyin_swipe_decode_context(input->trace, points, input->centers,
+                                                            input->trace_next_letters, input->matches, SWIPE_MATCHES);
         if (count && append_spelling(input, input->matches[0])) {
             input->pending_swipe = true;
             input->alternative_count = count - 1;

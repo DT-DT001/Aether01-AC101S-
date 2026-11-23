@@ -28,3 +28,8 @@ size_t app_pinyin_swipe_match(const app_pinyin_swipe_point_t *points, size_t poi
 size_t app_pinyin_swipe_decode(const app_pinyin_swipe_point_t *points, size_t point_count,
                               const app_pinyin_swipe_point_t centers[26],
                               char matches[][APP_PINYIN_SWIPE_MAX_SPELLING + 1], size_t match_capacity);
+
+/* Use the next-letter mask only to break geometric near-ties at touch-down. */
+size_t app_pinyin_swipe_decode_context(const app_pinyin_swipe_point_t *points, size_t point_count,
+                                      const app_pinyin_swipe_point_t centers[26], uint32_t next_letters,
+                                      char matches[][APP_PINYIN_SWIPE_MAX_SPELLING + 1], size_t match_capacity);

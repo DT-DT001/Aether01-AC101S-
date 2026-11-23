@@ -528,6 +528,29 @@ static void test_pinyin_pointer(lv_display_t *display, lv_obj_t *field, lv_obj_t
     alarm_pointer_sample(input, q.x + 17, q.y, false);
     assert(visible_label(dock, "q") && !strcmp(lv_textarea_get_text(field), ""));
     tap_key(input, keyboard, &keys, LV_SYMBOL_BACKSPACE);
+
+    const lv_point_t g = key_center(keyboard, &keys, "g");
+    const lv_point_t h = key_center(keyboard, &keys, "h");
+    for (int error = 1; error <= 3; ++error) {
+        const int x = (g.x + h.x) / 2 - error;
+        alarm_pointer_sample(input, x, g.y, true);
+        alarm_pointer_sample(input, x, g.y, false);
+        assert(visible_label(dock, "g"));
+        tap_key(input, keyboard, &keys, LV_SYMBOL_BACKSPACE);
+        tap_key(input, keyboard, &keys, "c");
+        alarm_pointer_sample(input, x, g.y, true);
+        alarm_pointer_sample(input, x, g.y, false);
+        assert(visible_label(dock, "ch"));
+        tap_key(input, keyboard, &keys, LV_SYMBOL_BACKSPACE);
+        tap_key(input, keyboard, &keys, LV_SYMBOL_BACKSPACE);
+    }
+    tap_key(input, keyboard, &keys, "c");
+    tap_key(input, keyboard, &keys, "g");
+    assert(visible_label(dock, "cg"));
+    tap_key(input, keyboard, &keys, LV_SYMBOL_BACKSPACE);
+    tap_key(input, keyboard, &keys, LV_SYMBOL_BACKSPACE);
+    puts("PASS dynamic Pinyin touch boundaries correct 1–3 px errors while preserving neutral and deliberate taps");
+
     tap_key(input, keyboard, &keys, "n");
     assert(visible_label(dock, "n") && !strcmp(lv_textarea_get_text(field), ""));
     tap_key(input, keyboard, &keys, "i");

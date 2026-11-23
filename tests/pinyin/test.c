@@ -102,8 +102,29 @@ static void check_catalog(void)
     assert(app_pinyin_common_phrase_priority(SIZE_MAX) == 0);
 }
 
+static void check_unfinished_syllables(void)
+{
+    const uint32_t h = UINT32_C(1) << ('h' - 'a');
+    const uint32_t g = UINT32_C(1) << ('g' - 'a');
+    const uint32_t i = UINT32_C(1) << ('i' - 'a');
+    const uint32_t continuation = app_pinyin_next_letters("c");
+    assert((continuation & (h | i)) == (h | i) && !(continuation & g));
+    assert(app_pinyin_next_letters("nic") == continuation);
+    assert(app_pinyin_next_letters("nihaonic") == continuation);
+    assert(app_pinyin_next_letters("ch") & i);
+    assert(!app_pinyin_next_letters("nihao") && !app_pinyin_next_letters("xian"));
+    assert(!app_pinyin_next_letters(NULL) && !app_pinyin_next_letters(""));
+    assert(!app_pinyin_next_letters("xzc") && !app_pinyin_next_letters("ni!c"));
+    char long_spelling[APP_PINYIN_MAX_SPELLING + 2];
+    memset(long_spelling, 'n', sizeof(long_spelling) - 1);
+    long_spelling[sizeof(long_spelling) - 1] = '\0';
+    assert(!app_pinyin_next_letters(long_spelling));
+    puts("PASS next-letter mask uses valid syllable boundaries and leaves complete or invalid input unbiased");
+}
+
 int main(void)
 {
+    check_unfinished_syllables();
     first("ni", "你", 2);
     first("zhong", "中", 5);
     first("shuang", "双", 6);

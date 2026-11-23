@@ -46,12 +46,14 @@ typedef struct {
     char path[192];
     uint32_t position_ms;
     uint32_t duration_ms;
+    uint32_t seek_requested_ms; /* Target reported while seeking is true. */
     uint32_t sample_rate;
     uint16_t channels;
     uint8_t volume;
     aether_audio_repeat_t repeat;
     aether_audio_eq_t eq;
     bool active;
+    bool seeking;
     bool closing; /* Session release remains pending until codec and playlist are free. */
     esp_err_t settings_error;
     bool preferences_pending; /* Actual worker-owned NVS dirty state, including resume. */

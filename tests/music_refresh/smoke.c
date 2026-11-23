@@ -1,6 +1,8 @@
 /* Reuse hardware/service doubles. Supply a controllable async IO queue. */
 #define APP_VOLUME_UI_DOUBLES_ONLY
+#define aether_audio_player_seek count_music_seek
 #include "../volume_ui/smoke.c"
+#undef aether_audio_player_seek
 #include "app_lyrics.h"
 
 static unsigned io_requests;
@@ -15,6 +17,16 @@ static const app_io_result_t *preparing_catalog;
 static unsigned resume_checks, play_requests;
 static uint32_t play_position;
 static bool restore_busy_once;
+static bool reject_seek;
+
+esp_err_t aether_audio_player_seek(aether_audio_player_handle_t h, uint32_t position_ms)
+{
+    if (reject_seek) return ESP_ERR_INVALID_STATE;
+    const esp_err_t error = count_music_seek(h, position_ms);
+    music.seeking = true;
+    music.seek_requested_ms = position_ms;
+    return error;
+}
 
 esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t h, char *path, size_t size)
 {
@@ -280,6 +292,7 @@ static void test_seek_screen_handoff(app_ui_t *ui, lv_indev_t *input)
     lv_obj_t *old_slider = progress_slider(ui);
     assert(old_slider);
     music.active = true;
+    music.state = AETHER_AUDIO_PLAYING;
     music.duration_ms = 60000;
     lv_slider_set_value(old_slider, 250, LV_ANIM_OFF);
     lv_obj_send_event(old_slider, LV_EVENT_PRESSED, input);
@@ -319,6 +332,7 @@ static void test_seek_screen_handoff(app_ui_t *ui, lv_indev_t *input)
     lv_obj_t *current_slider = progress_slider(ui);
     assert(current_slider && current_slider != old_slider && lv_obj_is_valid(old_slider));
     music.active = true;
+    music.state = AETHER_AUDIO_PLAYING;
     music.duration_ms = 60000;
     lv_slider_set_value(current_slider, 750, LV_ANIM_OFF);
     lv_obj_send_event(current_slider, LV_EVENT_PRESSED, input);
@@ -331,6 +345,63 @@ static void test_seek_screen_handoff(app_ui_t *ui, lv_indev_t *input)
     assert(!lv_obj_is_valid(old_screen) && !lv_obj_is_valid(old_slider));
     assert(lv_obj_is_valid(current_slider) && music_seek_requests == requests + 1);
     puts("PASS real LVGL deferred player deletion and stale slider reset/release preserve recordings and reopened seek state");
+}
+
+static void test_seek_feedback(app_ui_t *ui, lv_indev_t *input)
+{
+    lv_obj_t *slider = progress_slider(ui);
+    assert(slider);
+    music.state = AETHER_AUDIO_PLAYING;
+    music.active = true;
+    music.seeking = false;
+    music.duration_ms = 61337;
+    music.position_ms = 6000;
+    advance(150);
+    const unsigned requests = music_seek_requests;
+    assert(find(ui->screen, "00:06"));
+
+    lv_obj_send_event(slider, LV_EVENT_PRESSED, input);
+    lv_slider_set_value(slider, 671, LV_ANIM_OFF);
+    lv_obj_send_event(slider, LV_EVENT_VALUE_CHANGED, NULL);
+    assert(find(ui->screen, "00:41") && music_seek_requests == requests);
+    advance(250);
+    assert(lv_slider_get_value(slider) == 671 && find(ui->screen, "00:41"));
+    lv_obj_send_event(slider, LV_EVENT_RELEASED, input);
+    assert(music_seek_requests == requests + 1 && music_seek_position == 41157);
+
+    music.position_ms = 6350; /* Old playhead can advance until the backend applies the request. */
+    advance(260);
+    assert(lv_slider_get_value(slider) == 671 && find(ui->screen, "00:41") && find(ui->screen, "正在定位…"));
+
+    lv_obj_send_event(slider, LV_EVENT_PRESSED, input);
+    lv_slider_set_value(slider, 333, LV_ANIM_OFF);
+    lv_obj_send_event(slider, LV_EVENT_VALUE_CHANGED, NULL);
+    assert(find(ui->screen, "00:20"));
+    lv_obj_send_event(slider, LV_EVENT_RELEASED, input);
+    assert(music_seek_requests == requests + 2 && music_seek_position == 20425);
+    advance(260);
+    assert(lv_slider_get_value(slider) == 333 && find(ui->screen, "00:20"));
+
+    music.seeking = false;
+    music.position_ms = 22000;
+    music.state = AETHER_AUDIO_PAUSED;
+    advance(150);
+    assert(lv_slider_get_value(slider) == 359 && find(ui->screen, "00:22") && !find(ui->screen, "正在定位…"));
+
+    reject_seek = true;
+    lv_obj_send_event(slider, LV_EVENT_PRESSED, input);
+    lv_slider_set_value(slider, 900, LV_ANIM_OFF);
+    lv_obj_send_event(slider, LV_EVENT_RELEASED, input);
+    assert(lv_slider_get_value(slider) == 359 && find(ui->screen, "00:22"));
+    reject_seek = false;
+
+    lv_obj_send_event(slider, LV_EVENT_PRESSED, input);
+    lv_slider_set_value(slider, 900, LV_ANIM_OFF);
+    strlcpy(music.path, "/sdcard/Music/next.mp3", sizeof(music.path));
+    music.position_ms = 1000;
+    lv_obj_send_event(slider, LV_EVENT_RELEASED, input);
+    assert(music_seek_requests == requests + 2 && find(ui->screen, "00:01"));
+    puts("PASS drag time preview, pending seek replacement, acknowledgement, rejection, and track handoff");
 }
 
 static void test_lrc_parser(void)
@@ -469,6 +540,7 @@ int main(void)
     test_resume(&ui);
     test_recording_playlist_scope(&ui);
     test_seek_screen_handoff(&ui, input);
+    test_seek_feedback(&ui, input);
     test_synchronized_lyrics(&ui);
     if(ui.timer)lv_timer_delete(ui.timer);
     const unsigned releases=music_page_releases;

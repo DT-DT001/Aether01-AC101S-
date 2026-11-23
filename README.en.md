@@ -20,7 +20,7 @@ Swipe up from the desktop to open the app drawer. Returning to the drawer restor
 
 The firmware includes music playback with a live five-band EQ, video, recording, a TXT reader, NES emulation, USB OTG, Wi-Fi, Bluetooth controls, and ESP-NOW push-to-talk. Everyday tools include alarms, notes, a calendar, and weather. 2048 supports swipe and tilt controls. Sokoban and Snake respond to directional touch regions, and Snake also supports tilt.
 
-Music playback supports synchronized LRC lyrics and remembers playback position. The recorder shows a live waveform and has its own recording list. The offline Pinyin keyboard supports glide typing and an optional vocabulary extension. Long-press a file to see its details, copy it, move it, or delete it.
+Music playback supports synchronized LRC lyrics, previews the target time while scrubbing, and remembers playback position. The recorder shows a live waveform and has its own recording list. The offline Pinyin keyboard supports glide typing, context-sensitive touch boundaries, and an optional vocabulary extension. Long-press a file to see its details, copy it, move it, or delete it.
 
 Build from this checkout using an ESP-IDF 6.1 environment with ESP32-S31 support.
 
