@@ -12,6 +12,15 @@
 
 ![2048、推箱子、贪吃蛇和跳一跳](docs/images/03-built-in-games.png)
 
+<details>
+<summary>实用工具与连接界面</summary>
+
+![文件操作、运动姿态、短程位移与卫星定位](docs/images/04-device-tools.png)
+
+![电脑键鼠、OBS 切换台与 USB 传输](docs/images/05-connectivity.png)
+
+</details>
+
 图中的 480 × 480 界面由当前固件的 LVGL 界面渲染，内容使用演示数据。
 
 ## 硬件与功能
