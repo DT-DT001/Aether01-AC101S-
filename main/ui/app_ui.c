@@ -7,6 +7,7 @@
 #include "app_telemetry.h"
 #include "app_intercom.h"
 #include "app_utilities.h"
+#include "aether_recorder.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -199,6 +200,7 @@ lv_obj_t *app_ui_new_screen(app_ui_t *ui)
     ui->page_context = NULL;
     ui->page_can_exit = NULL;
     ui->page_back = NULL;
+    ui->page_suspend = NULL;
     ui->files_return = (app_files_return_t){0};
     for (size_t i = 0; i < sizeof(ui->app_obj) / sizeof(ui->app_obj[0]); ++i) {
         ui->app_obj[i] = NULL;
@@ -224,7 +226,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
 
     lv_obj_t *back = lv_button_create(screen);
     lv_obj_set_size(back, 48, 44);
-    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 12);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET);
     lv_obj_set_style_radius(back, 14, 0);
     lv_obj_set_style_bg_color(back, lv_color_hex(0x232842), 0);
     lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, ui);
@@ -235,7 +237,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
                     app_ui_chinese_font_size(24));
 
     lv_obj_t *battery = app_battery_create(screen, 70);
-    if (battery) lv_obj_align(battery, LV_ALIGN_TOP_RIGHT, -14, 20);
+    if (battery) lv_obj_align(battery, LV_ALIGN_TOP_RIGHT, -APP_HEADER_SIDE_INSET, 20);
 
     lv_obj_t *content = lv_obj_create(screen);
     lv_obj_set_size(content, 448, 394);
@@ -458,7 +460,29 @@ esp_err_t app_ui_quiesce_storage_resume(app_ui_t *ui)
 
 bool app_ui_input_blocked(const app_ui_t *ui)
 {
-    return !ui || app_io_is_quiescing(ui->io) || atomic_load(&ui->storage_resume_pending);
+    return !ui || atomic_load(&ui->screen_suspended) ||
+        app_io_is_quiescing(ui->io) || atomic_load(&ui->storage_resume_pending);
+}
+
+void app_ui_screen_suspend(void *context, bool suspended)
+{
+    app_ui_t *ui = context;
+    if (!ui || atomic_exchange(&ui->screen_suspended, suspended) == suspended) return;
+    if (suspended) {
+        app_ui_media_control_gate(ui, true, true);
+        app_display_metrics_set_active(false);
+        for (lv_indev_t *input = lv_indev_get_next(NULL); input; input = lv_indev_get_next(input)) {
+            lv_indev_reset(input, NULL);
+            lv_indev_wait_release(input);
+        }
+    }
+    aether_audio_player_set_screen_suspended(ui->audio_player, suspended);
+    aether_video_player_set_screen_paused(ui->video_player, suspended);
+    if (ui->nes) (void)aether_nes_set_screen_paused(ui->nes, suspended);
+    aether_recorder_set_screen_paused(aether_recorder_get_default(), suspended);
+    app_telemetry_set_screen_suspended(suspended);
+    if (ui->page_suspend) ui->page_suspend(ui, suspended);
+    if (!suspended) lv_timer_ready(ui->service_timer);
 }
 
 esp_err_t app_ui_start(aether_board_t *board,
@@ -482,6 +506,7 @@ esp_err_t app_ui_start(aether_board_t *board,
     ui->touch_indev = touch_indev;
     ui->power = power;
     atomic_init(&ui->storage_resume_pending, false);
+    atomic_init(&ui->screen_suspended, false);
     esp_err_t err = app_ui_media_control_init(ui);
     if (err != ESP_OK) { free(ui); return err; }
     err = app_frames_new(&ui->frames);

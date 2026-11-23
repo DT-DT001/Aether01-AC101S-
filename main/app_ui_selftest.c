@@ -23,10 +23,13 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_pm.h"
 #include "esp_timer.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "app_ui_selftest_mic.h"
 #include "app_ui_selftest_files.h"
+#include "app_ui_selftest_nes.h"
 
 enum { ROUNDS = 8, DRAWER_BACK_ROUND = 2, PAGE_TIMEOUT_MS = 5000, POLL_MS = 40 };
 static const char *const TAG = "ui_selftest";
@@ -53,14 +56,14 @@ static const route_t routes[] = {
     [READER] = {"reader", "小说阅读", "阅读"},
     [VIDEO] = {"video-picker", "选择视频", "视频"},
     [FILES] = {"files", "文件浏览", "文件"},
-    [GAMES] = {"games", "游戏", "游戏"},
+    [GAMES] = {"games", "小游戏", "小游戏"},
     [NES] = {"nes-picker", "选择 NES 游戏", "NES 游戏"},
     [RECORDER] = {"recorder", "录音机", "录音"},
     [SETTINGS] = {"settings", "设置", "设置"},
     [MOTION] = {"motion", "运动与姿态", "运动"},
     [PRESSURE] = {"barometer", "气压与高度", "气压高度"},
     [DISPLACEMENT] = {"displacement", "短程位移", "位移测量"},
-    [REMOTE] = {"pc-remote", "电脑键鼠", "电脑遥控"},
+    [REMOTE] = {"pc-remote", "空中飞鼠", "空中飞鼠"},
     [OBS] = {"obs-switcher", "OBS 切换台", "OBS 切换"},
     [INTERCOM] = {"intercom", "无线对讲", "无线对讲"},
     [GPS] = {"gps", "卫星定位", "定位"},
@@ -104,6 +107,50 @@ extern bool app_intercom_busy(void) __attribute__((weak));
 static void pause_ms(unsigned ms)
 {
     vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+static bool wait_screen(app_power_t *power, bool asleep)
+{
+    const int64_t limit = esp_timer_get_time() + INT64_C(3000000);
+    app_power_status_t state;
+    do {
+        pause_ms(20);
+        if (app_power_get_status(power, &state) != ESP_OK) return false;
+        if (state.sleeping == asleep && app_power_is_sleeping(power) == asleep &&
+            state.display_error == ESP_OK) {
+            pause_ms(20);
+            return true;
+        }
+    } while (esp_timer_get_time() < limit);
+    return false;
+}
+
+static bool screen_transition(app_power_t *power, bool asleep)
+{
+    const esp_err_t error = asleep ? app_power_sleep_now(power) : app_power_wake(power);
+    return error == ESP_OK && wait_screen(power, asleep);
+}
+
+static bool test_idle_suspend(probe_t *probe)
+{
+    app_power_t *power = probe->ui->power;
+    const uint32_t timeout = app_power_get_timeout(power);
+    bool ok = app_power_set_timeout(power, 1, false) == ESP_OK;
+    for (unsigned pass = 0; pass < 3 && ok; ++pass) {
+        if (!lvgl_port_lock(1000)) { ok = false; break; }
+        lv_display_trigger_activity(lv_display_get_default());
+        lvgl_port_unlock();
+        const bool slept = wait_screen(power, true);
+        const uint32_t tick = lv_tick_get();
+        pause_ms(300);
+        const uint32_t elapsed = lv_tick_get() - tick;
+        if (!pass && slept) (void)esp_pm_dump_locks(stdout);
+        const bool woke = screen_transition(power, false);
+        ok = slept && woke && elapsed <= 2;
+        ESP_LOGI(TAG, "CHECK standby-idle pass=%u asleep=%u wake=%u paused_ui_ms=%" PRIu32 " result=%s",
+                 pass + 1, slept, woke, elapsed, ok ? "PASS" : "FAIL");
+    }
+    return app_power_set_timeout(power, timeout, false) == ESP_OK && ok;
 }
 
 typedef struct {
@@ -1038,7 +1085,18 @@ static bool test_music(probe_t *probe)
         pause_ms(120);
         const bool scroll_ok = test_music_scroll(probe, &audio);
         const bool volume_ok = test_music_volume(probe, &audio);
-        return scroll_ok && volume_ok;
+        app_power_t *power = probe->ui->power;
+        const bool slept = screen_transition(power, true);
+        aether_audio_player_status_t parked = {0}, after = {0};
+        (void)aether_audio_player_get_status(probe->ui->audio_player, &parked);
+        pause_ms(500);
+        (void)aether_audio_player_get_status(probe->ui->audio_player, &after);
+        const bool woke = screen_transition(power, false);
+        const bool continued = after.state == AETHER_AUDIO_PLAYING && !strcmp(parked.path, after.path) &&
+            after.position_ms >= parked.position_ms + 350;
+        ESP_LOGI(TAG, "CHECK standby-music asleep=%u awake=%u continued=%u result=%s",
+                 slept, woke, continued, slept && woke && continued ? "PASS" : "FAIL");
+        return scroll_ok && volume_ok && slept && woke && continued;
     }
     ESP_LOGE(TAG, "FAIL music-playback state=%d error=%s", audio.state,
              esp_err_to_name(audio.last_error));
@@ -1240,7 +1298,26 @@ static bool test_video(probe_t *probe)
             ++probe->media_passed;
             ESP_LOGI(TAG, "PASS video-playback native frame=%" PRIu32 " dimensions=%ux%u",
                      video.frame_number, video.width, video.height);
-            return true;
+            app_power_t *power = probe->ui->power;
+            const bool slept = screen_transition(power, true);
+            pause_ms(100);
+            aether_video_status_t resting = {0}, still = {0};
+            (void)aether_video_player_get_status(probe->ui->video_player, &resting);
+            pause_ms(300);
+            (void)aether_video_player_get_status(probe->ui->video_player, &still);
+            const bool woke = screen_transition(power, false);
+            aether_video_status_t resumed = {0};
+            const int64_t resume_deadline = esp_timer_get_time() + INT64_C(1500000);
+            do {
+                pause_ms(20);
+                (void)aether_video_player_get_status(probe->ui->video_player, &resumed);
+            } while (resumed.frame_number <= still.frame_number && esp_timer_get_time() < resume_deadline);
+            const bool ok = slept && woke && resting.state == AETHER_VIDEO_PAUSED &&
+                still.frame_number == resting.frame_number && resumed.frame_number > still.frame_number;
+            ESP_LOGI(TAG, "CHECK standby-video paused=%u fixed_frame=%u resumed=%u result=%s",
+                     resting.state == AETHER_VIDEO_PAUSED, still.frame_number == resting.frame_number,
+                     resumed.frame_number > still.frame_number, ok ? "PASS" : "FAIL");
+            return ok;
         }
     } while (esp_timer_get_time() < deadline);
     ESP_LOGE(TAG, "FAIL video-playback state=%d error=%s", video.state,
@@ -1541,7 +1618,7 @@ static bool test_bluetooth_modes(probe_t *probe, const route_t *parent)
 {
     const route_t modes[] = {
         {"bt-audio", "蓝牙音频", "音频输出"},
-        {"bt-hid", "电脑键鼠", "蓝牙键鼠"},
+        {"bt-hid", "空中飞鼠", "蓝牙键鼠"},
     };
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
         const uint64_t before = completed_regions();
@@ -1675,6 +1752,7 @@ static void test_task(void *context)
                  (unsigned)heap_caps_get_free_size(external_caps));
         report_memory(round, "round", "all", round_before);
     }
+    if (ok) ok = test_idle_suspend(&probe);
     const heap_sample_t final_active = psram_sample();
     pause_ms(2000);
     report_memory(0, "idle", "desktop-after-cycles", final_active);
@@ -1684,6 +1762,7 @@ static void test_task(void *context)
         if (ok) ok = selftest_microphone(probe.ui) && selftest_files(probe.ui);
         else ESP_LOGE(TAG, "FAIL microphone idle gate not ready");
     }
+    if (ok) ok = selftest_nes(probe.ui);
     app_display_metrics_get(&end_display);
     const uint32_t drops = end_display.dropped_regions - start_display.dropped_regions;
     const uint32_t timeouts = end_display.flush_wait_timeouts - start_display.flush_wait_timeouts;
@@ -1696,12 +1775,14 @@ static void test_task(void *context)
              end_display.completed_sequence - start_display.completed_sequence,
              drops, timeouts, (unsigned)uxTaskGetStackHighWaterMark(NULL), probe.drawer_back_passed,
              probe.drawer_home_clicked);
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 esp_err_t app_ui_selftest_start(app_ui_t *ui)
 {
     if (!ui) return ESP_ERR_INVALID_ARG;
-    return xTaskCreate(test_task, "ui_selftest", 8192, ui, 2, NULL) == pdPASS ?
+    /* Synthetic rendering needs a large stack. Keep internal RAM free for
+     * the production codec stacks and DMA the diagnostic exercises. */
+    return xTaskCreateWithCaps(test_task, "ui_selftest", 16384, ui, 2, NULL, external_caps) == pdPASS ?
         ESP_OK : ESP_ERR_NO_MEM;
 }

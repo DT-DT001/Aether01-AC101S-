@@ -26,6 +26,8 @@ static struct {
     int32_t dx, dy, wheel, x, y;
     uint32_t current_key;
     bool caps, reset_requested, mouse_present, key_down;
+    bool capture_keys;
+    uint8_t captured_usage;
 } s = {.lock = portMUX_INITIALIZER_UNLOCKED};
 
 static bool bit(const uint8_t *keys, unsigned usage)
@@ -98,6 +100,7 @@ void app_usb_input_publish(void *context, const aether_usb_input_event_t *event)
     if (event->type == AETHER_USB_INPUT_RESET) {
         memset(s.keys, 0, sizeof(s.keys)); memset(s.blocked_keys, 0, sizeof(s.blocked_keys));
         s.buttons = s.blocked_buttons = 0; s.mouse_present = false;
+        s.captured_usage = 0;
         consume_locked();
     } else if (event->type == AETHER_USB_INPUT_KEYBOARD) {
         uint8_t old[32], old_blocked[32];
@@ -105,7 +108,20 @@ void app_usb_input_publish(void *context, const aether_usb_input_event_t *event)
         memcpy(s.keys, event->keys, sizeof(s.keys));
         for (unsigned i = 0; i < sizeof(s.keys); ++i) s.blocked_keys[i] &= s.keys[i];
         if (blocked) consume_locked();
-        else {
+        else if (s.capture_keys) {
+            if (!s.captured_usage) {
+                /* HID keyboard usages 1–3 denote report errors, not keys. */
+                for (unsigned u = 4; u <= 0xE7; ++u) {
+                    if (bit(s.keys, u) && !bit(old, u) && !bit(s.blocked_keys, u)) {
+                        s.captured_usage = (uint8_t)u;
+                        break;
+                    }
+                }
+            }
+            /* A captured Enter or Esc must never activate another widget,
+             * including after the binding dialog closes while it is held. */
+            for (unsigned i = 0; i < sizeof(s.keys); ++i) s.blocked_keys[i] |= s.keys[i];
+        } else {
             bool overflow = false;
             /* Publish releases first so simultaneous key swaps don't inherit
              * the old Enter press/release on a newly focused widget. */
@@ -273,6 +289,29 @@ void app_usb_input_set_enabled(bool enabled)
     if (!enabled && atomic_load(&s.ready)) {
         portENTER_CRITICAL(&s.lock); consume_locked(); portEXIT_CRITICAL(&s.lock);
     }
+}
+
+bool app_usb_input_capture_keys(bool enable)
+{
+    if (!atomic_load(&s.ready)) return false;
+    portENTER_CRITICAL(&s.lock);
+    if (s.capture_keys != enable) {
+        s.capture_keys = enable;
+        s.captured_usage = 0;
+        consume_locked();
+    }
+    portEXIT_CRITICAL(&s.lock);
+    return true;
+}
+
+uint8_t app_usb_input_take_captured_usage(void)
+{
+    if (!atomic_load(&s.ready)) return 0;
+    portENTER_CRITICAL(&s.lock);
+    const uint8_t usage = s.captured_usage;
+    s.captured_usage = 0;
+    portEXIT_CRITICAL(&s.lock);
+    return usage;
 }
 
 static bool inside(lv_obj_t *object, lv_obj_t *root)

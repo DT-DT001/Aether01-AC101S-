@@ -24,7 +24,8 @@ flags = [
     "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
     "-ffunction-sections", "-fdata-sections", "-DLV_CONF_INCLUDE_SIMPLE",
     "-DLV_CONF_SUPPRESS_DEFINE_CHECK=1", "-DLV_FONT_MONTSERRAT_20=1", "-DLV_FONT_MONTSERRAT_28=1",
-    *["-I" + str(path) for path in [test / "stubs", root / "tests/reader_ui", root / "main", lvgl]],
+    *["-I" + str(path) for path in [test / "stubs", root / "tests/reader_ui", root / "tests/reader_ui/stubs",
+                                    root / "tests/player/stubs", root / "main", lvgl]],
 ]
 sanitizers = [] if windows else ["-fsanitize=address,undefined"]
 sources = [

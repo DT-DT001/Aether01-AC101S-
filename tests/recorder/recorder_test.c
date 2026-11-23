@@ -139,6 +139,36 @@ static void test_recording(aether_recorder_handle_t h)
     assert(aether_recorder_stop_wait(h,3000)==ESP_OK);verify_wav(snapshot(h));verify_wav(saved);
     puts("PASS real writer/collector: stereo-to-mono WAV including right-only signal and no full-scale overflow, full-scale meter, pause drains RX, resume, checkpoint, unique files and stop ownership barrier");
 }
+
+static void test_screen_pause(aether_recorder_handle_t h)
+{
+    assert(aether_recorder_start(h) == ESP_OK);
+    wait_state(h, AETHER_RECORDER_RECORDING);
+    wait_data(h);
+    for (unsigned pass = 0; pass < 3; ++pass) {
+        aether_recorder_set_screen_paused(h, true);
+        wait_state(h, AETHER_RECORDER_PAUSED);
+        vTaskDelay(30);
+        const aether_recorder_status_t before = snapshot(h);
+        const unsigned reads_before = reads;
+        vTaskDelay(30);
+        assert(!codec_on && reads == reads_before);
+        assert(snapshot(h).data_bytes == before.data_bytes);
+        assert(aether_recorder_set_paused(h, true) == ESP_OK);
+        aether_recorder_set_screen_paused(h, false);
+        vTaskDelay(60);
+        assert(snapshot(h).state == AETHER_RECORDER_PAUSED);
+        assert(snapshot(h).data_bytes == before.data_bytes);
+        assert(aether_recorder_set_paused(h, false) == ESP_OK);
+        wait_state(h, AETHER_RECORDER_RECORDING);
+        for (unsigned i = 0; i < 2000 && snapshot(h).data_bytes == before.data_bytes; ++i) vTaskDelay(1);
+        assert(snapshot(h).data_bytes > before.data_bytes);
+        assert(!strcmp(snapshot(h).path, before.path));
+    }
+    assert(aether_recorder_stop_wait(h, 3000) == ESP_OK);
+    verify_wav(snapshot(h));
+    puts("PASS three recording standby cycles release the mic, retain manual pause and resume the same WAV");
+}
 static void test_failures(aether_recorder_handle_t h)
 {
     fail_start=true;unsigned previous_stops=stops;assert(aether_recorder_start(h)==ESP_OK);wait_state(h,AETHER_RECORDER_ERROR);
@@ -177,7 +207,7 @@ int main(void)
     assert(aether_recorder_new((void*)1,(void*)2,&h)==ESP_OK&&aether_recorder_get_default()==h&&task_count==0);
     aether_recorder_handle_t duplicate=(void*)3;assert(aether_recorder_new((void*)1,(void*)2,&duplicate)==ESP_ERR_INVALID_STATE&&!duplicate);
     assert(MAX_DATA_BYTES%2==0&&MAX_DATA_BYTES+44<=INT32_MAX&&MAX_DATA_BYTES+36<=UINT32_MAX);
-    assert(aether_recorder_stop_wait(h,0)==ESP_OK);test_recording(h);test_failures(h);test_storage_faults(h);
+    assert(aether_recorder_stop_wait(h,0)==ESP_OK);test_recording(h);test_screen_pause(h);test_failures(h);test_storage_faults(h);
     assert(aether_recorder_del(h)==ESP_OK&&!aether_recorder_get_default());
     for(unsigned i=0;i<task_count;++i){assert(!pthread_join(tasks[i]->thread,NULL));free(tasks[i]);}
     puts("All production recorder host regressions passed.");return 0;

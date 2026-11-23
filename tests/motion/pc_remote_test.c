@@ -17,7 +17,7 @@ static uint32_t interest;
 static unsigned moves, keys, cancels, writes, queued_clicks;
 static app_pc_shortcut_t last_key;
 static bool busy, reject_commit, motion_queued;
-static uint8_t stored[32], staging[32];
+static uint8_t stored[512], staging[512];
 static size_t stored_size, staging_size;
 
 int64_t esp_timer_get_time(void) { return now; }
@@ -82,8 +82,6 @@ esp_err_t aether_bluetooth_hid_key(aether_bluetooth_handle_t handle, uint8_t mod
     ++keys;
     return ESP_OK;
 }
-esp_err_t aether_bluetooth_hid_text(aether_bluetooth_handle_t handle, const char *text)
-{ assert(handle == bluetooth && text); return hid.connected ? ESP_OK : ESP_ERR_INVALID_STATE; }
 esp_err_t aether_bluetooth_hid_click(aether_bluetooth_handle_t handle, uint8_t buttons)
 {
     assert(handle == bluetooth && buttons);
@@ -126,9 +124,22 @@ int main(void)
     assert(consume);
     for (unsigned slot = 0; slot < 4; ++slot) {
         app_pc_shortcut_t key;
+        char name[APP_PC_REMOTE_SCENE_BYTES], expected[16];
         assert(app_pc_remote_get_shortcut(slot, &key) == ESP_OK);
         assert(key.modifiers == 0x05 && key.key == 0x42 + slot);
+        snprintf(expected, sizeof(expected), "场景 %u", slot + 1);
+        assert(app_pc_remote_get_scene_name(slot, name) == ESP_OK && !strcmp(name, expected));
     }
+    const struct { uint32_t version; app_pc_shortcut_t shortcut[4]; } legacy = {
+        1, {{5, 0x42}, {2, 0x41}, {5, 0x44}, {5, 0x45}},
+    };
+    memcpy(stored, &legacy, sizeof(legacy));
+    stored_size = sizeof(legacy);
+    app_pc_remote_init(bluetooth, &power, true, flash_busy);
+    app_pc_shortcut_t migrated;
+    assert(app_pc_remote_get_shortcut(1, &migrated) == ESP_OK && migrated.modifiers == 2 && migrated.key == 0x41);
+    char name[APP_PC_REMOTE_SCENE_BYTES];
+    assert(app_pc_remote_get_scene_name(1, name) == ESP_OK && !strcmp(name, "场景 2"));
     assert(app_pc_remote_trigger(0) == ESP_ERR_INVALID_STATE && keys == 0);
     assert(app_pc_remote_set_enabled(true) == ESP_OK);
     hid.connected = true;
@@ -142,18 +153,33 @@ int main(void)
     consume(NULL);
     app_pc_remote_status_t status;
     app_pc_remote_get_status(&status);
-    assert(status.save_error == ESP_FAIL && !status.save_pending);
+    assert(status.save_error == ESP_FAIL && status.save_pending);
     reject_commit = false;
-    assert(app_pc_remote_set_shortcut(2, replacement) == ESP_OK);
+    now += 1500000;
+    consume(NULL);
+    assert(writes == 1 && app_pc_remote_save_pending());
+    now += 500000;
     consume(NULL);
     assert(writes == 2 && stored_size && !app_pc_remote_save_pending());
+    assert(app_pc_remote_set_scene_name(0, "  开场直播  ") == ESP_OK);
+    assert(app_pc_remote_set_scene_name(1, "媒体预览") == ESP_OK && app_pc_remote_save_pending());
+    assert(app_pc_remote_set_scene_name(1, "   ") == ESP_ERR_INVALID_ARG);
+    assert(app_pc_remote_set_scene_name(1, "换\n行") == ESP_ERR_INVALID_ARG);
+    assert(app_pc_remote_set_scene_name(1, "\xc0\xaf") == ESP_ERR_INVALID_ARG);
+    assert(app_pc_remote_set_scene_name(1, "12345678901234567") == ESP_ERR_INVALID_ARG);
+    consume(NULL);
+    assert(writes == 3 && !app_pc_remote_save_pending());
     app_pc_remote_init(bluetooth, &power, true, flash_busy);
+    assert(app_pc_remote_get_scene_name(0, name) == ESP_OK && !strcmp(name, "开场直播"));
+    assert(app_pc_remote_get_scene_name(1, name) == ESP_OK && !strcmp(name, "媒体预览"));
+    assert(app_pc_remote_get_scene_name(2, name) == ESP_OK && !strcmp(name, "场景 3"));
+    assert(app_pc_remote_get_shortcut(1, &migrated) == ESP_OK && migrated.modifiers == 2 && migrated.key == 0x41);
     assert(app_pc_remote_trigger(2) == ESP_OK && keys == 1);
     assert(last_key.modifiers == replacement.modifiers && last_key.key == replacement.key);
     power_status.sleeping = true;
     assert(app_pc_remote_trigger(2) == ESP_ERR_INVALID_STATE && keys == 1);
     power_status.sleeping = false;
-    puts("PASS OBS shortcut defaults, persistence guard, error/retry, reload and input gating");
+    puts("PASS OBS v1 migration, UTF-8 scene names, shared NVS commit/retry, reboot and input gating");
 
     app_pc_remote_set_air_mode(true);
     assert(interest == APP_TELEMETRY_IMU);

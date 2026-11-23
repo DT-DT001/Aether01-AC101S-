@@ -62,6 +62,8 @@ esp_err_t aether_mjpeg_player_play(aether_mjpeg_player_handle_t handle,
                                    void *user_ctx);
 esp_err_t aether_mjpeg_player_set_paused(aether_mjpeg_player_handle_t handle,
                                          bool paused);
+void aether_mjpeg_player_set_screen_paused(aether_mjpeg_player_handle_t handle,
+                                         bool paused);
 esp_err_t aether_mjpeg_player_set_fps(aether_mjpeg_player_handle_t handle, uint8_t fps);
 esp_err_t aether_mjpeg_player_stop(aether_mjpeg_player_handle_t handle);
 /** Stop and wait for callbacks and hardware accesses to finish. Zero polls. */

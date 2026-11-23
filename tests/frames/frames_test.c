@@ -125,6 +125,7 @@ void lv_image_set_src(lv_obj_t *image, const void *source)
     image->source = source;
     ++image->updates;
 }
+const void *lv_image_get_src(const lv_obj_t *image) { return image->source; }
 void lv_obj_center(lv_obj_t *object) { ++object->centers; }
 int32_t lv_obj_get_width(const lv_obj_t *object) { return object->width; }
 int32_t lv_obj_get_height(const lv_obj_t *object) { return object->height; }
@@ -133,6 +134,19 @@ void lv_obj_invalidate(lv_obj_t *object) { ++object->invalidations; }
 lv_display_t *lv_obj_get_display(const lv_obj_t *object) { (void)object; return &display; }
 void lv_display_trigger_activity(lv_display_t *target) { ++target->activity; }
 void lv_image_cache_drop(const void *source) { if (source) ++cache_drops; }
+void lv_display_add_event_cb(lv_display_t *d,lv_event_cb_t cb,lv_event_code_t code,void *ctx)
+{ if (code==LV_EVENT_REFR_START) { d->refresh=cb;d->refresh_context=ctx; } }
+uint32_t lv_display_remove_event_cb_with_user_data(lv_display_t *d,lv_event_cb_t cb,void *ctx)
+{ if (d->refresh!=cb||d->refresh_context!=ctx)return 0;d->refresh=0;d->refresh_context=0;return 1; }
+void lv_obj_add_event_cb(lv_obj_t *o,lv_event_cb_t cb,lv_event_code_t code,void *ctx)
+{ if (code==LV_EVENT_DELETE) { o->on_delete=cb;o->delete_context=ctx; } }
+void lv_obj_remove_event_cb_with_user_data(lv_obj_t *o,lv_event_cb_t cb,void *ctx)
+{ if(o->on_delete==cb&&o->delete_context==ctx){o->on_delete=0;o->delete_context=0;} }
+void *lv_event_get_user_data(lv_event_t *e){return e->user_data;}
+lv_obj_t *lv_event_get_target_obj(lv_event_t *e){return e->target;}
+lv_timer_t *lv_display_get_refr_timer(lv_display_t *d){return &d->timer;}
+void lv_timer_resume(lv_timer_t *t){++t->resume;}
+void lv_timer_ready(lv_timer_t *t){++t->ready;}
 
 static void reset(unsigned fail_at)
 {
@@ -145,7 +159,7 @@ static void reset(unsigned fail_at)
     cache_drops = 0;
     now_us = 0;
     last_mutex = NULL;
-    display.activity = 0;
+    memset(&display,0,sizeof(display));
     memset(allocations, 0, sizeof(allocations));
 }
 
@@ -214,10 +228,38 @@ int test_copy_latest_front(void)
     CHECK(uniform((const uint16_t *)image.source->data, 16, 20));
     CHECK((const uint16_t *)image.source->data != front);
     app_frames_present(frames, &image); /* No redundant update without a new frame. */
-    CHECK(image.updates == 2 && cache_drops == 2 && display.activity == 2);
+    CHECK(image.updates == 2 && cache_drops == 2 && !display.activity);
     CHECK(image.invalidations == 2 && image.centers == 2);
     app_frames_delete(frames);
     CHECK(!live_allocations && !allocation_errors && !mutex_errors);
+
+    reset(0);
+    image=(lv_obj_t){0};
+    CHECK(app_frames_new(&frames) == ESP_OK);
+    app_frames_set_active(frames,true);
+    app_frames_set_refresh_image(frames,&image);
+    CHECK(display.refresh && image.on_delete);
+    fill(source,16,10);
+    app_frames_push(frames,source,4,4);
+    app_frames_present(frames,&image);
+    CHECK(!image.source&&!image.updates&&display.timer.resume==1&&display.timer.ready==1);
+    fill(source,16,11);
+    app_frames_push(frames,source,4,4);
+    lv_event_t refresh={.user_data=display.refresh_context,.target=&display};
+    display.refresh(&refresh);
+    CHECK(image.updates==1 && uniform((const uint16_t *)image.source->data,16,11));
+    fill(source,16,12);
+    app_frames_push(frames,source,4,4);
+    CHECK(uniform((const uint16_t *)image.source->data,16,11));
+    display.refresh(&refresh);
+    CHECK(image.updates==1&&image.invalidations==2&&!display.activity&&cache_drops==2);
+    CHECK(uniform((const uint16_t *)image.source->data,16,12));
+    lv_event_t deleted={.user_data=image.delete_context,.target=&image};
+    image.on_delete(&deleted);
+    CHECK(!display.refresh&&!image.on_delete);
+    app_frames_set_active(frames,false);
+    app_frames_delete(frames);
+    CHECK(!live_allocations&&!allocation_errors&&!mutex_errors);
     return 0;
 }
 

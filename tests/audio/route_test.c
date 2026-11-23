@@ -59,6 +59,7 @@ esp_err_t ac101s_codec_set_speaker(i2c_master_dev_handle_t dev, unsigned volume)
     return ESP_OK;
 }
 
+int i2s_channel_enable(i2s_chan_handle_t channel) { assert(channel); return ESP_OK; }
 int i2s_channel_write(i2s_chan_handle_t tx, const void *data, size_t bytes, size_t *sent, unsigned timeout)
 {
     assert(tx && data && bytes == 4 && timeout && codec_open && !muted);
@@ -107,7 +108,7 @@ static void wait_entered(void)
 int main(void)
 {
     struct test_mutex mutex={.value=PTHREAD_MUTEX_INITIALIZER};
-    struct ac101s_audio_dev_t audio={.codec=(void*)1,.tx=(void*)2,.pa_enable=42,.sample_rate_hz=48000,
+    struct ac101s_audio_dev_t audio={.codec=(void*)1,.tx=(void*)2,.rx=(void*)3,.pa_enable=42,.sample_rate_hz=48000,
         .master_volume=100,.mutex=&mutex,.route_lock=portMUX_INITIALIZER_UNLOCKED};
     ac101s_audio_sink_t sink={.context=(void*)1,.connected=connected,.start=transport_start,
         .stop=transport_stop,.write=transport_write};

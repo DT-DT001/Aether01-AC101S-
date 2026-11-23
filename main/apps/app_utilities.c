@@ -635,18 +635,38 @@ void app_open_notes(app_ui_t *ui)
 }
 
 typedef struct {
-    lv_obj_t *calendar, *title, *selected, *previous, *next;
+    lv_obj_t *calendar, *title, *selected, *previous, *next, *today;
+    lv_calendar_date_t selected_date;
+    bool clock_valid;
 } calendar_page_t;
+
+static const char *calendar_week[] = {"日", "一", "二", "三", "四", "五", "六"};
+
+static void select_calendar_day(calendar_page_t *page, lv_calendar_date_t date)
+{
+    page->selected_date = date;
+    lv_calendar_set_highlighted_dates(page->calendar, &page->selected_date, 1);
+    const unsigned weekday = app_calendar_weekday(date.year, date.month, date.day);
+#if LV_USE_CALENDAR_CHINESE
+    const char *name = lv_calendar_get_day_name(&date);
+#else
+    const char *name = NULL;
+#endif
+    app_ui_label_fmt(page->selected, "%u 月 %u 日  ·  周%s%s%s", (unsigned)date.month,
+                     (unsigned)date.day, calendar_week[weekday], name ? "  ·  " : "", name ? name : "");
+}
 
 static void show_calendar_month(calendar_page_t *page, unsigned year, unsigned month)
 {
     lv_calendar_set_month_shown(page->calendar, year, month);
-    app_ui_label_fmt(page->title, "%04u 年 %02u 月", year, month);
+    app_ui_label_fmt(page->title, "%04u 年 %u 月", year, month);
     if (year == 2000 && month == 1) lv_obj_add_state(page->previous, LV_STATE_DISABLED);
     else lv_obj_remove_state(page->previous, LV_STATE_DISABLED);
     if (year == 2099 && month == 12) lv_obj_add_state(page->next, LV_STATE_DISABLED);
     else lv_obj_remove_state(page->next, LV_STATE_DISABLED);
-    app_ui_label_text(page->selected, "");
+    const lv_calendar_date_t *today = lv_calendar_get_today_date(page->calendar);
+    select_calendar_day(page, page->clock_valid && today->year == year && today->month == month ?
+                        *today : (lv_calendar_date_t){year, month, 1});
 }
 
 static void calendar_month_event(lv_event_t *event)
@@ -668,19 +688,60 @@ static void calendar_month_event(lv_event_t *event)
 static void calendar_day_event(lv_event_t *event)
 {
     calendar_page_t *page = lv_event_get_user_data(event);
-    lv_calendar_date_t date;
-    if (lv_calendar_get_pressed_date(page->calendar, &date) != LV_RESULT_OK) return;
-#if LV_USE_CALENDAR_CHINESE
-    const char *name = lv_calendar_get_day_name(&date);
-    app_ui_label_fmt(page->selected, "%02u-%02u  %s", date.month, date.day, name ? name : "");
-#else
-    app_ui_label_fmt(page->selected, "%02u-%02u", date.month, date.day);
-#endif
+    lv_obj_t *grid = lv_calendar_get_btnmatrix(page->calendar);
+    const uint32_t index = lv_buttonmatrix_get_selected_button(grid);
+    if (index == LV_BUTTONMATRIX_BUTTON_NONE || index < 7 ||
+        lv_buttonmatrix_has_button_ctrl(grid, index, LV_BUTTONMATRIX_CTRL_DISABLED)) return;
+    const char *label = lv_buttonmatrix_get_button_text(grid, index);
+    if (!label) return;
+    /* Chinese cells contain the lunar name on a second line. Parse only
+     * the Gregorian day so one-digit dates work as well as two-digit dates. */
+    char *end;
+    const unsigned long day = strtoul(label, &end, 10);
+    lv_calendar_date_t date = *lv_calendar_get_showed_date(page->calendar);
+    if (end != label && (*end == '\0' || *end == '\n') && day <= 31 &&
+        app_calendar_valid(date.year, date.month, day, 0, 0, 0)) {
+        date.day = day;
+        select_calendar_day(page, date);
+    }
+}
+
+static void calendar_show_today(calendar_page_t *page)
+{
+    app_telemetry_snapshot_t telemetry;
+    app_telemetry_get(&telemetry);
+    const pcf85063_time_t *rtc = &telemetry.rtc;
+    page->clock_valid = telemetry.rtc_error == ESP_OK && !rtc->oscillator_stopped &&
+        app_calendar_valid(rtc->year, rtc->month, rtc->day, 0, 0, 0);
+    if (page->clock_valid) {
+        lv_obj_remove_state(page->today, LV_STATE_DISABLED);
+        lv_calendar_set_today_date(page->calendar, rtc->year, rtc->month, rtc->day);
+        show_calendar_month(page, rtc->year, rtc->month);
+    } else {
+        lv_obj_add_state(page->today, LV_STATE_DISABLED);
+        lv_calendar_set_today_date(page->calendar, 0, 0, 0);
+        show_calendar_month(page, 2000, 1);
+        app_ui_label_text(page->selected, "请在时钟中校准日期");
+    }
+}
+
+static void calendar_today_event(lv_event_t *event)
+{
+    calendar_show_today(lv_event_get_user_data(event));
+}
+
+static void calendar_cleanup(app_ui_t *ui)
+{
+    calendar_page_t *page = ui->page_context;
+    /* The old screen may be retired asynchronously. The calendar borrows
+     * the highlight array, so detach it before releasing the page. */
+    static lv_calendar_date_t empty;
+    lv_calendar_set_highlighted_dates(page->calendar, &empty, 0);
+    page_free(ui);
 }
 
 void app_open_calendar(app_ui_t *ui)
 {
-    static const char *week[] = {"日", "一", "二", "三", "四", "五", "六"};
     lv_obj_t *content = app_ui_begin_page(ui, "日历");
     calendar_page_t *page = calloc(1, sizeof(*page));
     if (!page) {
@@ -688,41 +749,54 @@ void app_open_calendar(app_ui_t *ui)
         return;
     }
     ui->page_context = page;
-    ui->page_cleanup = page_free;
-    page->previous = utility_button(content, LV_SYMBOL_LEFT, 0, 0, 54, calendar_month_event, page);
-    page->next = utility_button(content, LV_SYMBOL_RIGHT, 350, 0, 54, calendar_month_event, page);
-    page->title = app_ui_add_text(content, "", LV_ALIGN_TOP_MID, 0, 8, 0xEAF2FF, app_ui_chinese_font_size(24));
+    ui->page_cleanup = calendar_cleanup;
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    page->title = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 8, 9,
+                                  0xF4F7FF, app_ui_chinese_font_size(24));
+    page->today = utility_button(content, "今天", 254, 0, 66, calendar_today_event, page);
+    page->previous = utility_button(content, LV_SYMBOL_LEFT, 326, 0, 48, calendar_month_event, page);
+    page->next = utility_button(content, LV_SYMBOL_RIGHT, 380, 0, 48, calendar_month_event, page);
+    lv_obj_set_style_bg_color(page->today, lv_color_hex(0x275A70), 0);
     page->calendar = lv_calendar_create(content);
-    lv_obj_set_pos(page->calendar, 0, 51);
-    lv_obj_set_size(page->calendar, 405, 269);
-    lv_calendar_set_day_names(page->calendar, week);
+    lv_obj_set_pos(page->calendar, 0, 50);
+    lv_obj_set_size(page->calendar, 432, 284);
+#if LV_CALENDAR_WEEK_STARTS_MONDAY
+    static const char *monday_first[] = {"一", "二", "三", "四", "五", "六", "日"};
+    lv_calendar_set_day_names(page->calendar, monday_first);
+#else
+    lv_calendar_set_day_names(page->calendar, calendar_week);
+#endif
     lv_obj_t *grid = lv_calendar_get_btnmatrix(page->calendar);
-    lv_obj_set_style_bg_color(page->calendar, lv_color_hex(0x1B2337), 0);
+    lv_obj_set_style_bg_color(page->calendar, lv_color_hex(0x182437), 0);
     lv_obj_set_style_radius(page->calendar, 18, 0);
-    lv_obj_set_style_border_color(page->calendar, lv_color_hex(0x34435E), 0);
+    lv_obj_set_style_border_color(page->calendar, lv_color_hex(0x2E4258), 0);
     lv_obj_set_style_border_width(page->calendar, 1, 0);
+    lv_obj_set_style_pad_all(page->calendar, 4, 0);
     lv_obj_set_style_text_font(grid, app_ui_chinese_font(), LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(grid, lv_color_hex(0x273852), LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(grid, lv_color_hex(0x266867), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(grid, lv_color_hex(0x182437), LV_PART_MAIN);
+    lv_obj_set_style_border_width(grid, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(grid, lv_color_hex(0x202E44), LV_PART_ITEMS);
     lv_obj_set_style_bg_color(grid, lv_color_hex(0x395F80), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_radius(grid, 10, LV_PART_ITEMS);
+    lv_obj_set_style_shadow_width(grid, 0, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(grid, 1, LV_PART_ITEMS);
+    lv_obj_set_style_border_color(grid, lv_color_hex(0x25364E), LV_PART_ITEMS);
     lv_obj_set_style_text_color(grid, lv_color_hex(0xDFEBFF), LV_PART_ITEMS);
     lv_obj_set_style_text_color(grid, lv_color_hex(0x8394AD), LV_PART_ITEMS | LV_STATE_DISABLED);
     lv_obj_set_style_text_line_space(grid, 0, LV_PART_ITEMS);
-    lv_obj_set_style_pad_gap(grid, 2, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(grid, 3, LV_PART_MAIN);
-    page->selected = app_ui_add_text(content, "", LV_ALIGN_TOP_MID, 0, 327, 0xBFDBFC, app_ui_chinese_font());
+    lv_obj_set_style_pad_gap(grid, 3, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(grid, 1, LV_PART_MAIN);
+    lv_obj_t *details = utility_panel(content, 0, 341, 432, 34, 0x25374D);
+    page->selected = app_ui_add_text(details, "", LV_ALIGN_CENTER, 0, 0, 0xCEF1FF, app_ui_chinese_font());
+    lv_obj_set_width(page->selected, 416);
+    lv_obj_set_style_text_align(page->selected, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(page->selected, LV_LABEL_LONG_DOT);
     lv_obj_add_event_cb(page->calendar, calendar_day_event, LV_EVENT_VALUE_CHANGED, page);
-    app_telemetry_snapshot_t telemetry;
-    app_telemetry_get(&telemetry);
-    const pcf85063_time_t *rtc = &telemetry.rtc;
-    const bool valid = telemetry.rtc_error == ESP_OK && !rtc->oscillator_stopped &&
-        app_calendar_valid(rtc->year, rtc->month, rtc->day, 0, 0, 0);
-    if (valid) lv_calendar_set_today_date(page->calendar, rtc->year, rtc->month, rtc->day);
 #if LV_USE_CALENDAR_CHINESE
     lv_calendar_set_chinese_mode(page->calendar, true);
 #endif
-    show_calendar_month(page, valid ? rtc->year : 2000, valid ? rtc->month : 1);
-    if (!valid) app_ui_label_text(page->selected, "请在时钟中校准日期");
+    calendar_show_today(page);
 }
 
 typedef struct {

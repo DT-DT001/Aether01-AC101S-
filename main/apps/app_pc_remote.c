@@ -13,15 +13,15 @@
 #define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
 
 typedef enum {
-    REMOTE_KEYBOARD, REMOTE_MOUSE, REMOTE_OBS,
+    REMOTE_MOUSE, REMOTE_OBS,
 } remote_view_t;
 
 enum {
-    ACTION_ENABLE = 1, ACTION_KEYBOARD, ACTION_MOUSE, ACTION_TEXT,
+    ACTION_ENABLE = 1,
     ACTION_LEFT, ACTION_RIGHT, ACTION_MIDDLE, ACTION_RECENTER,
     ACTION_EDIT, ACTION_SAVE, ACTION_CANCEL,
     ACTION_CONFIRM, ACTION_REJECT, ACTION_PAIR_OFF, ACTION_CALIBRATE,
-    ACTION_KEY_BASE = 32, ACTION_SCENE_BASE = 300,
+    ACTION_SHORTCUT_BASE = 32, ACTION_SCENE_BASE = 64,
 };
 
 typedef struct {
@@ -46,6 +46,10 @@ static const struct { const char *label; uint8_t bit; } modifiers[] = {
     {"Ctrl",0x01}, {"Alt",0x04}, {"Shift",0x02}, {"Win",0x08},
 };
 
+static const struct { const char *label; app_pc_shortcut_t binding; } mouse_shortcuts[] = {
+    {"回车", {0, 0x28}}, {"Esc", {0, 0x29}}, {"空格", {0, 0x2c}}, {"切应用", {0x04, 0x2b}},
+};
+
 typedef struct {
     app_ui_t *ui;
     remote_view_t view;
@@ -54,14 +58,14 @@ typedef struct {
     uint32_t state_color, pair_code, notice_tick, motion_tick;
     bool pair_replied, motion_contact, motion_held;
     char notice[96];
-    lv_obj_t *tabs[2], *keyboard_panel, *mouse_panel;
-    lv_obj_t *text, *keyboard, *send, *direct_keys[8];
+    lv_obj_t *direct_keys[ARRAY_COUNT(mouse_shortcuts)];
     lv_obj_t *move, *mouse_hint, *mouse_buttons[3], *recenter, *calibrate;
     lv_obj_t *edit, *instructions, *grid, *editor, *edit_title, *key_selector;
     lv_obj_t *scenes[APP_PC_REMOTE_SCENES], *bindings[APP_PC_REMOTE_SCENES];
     lv_obj_t *mod_buttons[ARRAY_COUNT(modifiers)];
+    lv_obj_t *rename_box, *rename_field, *rename_error;
     bool edit_select, editor_open;
-    unsigned edit_slot;
+    unsigned edit_slot, rename_slot;
 } remote_page_t;
 
 static void page_cleanup(app_ui_t *ui);
@@ -118,16 +122,15 @@ static lv_obj_t *button(remote_page_t *page, lv_obj_t *parent, const char *text,
     lv_obj_t *object = lv_button_create(parent);
     lv_obj_set_pos(object, x, y);
     lv_obj_set_size(object, width, height);
-    app_connection_button_style(object, action == ACTION_ENABLE || action == ACTION_TEXT || action == ACTION_SAVE);
+    app_connection_button_style(object, action == ACTION_ENABLE || action == ACTION_SAVE);
     lv_obj_set_style_bg_color(object, lv_color_hex(CONNECTION_BLUE), LV_STATE_CHECKED);
     lv_obj_set_style_opa(object, LV_OPA_60, LV_STATE_USER_1);
     if (action) {
         lv_obj_set_user_data(object, (void *)action);
-        lv_obj_add_event_cb(object, button_clicked, LV_EVENT_CLICKED, page->ui);
+        const lv_event_code_t click = action >= ACTION_SCENE_BASE ? LV_EVENT_SHORT_CLICKED : LV_EVENT_CLICKED;
+        lv_obj_add_event_cb(object, button_clicked, click, page->ui);
     }
-    const bool arrow = action >= ACTION_KEY_BASE + 0x4f && action <= ACTION_KEY_BASE + 0x52;
-    app_ui_add_text(object, text, LV_ALIGN_CENTER, 0, 0, CONNECTION_TEXT,
-                    arrow ? &lv_font_montserrat_16 : app_ui_chinese_font());
+    app_ui_add_text(object, text, LV_ALIGN_CENTER, 0, 0, CONNECTION_TEXT, app_ui_chinese_font());
     return object;
 }
 
@@ -193,105 +196,10 @@ static void motion_event(lv_event_t *event)
     app_pc_remote_set_motion(true);
 }
 
-static void remote_view(remote_page_t *page, remote_view_t view)
-{
-    if (page->view == view) return;
-    app_ui_gyro_calibration_close(&page->calibration);
-    release_motion(page);
-    page->view = view;
-    app_pc_remote_set_air_mode(view == REMOTE_MOUSE);
-    set_visible(page->keyboard_panel, view == REMOTE_KEYBOARD);
-    set_visible(page->mouse_panel, view == REMOTE_MOUSE);
-    set_checked(page->tabs[0], view == REMOTE_KEYBOARD);
-    set_checked(page->tabs[1], view == REMOTE_MOUSE);
-}
-
-static void send_text(remote_page_t *page)
-{
-    const char *text = lv_textarea_get_text(page->text);
-    if (!text[0]) {
-        show_result(page, ESP_OK, "请先输入文本");
-        return;
-    }
-    const esp_err_t error = app_pc_remote_text(text);
-    show_result(page, error, "文本已提交");
-    if (error == ESP_OK) lv_textarea_set_text(page->text, "");
-}
-
-static void keyboard_ready(lv_event_t *event)
-{
-    remote_page_t *page = current_page(event);
-    if (!page || page->view != REMOTE_KEYBOARD) return;
-    app_pc_remote_status_t status;
-    app_pc_remote_get_status(&status);
-    if (can_send(&status)) send_text(page);
-    refresh(page);
-}
-
-static void keyboard_visibility(lv_event_t *event)
-{
-    remote_page_t *page = current_page(event);
-    if (!page || page->view != REMOTE_KEYBOARD) return;
-    const bool visible = lv_event_get_code(event) != LV_EVENT_CANCEL;
-    set_visible(page->keyboard, visible);
-    show_result(page, ESP_OK, visible ? NULL : "点击文本框显示键盘");
-    refresh(page);
-}
-
-static void build_keyboard(remote_page_t *page, lv_obj_t *content)
-{
-    static const char accepted[] =
-        " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\140abcdefghijklmnopqrstuvwxyz{|}~";
-    static const key_choice_t direct[] = {
-        {"Esc",0x29}, {"Tab",0x2b}, {"退格",0x2a}, {LV_SYMBOL_LEFT,0x50},
-        {LV_SYMBOL_UP,0x52}, {LV_SYMBOL_DOWN,0x51}, {LV_SYMBOL_RIGHT,0x4f}, {"回车",0x28},
-    };
-    page->keyboard_panel = panel(content, 108, 242);
-    lv_obj_t *parent = page->keyboard_panel;
-    page->text = lv_textarea_create(parent);
-    lv_textarea_set_one_line(page->text, true);
-    lv_obj_set_size(page->text, 286, 44);
-    lv_textarea_set_accepted_chars(page->text, accepted);
-    lv_textarea_set_max_length(page->text, APP_PC_REMOTE_TEXT_MAX);
-    lv_textarea_set_placeholder_text(page->text, "英文、数字和符号");
-    lv_obj_set_style_text_font(page->text, app_ui_chinese_font(), 0);
-    lv_obj_set_style_text_color(page->text, lv_color_hex(0xEAF2FF), 0);
-    lv_obj_set_style_text_color(page->text, lv_color_hex(0x9CB2D2), LV_PART_TEXTAREA_PLACEHOLDER);
-    lv_obj_set_style_bg_color(page->text, lv_color_hex(CONNECTION_PANEL), 0);
-    app_text_input_style_cursor(page->text, 0x92E7F1);
-    lv_obj_set_style_border_color(page->text, lv_color_hex(CONNECTION_BORDER), 0);
-    lv_obj_set_style_radius(page->text, 12, 0);
-    page->send = button(page, parent, "发送文本", 296, 0, 108, 44, ACTION_TEXT);
-    lv_obj_t *keyboard = lv_keyboard_create(parent);
-    page->keyboard = keyboard;
-    lv_obj_set_size(keyboard, REMOTE_WIDTH, 140);
-    lv_obj_align(keyboard, LV_ALIGN_TOP_LEFT, 0, 48);
-    lv_obj_set_style_bg_opa(keyboard, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(keyboard, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(keyboard, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(keyboard, 4, LV_PART_MAIN);
-    lv_obj_set_style_pad_column(keyboard, 4, LV_PART_MAIN);
-    lv_obj_set_style_radius(keyboard, 7, LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(keyboard, lv_color_hex(CONNECTION_CONTROL), LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(keyboard, lv_color_hex(CONNECTION_BLUE), LV_PART_ITEMS | LV_STATE_PRESSED);
-    lv_obj_set_style_text_color(keyboard, lv_color_hex(0xEAF2FF), LV_PART_ITEMS);
-    lv_obj_set_style_text_font(keyboard, &lv_font_montserrat_16, LV_PART_ITEMS);
-    lv_keyboard_set_textarea(keyboard, page->text);
-    lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
-    /* The keyboard emits READY on the textarea for both Enter and OK. */
-    lv_obj_add_event_cb(page->text, keyboard_ready, LV_EVENT_READY, page->ui);
-    lv_obj_add_event_cb(page->text, keyboard_visibility, LV_EVENT_CANCEL, page->ui);
-    lv_obj_add_event_cb(page->text, keyboard_visibility, LV_EVENT_CLICKED, page->ui);
-    for (size_t i = 0; i < ARRAY_COUNT(direct); ++i)
-        page->direct_keys[i] = button(page, parent, direct[i].label, (int)i * 51, 196, 47, 44,
-                                      ACTION_KEY_BASE + direct[i].usage);
-}
-
 static void build_mouse(remote_page_t *page, lv_obj_t *content)
 {
-    page->mouse_panel = panel(content, 108, 242);
-    lv_obj_t *parent = page->mouse_panel;
-    page->move = button(page, parent, "按住移动", 0, 0, REMOTE_WIDTH, 96, 0);
+    lv_obj_t *parent = panel(content, 54, 296);
+    page->move = button(page, parent, "按住移动", 0, 0, REMOTE_WIDTH, 110, 0);
     lv_obj_set_style_bg_color(page->move, lv_color_hex(0x1D4563), 0);
     lv_obj_set_style_border_color(page->move, lv_color_hex(0x376884), 0);
     lv_obj_set_style_border_width(page->move, 1, 0);
@@ -306,13 +214,15 @@ static void build_mouse(remote_page_t *page, lv_obj_t *content)
     lv_obj_add_event_cb(page->move, motion_event, LV_EVENT_RELEASED, page->ui);
     lv_obj_add_event_cb(page->move, motion_event, LV_EVENT_PRESS_LOST, page->ui);
     lv_obj_add_event_cb(page->move, motion_event, LV_EVENT_INDEV_RESET, page->ui);
-    page->mouse_hint = label(parent, "", 106, REMOTE_WIDTH, 38, 0xAFC6E9);
-    page->mouse_buttons[0] = button(page, parent, "左键", 0, 146, 128, 44, ACTION_LEFT);
-    page->mouse_buttons[1] = button(page, parent, "右键", 138, 146, 128, 44, ACTION_RIGHT);
-    page->mouse_buttons[2] = button(page, parent, "中键", 276, 146, 128, 44, ACTION_MIDDLE);
-    page->recenter = button(page, parent, "回中", 0, 198, 196, 44, ACTION_RECENTER);
-    page->calibrate = button(page, parent, "漂移校准", 208, 198, 196, 44, ACTION_CALIBRATE);
-    set_visible(parent, false);
+    page->mouse_hint = label(parent, "", 115, REMOTE_WIDTH, 25, 0xAFC6E9);
+    page->mouse_buttons[0] = button(page, parent, "左键", 0, 141, 128, 46, ACTION_LEFT);
+    page->mouse_buttons[1] = button(page, parent, "右键", 138, 141, 128, 46, ACTION_RIGHT);
+    page->mouse_buttons[2] = button(page, parent, "中键", 276, 141, 128, 46, ACTION_MIDDLE);
+    for (size_t i = 0; i < ARRAY_COUNT(mouse_shortcuts); ++i)
+        page->direct_keys[i] = button(page, parent, mouse_shortcuts[i].label, (int)i * 103, 195, 95, 44,
+                                      ACTION_SHORTCUT_BASE + i);
+    page->recenter = button(page, parent, "回中", 0, 247, 196, 46, ACTION_RECENTER);
+    page->calibrate = button(page, parent, "漂移校准", 208, 247, 196, 46, ACTION_CALIBRATE);
 }
 
 static size_t key_index(uint8_t usage)
@@ -340,7 +250,7 @@ static void refresh_obs_layout(remote_page_t *page)
     set_visible(page->editor, page->editor_open);
     app_ui_label_text(lv_obj_get_child(page->edit, 0), page->edit_select ? "退出编辑" : "编辑快捷键");
     app_ui_label_text(page->instructions, page->editor_open ? "选择组合键" : page->edit_select ?
-                      "请选择场景" : "先在 OBS 绑定相同快捷键");
+                      "请选择场景" : "长按场景名称修改");
 }
 
 static void open_editor(remote_page_t *page, unsigned slot)
@@ -380,19 +290,123 @@ static void save_shortcut(remote_page_t *page)
     if (error == ESP_OK) close_editor(page);
 }
 
+static void update_scene_name(remote_page_t *page, unsigned slot)
+{
+    char name[APP_PC_REMOTE_SCENE_BYTES];
+    if (app_pc_remote_get_scene_name(slot, name) == ESP_OK)
+        app_ui_label_text(lv_obj_get_child(page->scenes[slot], 0), name);
+}
+
+static void rename_deleted(lv_event_t *event)
+{
+    remote_page_t *page = lv_event_get_user_data(event);
+    page->rename_box = page->rename_field = page->rename_error = NULL;
+}
+
+static void rename_cancel(lv_event_t *event)
+{
+    remote_page_t *page = current_page(event);
+    if (page && page->rename_box) lv_msgbox_close_async(page->rename_box);
+}
+
+static void rename_changed(lv_event_t *event)
+{
+    remote_page_t *page = current_page(event);
+    if (page && page->rename_error) app_ui_label_text(page->rename_error, "");
+}
+
+static void rename_save(lv_event_t *event)
+{
+    remote_page_t *page = current_page(event);
+    if (!page || !page->rename_box) return;
+    const esp_err_t error = app_pc_remote_set_scene_name(page->rename_slot,
+                                                        lv_textarea_get_text(page->rename_field));
+    if (error != ESP_OK) {
+        if (error == ESP_ERR_INVALID_ARG) app_ui_label_text(page->rename_error, "请输入 1 至 16 个字符");
+        else app_ui_label_fmt(page->rename_error, "保存失败 %s", esp_err_to_name(error));
+        return;
+    }
+    update_scene_name(page, page->rename_slot);
+    show_result(page, ESP_OK, "场景名已修改");
+    lv_msgbox_close_async(page->rename_box);
+    refresh(page);
+}
+
+static void rename_layout(void *context, bool keyboard_visible)
+{
+    remote_page_t *page = context;
+    if (page->rename_box)
+        lv_obj_align(page->rename_box, LV_ALIGN_CENTER, 0, keyboard_visible ? -128 : 0);
+}
+
+static void rename_scene(lv_event_t *event)
+{
+    remote_page_t *page = current_page(event);
+    if (!page || page->view != REMOTE_OBS || page->rename_box || page->pair_box || page->editor_open) return;
+    const uintptr_t action = (uintptr_t)lv_obj_get_user_data(lv_event_get_current_target_obj(event));
+    const unsigned slot = (unsigned)(action - ACTION_SCENE_BASE);
+    char name[APP_PC_REMOTE_SCENE_BYTES];
+    if (app_pc_remote_get_scene_name(slot, name) != ESP_OK) return;
+    lv_obj_t *box = app_ui_modal_msgbox(page->ui->screen);
+    if (!box) { show_result(page, ESP_ERR_NO_MEM, NULL); return; }
+    page->rename_box = box;
+    page->rename_slot = slot;
+    lv_obj_add_event_cb(box, rename_deleted, LV_EVENT_DELETE, page);
+    lv_obj_set_style_bg_color(lv_obj_get_parent(box), lv_color_hex(0x05080E), 0);
+    lv_obj_set_style_bg_opa(lv_obj_get_parent(box), LV_OPA_80, 0);
+    lv_obj_set_width(box, 424);
+    lv_obj_set_style_bg_color(box, lv_color_hex(CONNECTION_PANEL), 0);
+    lv_obj_set_style_text_color(box, lv_color_hex(CONNECTION_TEXT), 0);
+    lv_obj_set_style_text_font(box, app_ui_chinese_font(), 0);
+    lv_obj_t *title = lv_msgbox_add_title(box, "重命名场景");
+    lv_obj_set_style_text_font(title, app_ui_chinese_font_size(24), 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(CONNECTION_TEXT), 0);
+    lv_obj_set_style_bg_color(lv_obj_get_parent(title), lv_color_hex(CONNECTION_CONTROL), 0);
+    lv_obj_t *field = lv_textarea_create(lv_msgbox_get_content(box));
+    page->rename_field = field;
+    lv_obj_set_size(field, LV_PCT(100), 52);
+    lv_obj_set_style_text_font(field, app_ui_chinese_font_size(24), 0);
+    app_connection_button_style(field, false);
+    lv_obj_set_style_pad_hor(field, 12, 0);
+    lv_obj_set_style_text_color(field, lv_color_hex(CONNECTION_TEXT), 0);
+    app_text_input_style_cursor(field, 0x92E7F1);
+    lv_textarea_set_one_line(field, true);
+    lv_textarea_set_max_length(field, APP_PC_REMOTE_SCENE_CHARACTERS);
+    lv_textarea_set_text(field, name);
+    page->rename_error = lv_msgbox_add_text(box, "");
+    lv_obj_set_style_text_color(page->rename_error, lv_color_hex(0xFFC28A), 0);
+    lv_obj_add_event_cb(field, rename_changed, LV_EVENT_VALUE_CHANGED, page->ui);
+    lv_obj_add_event_cb(field, rename_save, LV_EVENT_READY, page->ui);
+    lv_obj_add_event_cb(field, rename_cancel, LV_EVENT_CANCEL, page->ui);
+    lv_obj_t *cancel = lv_msgbox_add_footer_button(box, "取消");
+    lv_obj_set_size(cancel, 170, 46);
+    app_connection_button_style(cancel, false);
+    lv_obj_add_event_cb(cancel, rename_cancel, LV_EVENT_CLICKED, page->ui);
+    lv_obj_t *save = lv_msgbox_add_footer_button(box, "保存名称");
+    lv_obj_set_size(save, 170, 46);
+    app_connection_button_style(save, true);
+    lv_obj_add_event_cb(save, rename_save, LV_EVENT_CLICKED, page->ui);
+    lv_obj_center(box);
+    lv_obj_t *dock = app_text_input_create(lv_obj_get_parent(box), field, true, rename_layout, page);
+    if (dock) app_text_input_show(dock, true);
+    else app_ui_label_text(page->rename_error, "屏幕键盘不可用");
+    app_ui_modal_focus(box, field);
+    if (!lv_obj_has_state(field, LV_STATE_FOCUSED)) lv_obj_send_event(field, LV_EVENT_FOCUSED, NULL);
+    lv_textarea_set_cursor_pos(field, LV_TEXTAREA_CURSOR_LAST);
+}
+
 static void build_obs(remote_page_t *page, lv_obj_t *content)
 {
     page->instructions = label(content, "", 63, 270, 24, CONNECTION_DETAIL);
     page->edit = button(page, content, "编辑快捷键", 282, 50, 122, 44, ACTION_EDIT);
-    page->grid = panel(content, 102, 246);
+    page->grid = panel(content, 98, 252);
     static const uint32_t colors[] = {0x8AC9FF, 0x7FDFCE, 0xBAAFF8, 0x95C2CE};
     for (unsigned i = 0; i < APP_PC_REMOTE_SCENES; ++i) {
         /* Physical order is left top/bottom, then right top/bottom. */
-        char scene[24];
-        snprintf(scene, sizeof(scene), "场景 %u", i + 1);
-        lv_obj_t *card = button(page, page->grid, scene, (int)(i / 2) * 208, (int)(i % 2) * 126,
-                                196, 116, ACTION_SCENE_BASE + i);
+        lv_obj_t *card = button(page, page->grid, "", (int)(i / 2) * 206, (int)(i % 2) * 128,
+                                198, 124, ACTION_SCENE_BASE + i);
         page->scenes[i] = card;
+        lv_obj_add_event_cb(card, rename_scene, LV_EVENT_LONG_PRESSED, page->ui);
         lv_obj_set_style_bg_color(card, lv_color_hex(CONNECTION_PANEL), 0);
         lv_obj_set_style_border_color(card, lv_color_hex(CONNECTION_BORDER), 0);
         lv_obj_set_style_border_width(card, 1, 0);
@@ -400,7 +414,11 @@ static void build_obs(remote_page_t *page, lv_obj_t *content)
                         colors[i], &lv_font_montserrat_16);
         lv_obj_t *title = lv_obj_get_child(card, 0);
         lv_obj_set_style_text_font(title, app_ui_chinese_font_size(24), 0);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 36);
+        lv_obj_set_size(title, 180, 34);
+        lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 39);
+        update_scene_name(page, i);
         page->bindings[i] = app_ui_add_text(card, "待配置", LV_ALIGN_BOTTOM_MID, 0, -13,
                                             CONNECTION_DETAIL, app_ui_chinese_font());
         lv_obj_set_width(page->bindings[i], 180);
@@ -538,16 +556,14 @@ static void refresh(remote_page_t *page)
     app_ui_label_text(lv_obj_get_child(page->toggle, 0), status.requested ? "关闭键鼠" : "开启键鼠");
     set_enabled(page->toggle, status.available || status.requested);
     if (page->view == REMOTE_OBS && status.save_error != ESP_OK)
-        app_ui_label_fmt(page->hint, "快捷键保存失败 %s", esp_err_to_name(status.save_error));
+        app_ui_label_text(page->hint, "保存失败，稍后重试");
     else if (page->view == REMOTE_OBS && status.save_pending)
-        app_ui_label_text(page->hint, "正在保存快捷键…");
+        app_ui_label_text(page->hint, "正在保存场景…");
     else if (page->notice[0] && lv_tick_elaps(page->notice_tick) < 2800)
         app_ui_label_text(page->hint, page->notice);
     else if (status.reconnecting) app_ui_label_text(page->hint, "请保持对方蓝牙开启");
     else if (status.last_error != ESP_OK)
         app_ui_label_fmt(page->hint, "蓝牙 %s", esp_err_to_name(status.last_error));
-    else if (ready && page->view == REMOTE_KEYBOARD)
-        app_ui_label_text(page->hint, "使用美式键盘布局");
     else if (ready || !status.requested) app_ui_label_text(page->hint, "");
     else app_ui_label_text(page->hint, "在对方蓝牙列表选 Aether01");
 
@@ -561,7 +577,6 @@ static void refresh(remote_page_t *page)
             indicate_ready(page->scenes[i], ready || page->edit_select);
         }
     } else {
-        indicate_ready(page->send, ready);
         for (size_t i = 0; i < ARRAY_COUNT(page->direct_keys); ++i) indicate_ready(page->direct_keys[i], ready);
         for (size_t i = 0; i < ARRAY_COUNT(page->mouse_buttons); ++i) indicate_ready(page->mouse_buttons[i], ready);
         const bool can_move = ready && status.gyro_ready && status.gyro_calibrated;
@@ -573,7 +588,7 @@ static void refresh(remote_page_t *page)
             !ready ? "连接电脑后可移动鼠标。" : !status.gyro_calibrated ? "平放设备，或点漂移校准" :
             page->motion_held ? "松手停止" : "按住后转动设备");
     }
-    if (!page->calibration.box) refresh_pairing(page, &status);
+    if (!page->calibration.box && !page->rename_box) refresh_pairing(page, &status);
 }
 
 static void button_clicked(lv_event_t *event)
@@ -588,11 +603,7 @@ static void button_clicked(lv_event_t *event)
         if (status.requested) release_motion(page);
         show_result(page, app_pc_remote_set_enabled(!status.requested), NULL);
     } else if (status.confirm_pending) return;
-    else if (action == ACTION_KEYBOARD || action == ACTION_MOUSE) {
-        remote_view(page, action == ACTION_KEYBOARD ? REMOTE_KEYBOARD : REMOTE_MOUSE);
-    } else if (action == ACTION_TEXT && page->view == REMOTE_KEYBOARD) {
-        if (require_link(page, ready)) send_text(page);
-    } else if (action == ACTION_CALIBRATE && page->view == REMOTE_MOUSE) {
+    else if (action == ACTION_CALIBRATE && page->view == REMOTE_MOUSE) {
         release_motion(page);
         app_ui_gyro_calibration_open(page->ui->screen, &page->calibration);
     } else if (action == ACTION_RECENTER && page->view == REMOTE_MOUSE) {
@@ -616,10 +627,12 @@ static void button_clicked(lv_event_t *event)
         const unsigned slot = (unsigned)(action - ACTION_SCENE_BASE);
         if (page->edit_select) open_editor(page, slot);
         else if (require_link(page, ready)) show_result(page, app_pc_remote_trigger(slot), "快捷键已提交");
-    } else if (page->view == REMOTE_KEYBOARD && action >= ACTION_KEY_BASE &&
-               action <= ACTION_KEY_BASE + UINT8_MAX) {
-        if (require_link(page, ready))
-            show_result(page, app_pc_remote_key(0, (uint8_t)(action - ACTION_KEY_BASE)), NULL);
+    } else if (page->view == REMOTE_MOUSE && action >= ACTION_SHORTCUT_BASE &&
+               action < ACTION_SHORTCUT_BASE + ARRAY_COUNT(mouse_shortcuts)) {
+        if (require_link(page, ready)) {
+            const app_pc_shortcut_t binding = mouse_shortcuts[action - ACTION_SHORTCUT_BASE].binding;
+            show_result(page, app_pc_remote_key(binding.modifiers, binding.key), NULL);
+        }
     }
     refresh(page);
 }
@@ -638,8 +651,19 @@ static void page_cleanup(app_ui_t *ui)
     release_motion(page);
     app_pc_remote_release_controls();
     close_pairing(page);
+    if (page->rename_box) lv_msgbox_close(page->rename_box);
     free(page);
     ui->page_context = NULL;
+}
+
+static void page_suspend(app_ui_t *ui, bool suspended)
+{
+    remote_page_t *page = ui->page_context;
+    if (suspended) {
+        app_ui_gyro_calibration_close(&page->calibration);
+        release_motion(page);
+        app_pc_remote_release_controls();
+    } else if (page->view == REMOTE_MOUSE) app_pc_remote_set_air_mode(true);
 }
 
 static void open_page(app_ui_t *ui, remote_view_t view, const char *title)
@@ -651,6 +675,7 @@ static void open_page(app_ui_t *ui, remote_view_t view, const char *title)
     page->view = view;
     ui->page_context = page;
     ui->page_cleanup = page_cleanup;
+    ui->page_suspend = page_suspend;
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *status_card = lv_obj_create(content);
     lv_obj_set_size(status_card, REMOTE_WIDTH, 48);
@@ -664,21 +689,12 @@ static void open_page(app_ui_t *ui, remote_view_t view, const char *title)
     page->toggle = button(page, content, "开启键鼠", 280, 2, 122, 44, ACTION_ENABLE);
     if (view == REMOTE_OBS) build_obs(page, content);
     else {
-        page->tabs[0] = button(page, content, "键盘", 0, 54, 196, 44, ACTION_KEYBOARD);
-        page->tabs[1] = button(page, content, "空气鼠标", 208, 54, 196, 44, ACTION_MOUSE);
-        lv_obj_align(lv_obj_get_child(page->tabs[0], 0), LV_ALIGN_CENTER, 10, 0);
-        lv_obj_align(lv_obj_get_child(page->tabs[1], 0), LV_ALIGN_CENTER, 10, 0);
-        app_ui_add_text(page->tabs[0], LV_SYMBOL_KEYBOARD, LV_ALIGN_CENTER, -30, 0,
-                        CONNECTION_ACCENT, &lv_font_montserrat_16);
-        app_ui_add_text(page->tabs[1], LV_SYMBOL_GPS, LV_ALIGN_CENTER, -43, 0,
-                        CONNECTION_ACCENT, &lv_font_montserrat_16);
-        set_checked(page->tabs[0], true);
-        build_keyboard(page, content);
         build_mouse(page, content);
+        app_pc_remote_set_air_mode(true);
     }
     app_ui_set_timer(ui, page_timer, 150);
     refresh(page);
 }
 
-void app_open_pc_remote(app_ui_t *ui) { open_page(ui, REMOTE_KEYBOARD, "电脑键鼠"); }
+void app_open_pc_remote(app_ui_t *ui) { open_page(ui, REMOTE_MOUSE, "空中飞鼠"); }
 void app_open_obs_switcher(app_ui_t *ui) { open_page(ui, REMOTE_OBS, "OBS 切换台"); }

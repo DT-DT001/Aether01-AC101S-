@@ -790,6 +790,20 @@ static void test_recording_resume_isolation(void)
     player.status.duration_ms = fixture.duration_ms;
     remember_position_locked(&player);
     assert(player.resume_dirty);
+    player.status.state = AETHER_AUDIO_PLAYING;
+    aether_audio_player_set_screen_suspended(&player, true);
+    assert(!controls(&player).pause);
+    player.status.state = AETHER_AUDIO_PAUSED;
+    player.pause_requested = true;
+    aether_audio_player_set_screen_suspended(&player, true);
+    aether_audio_player_set_screen_suspended(&player, false);
+    assert(controls(&player).pause);
+    player.status.state = AETHER_AUDIO_STARTING;
+    player.pause_requested = false;
+    aether_audio_player_set_screen_suspended(&player, true);
+    assert(controls(&player).pause);
+    aether_audio_player_set_screen_suspended(&player, false);
+    assert(!controls(&player).pause);
     const music_resume_t song = player.resume;
     save_preferences(&player, true);
     assert(!player.resume_dirty);
@@ -797,6 +811,11 @@ static void test_recording_resume_isolation(void)
     const unsigned initial_commits = commits;
     for (size_t i = 0; i < sizeof(recordings) / sizeof(recordings[0]); ++i) {
         strcpy(player.status.path, recordings[i]);
+        player.status.state = AETHER_AUDIO_PLAYING;
+        aether_audio_player_set_screen_suspended(&player, true);
+        assert(controls(&player).pause);
+        aether_audio_player_set_screen_suspended(&player, false);
+        assert(!controls(&player).pause);
         remember_position_locked(&player);
         assert(!player.resume_dirty);
         assert(aether_audio_player_get_resume_path(&player, remembered, sizeof(remembered)) == ESP_OK);
@@ -809,6 +828,7 @@ static void test_recording_resume_isolation(void)
     assert(!memcmp(&player.resume, &song, sizeof(song)));
     assert(pthread_mutex_destroy(&player.state_lock) == 0);
     puts("PASS recording auditions preserve the song bookmark and saved legacy recordings are ignored");
+    puts("PASS only active music continues through standby; paused music, pending music and recording auditions are parked");
 }
 
 static bool cancel_mp3(void *context) { return *(bool *)context; }

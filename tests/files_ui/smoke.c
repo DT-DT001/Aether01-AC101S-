@@ -117,7 +117,13 @@ static void deliver(app_ui_t *ui,esp_err_t error)
     free(items);
 }
 #define OPEN(kind,number) void app_open_##kind##_path(app_ui_t *u,const char *p){(void)u;route=number;strlcpy(opened,p,sizeof(opened));}
-OPEN(reader,1) OPEN(video,3) OPEN(nes,4)
+OPEN(video,3) OPEN(nes,4)
+void app_open_reader_path(app_ui_t *ui, const char *path)
+{
+    route = 1;
+    strlcpy(opened, path, sizeof(opened));
+    if (simulate_playback_page) (void)app_ui_begin_page(ui, "小说阅读");
+}
 void app_open_music_path(app_ui_t *ui, const char *path)
 {
     route = 2;
@@ -295,6 +301,24 @@ static void test_nested_recording_back(app_ui_t *ui)
     tap_text(ui->screen, LV_SYMBOL_LEFT);
     assert(find(ui->screen, "录音机") && !ui->page_back);
     puts("PASS Files header Back returns through playback, nested folder, recordings list and Recorder one level at a time");
+}
+
+static void test_txt_browser_return(app_ui_t *ui)
+{
+    simulate_playback_page = true;
+    app_io_entry_t book = {.path = "/sdcard/Books/Session/novel.txt"};
+    app_io_result_t listing = {.operation = APP_IO_CATALOG, .entries = &book, .count = 1, .total_count = 1};
+    app_open_files_path(ui, "/sdcard/Books/Session");
+    complete(ui, &listing);
+    advance(80);
+    tap_text(ui->screen, "novel.txt");
+    assert(route == 1 && !strcmp(opened, book.path) && find(ui->screen, "小说阅读") && ui->page_back);
+    ui->page_back(ui); /* The full-screen reader menu calls the same page back route. */
+    assert(find(ui->screen, "文件浏览") && ui->io_complete && !strcmp(request.path, "/sdcard/Books/Session"));
+    complete(ui, &listing);
+    advance(80);
+    assert(find(ui->screen, "novel.txt"));
+    puts("PASS TXT routes back to its original Files folder instead of the app drawer");
 }
 
 static void snapshot(lv_display_t *d,const char *dir,const char *name){lv_refr_now(d);char p[1024];snprintf(p,sizeof(p),"%s/%s.ppm",dir,name);FILE *f=fopen(p,"wb");assert(f);fprintf(f,"P6\n480 480\n255\n");for(unsigned i=0;i<480*480;++i){uint16_t v=framebuffer[i];uint8_t rgb[]={(v>>11)*255/31,((v>>5)&63)*255/63,(v&31)*255/31};assert(fwrite(rgb,1,3,f)==3);}fclose(f);}
@@ -606,6 +630,7 @@ int main(int argc,char **argv)
         puts("PASS file browser pointer scrolling, catalog-tail selection with bounded recycled rows, error/retry, hotplug and parent navigation");
         test_recordings_back(&ui);
         test_nested_recording_back(&ui);
+        test_txt_browser_return(&ui);
         test_file_operations(&ui, d, argv[1]);
         capture_phone_files(&ui, d, argv[1]);
     }

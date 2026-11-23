@@ -1,18 +1,21 @@
 #include "app_ui_internal.h"
 #include "app_utilities.h"
+#include "app_audio_system.h"
+#include "app_intercom.h"
 #include "app_ui_modal.h"
 #include "app_text_input.h"
 #include "app_telemetry.h"
 #include "app_otg_control.h"
 #include "app_usb_input.h"
 #include "aether_wifi.h"
+#include "src/widgets/buttonmatrix/lv_buttonmatrix_private.h"
 #include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static bool keyboard_present;
+static bool keyboard_present, screen_sleeping;
 static char notes[APP_NOTE_COUNT][APP_NOTE_CAPACITY];
 static app_alarm_snapshot_t alarm_state;
 static app_alarm_slot_t alarm_slots[APP_ALARM_SLOTS];
@@ -30,8 +33,12 @@ static aether_wifi_ap_t access_point = {
     .ssid = "Test network", .password_required = true, .supported = true, .rssi = -40, .channel = 6,
 };
 static unsigned wifi_connections, wifi_preference_changes;
+static app_intercom_status_t intercom;
+static unsigned intercom_enters, intercom_leaves, talk_begins, talk_ends;
+static pcf85063_time_t clock_time = {.year = 2026, .month = 2, .day = 17};
 
 void app_open_wifi(app_ui_t *ui);
+void app_open_intercom(app_ui_t *ui);
 
 extern const lv_font_t font_16, font_24;
 const lv_font_t *app_ui_chinese_font(void) { return app_ui_chinese_font_size(16); }
@@ -45,8 +52,54 @@ const lv_font_t *app_ui_chinese_font_size(unsigned size)
     return size == 24 ? &large : &small;
 }
 const char *esp_err_to_name(esp_err_t error) { return error == ESP_OK ? "OK" : "Error"; }
-bool app_power_is_sleeping(app_power_t *power) { (void)power; return false; }
+bool app_power_is_sleeping(app_power_t *power) { (void)power; return screen_sleeping; }
 bool app_ui_input_blocked(const app_ui_t *ui) { (void)ui; return false; }
+void app_ui_media_control_gate(app_ui_t *ui, bool accept, bool clear)
+{
+    (void)ui;
+    assert(accept && clear);
+}
+esp_err_t app_io_release_media(app_io_handle_t io)
+{
+    assert(io);
+    return ESP_OK;
+}
+esp_err_t app_intercom_enter(ac101s_audio_handle_t codec, app_io_handle_t io)
+{
+    assert(codec && io);
+    ++intercom_enters;
+    intercom.active = true;
+    return ESP_OK;
+}
+void app_intercom_leave(void)
+{
+    ++intercom_leaves;
+    intercom.active = false;
+}
+void app_intercom_set_screen_talk(bool held)
+{
+    if (intercom.transmitting == held) return;
+    if (held) {
+        assert(intercom.active && !screen_sleeping);
+        ++talk_begins;
+    } else ++talk_ends;
+    intercom.transmitting = held;
+}
+void app_intercom_get_status(app_intercom_status_t *status) { *status = intercom; }
+esp_err_t app_intercom_search(void)
+{
+    intercom.radio.state = AETHER_INTERCOM_RADIO_SEARCHING;
+    return ESP_OK;
+}
+esp_err_t app_intercom_forget(void)
+{
+    intercom.radio.state = AETHER_INTERCOM_RADIO_READY;
+    return ESP_OK;
+}
+void app_audio_system_get_snapshot(app_audio_system_snapshot_t *snapshot)
+{
+    *snapshot = (app_audio_system_snapshot_t){.ready = true, .master_volume = 50};
+}
 esp_err_t app_otg_get_status(aether_usb_host_status_t *status)
 {
     *status = (aether_usb_host_status_t){.active = true, .keyboard_interfaces = keyboard_present};
@@ -107,7 +160,7 @@ esp_err_t app_note_save(unsigned note, const char *text)
 }
 void app_telemetry_get(app_telemetry_snapshot_t *out)
 {
-    *out = (app_telemetry_snapshot_t){.rtc_error = ESP_OK, .rtc = {.year = 2026, .month = 2, .day = 17}};
+    *out = (app_telemetry_snapshot_t){.rtc_error = ESP_OK, .rtc = clock_time};
 }
 void app_weather_get(app_weather_snapshot_t *weather) { *weather = forecast; }
 void app_weather_refresh(bool manual) { refreshes += manual; }
@@ -170,6 +223,7 @@ static void close_page(app_ui_t *ui)
     ui->page_context = NULL;
     ui->page_cleanup = NULL;
     ui->page_back = NULL;
+    ui->page_suspend = NULL;
     if (ui->timer) lv_timer_delete(ui->timer);
     ui->timer = NULL;
 }
@@ -187,6 +241,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_t *content = lv_obj_create(ui->screen);
     lv_obj_set_size(content, 448, 394);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, -14);
+    ui->content = content;
     return content;
 }
 
@@ -195,7 +250,7 @@ lv_obj_t *app_ui_add_text(lv_obj_t *parent, const char *text, lv_align_t align,
 {
     lv_obj_t *label = lv_label_create(parent);
     lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
-    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_font(label, font ? font : app_ui_chinese_font(), 0);
     lv_label_set_text(label, text);
     lv_obj_align(label, align, x, y);
     return label;
@@ -894,7 +949,130 @@ static void test_alarm_ui(app_ui_t *ui, lv_display_t *display)
     puts("PASS real pointer: six alarms, add/edit/toggle/delete, ringtone preview, scrolling, actual ring time and 20 repeat openings");
 }
 
-int main(void)
+static void calendar_pick(lv_indev_t *input, lv_obj_t *calendar, unsigned day)
+{
+    lv_obj_t *grid = lv_calendar_get_btnmatrix(calendar);
+    lv_obj_update_layout(calendar);
+    const lv_buttonmatrix_t *matrix = (lv_buttonmatrix_t *)grid;
+    lv_area_t bounds;
+    lv_obj_get_coords(grid, &bounds);
+    for (uint32_t cell = 7; cell < matrix->btn_cnt; ++cell) {
+        if (lv_buttonmatrix_has_button_ctrl(grid, cell, LV_BUTTONMATRIX_CTRL_DISABLED) ||
+            strtoul(lv_buttonmatrix_get_button_text(grid, cell), NULL, 10) != day) continue;
+        const lv_area_t *area = &matrix->button_areas[cell];
+        const int x = bounds.x1 + (area->x1 + area->x2) / 2;
+        const int y = bounds.y1 + (area->y1 + area->y2) / 2;
+        alarm_pointer_sample(input, x, y, true);
+        alarm_pointer_sample(input, x, y, false);
+        assert(lv_calendar_get_highlighted_dates_num(calendar) == 1);
+        assert(lv_calendar_get_highlighted_dates(calendar)[0].day == day);
+        return;
+    }
+    assert(!"Calendar date does not have a tappable cell");
+}
+
+static void test_calendar_ui(app_ui_t *ui, lv_display_t *display)
+{
+    lv_indev_t *input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(input, display);
+    lv_indev_set_read_cb(input, alarm_pointer_read);
+    lv_indev_set_mode(input, LV_INDEV_MODE_EVENT);
+    app_open_calendar(ui);
+    lv_obj_t *calendar = find_type(ui->screen, &lv_calendar_class);
+    assert(calendar);
+    lv_obj_update_layout(ui->screen);
+    assert(lv_obj_get_width(calendar) >= 425 && lv_obj_get_height(calendar) >= 280);
+    const lv_calendar_date_t *shown = lv_calendar_get_showed_date(calendar);
+    assert(shown->year == 2026 && shown->month == 2);
+    assert(lv_calendar_get_highlighted_dates(calendar)[0].day == 17);
+#if LV_USE_CALENDAR_CHINESE
+    assert(find_label(ui->screen, "2 月 17 日  ·  周二  ·  春节"));
+#endif
+    calendar_pick(input, calendar, 2);
+    calendar_pick(input, calendar, 23);
+    alarm_click(input, ui->screen, LV_SYMBOL_RIGHT);
+    assert(shown->month == 3);
+    alarm_click(input, ui->screen, "今天");
+    assert(shown->month == 2 && lv_calendar_get_highlighted_dates(calendar)[0].day == 17);
+
+    clock_time = (pcf85063_time_t){.year = 2099, .month = 12, .day = 31};
+    alarm_click(input, ui->screen, "今天");
+    assert(shown->year == 2099 && shown->month == 12);
+    assert(lv_obj_has_state(lv_obj_get_parent(find_label(ui->screen, LV_SYMBOL_RIGHT)), LV_STATE_DISABLED));
+    clock_time.oscillator_stopped = true;
+    app_open_calendar(ui);
+    assert(find_label(ui->screen, "请在时钟中校准日期"));
+    assert(lv_obj_has_state(lv_obj_get_parent(find_label(ui->screen, "今天")), LV_STATE_DISABLED));
+    calendar = find_type(ui->screen, &lv_calendar_class);
+    shown = lv_calendar_get_showed_date(calendar);
+    assert(shown->year == 2000 && shown->month == 1);
+    assert(lv_obj_has_state(lv_obj_get_parent(find_label(ui->screen, LV_SYMBOL_LEFT)), LV_STATE_DISABLED));
+    clock_time = (pcf85063_time_t){.year = 2026, .month = 2, .day = 17};
+    for (unsigned i = 0; i < 12; ++i) {
+        app_open_calendar(ui);
+        advance(40);
+        assert(lv_mem_test() == LV_RESULT_OK);
+    }
+    lv_indev_delete(input);
+    puts("PASS calendar grid, real day taps, Chinese New Year, Today, clock faults, month limits and 12 reopenings");
+}
+
+static void test_intercom_ui(app_ui_t *ui, lv_display_t *display)
+{
+    static aether_board_t board = {.audio_ready = true, .audio = &board};
+    ui->board = &board;
+    ui->io = ui;
+    intercom = (app_intercom_status_t){.radio = {.state = AETHER_INTERCOM_RADIO_PAIRED, .peer_online = true}};
+    app_open_intercom(ui);
+    assert(ui->page_suspend && intercom_enters == 1 && intercom.active);
+    lv_obj_t *label = find_label(ui->screen, "按住讲话");
+    assert(label);
+    lv_obj_t *talk = lv_obj_get_parent(label);
+    lv_obj_update_layout(ui->screen);
+    assert(lv_obj_get_height(talk) >= 140 && lv_obj_get_width(talk) >= 400);
+    lv_area_t bounds;
+    lv_obj_get_coords(talk, &bounds);
+    lv_indev_t *input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(input, display);
+    lv_indev_set_read_cb(input, alarm_pointer_read);
+    lv_indev_set_mode(input, LV_INDEV_MODE_EVENT);
+    const int center_y = (bounds.y1 + bounds.y2) / 2;
+    alarm_pointer_sample(input, bounds.x1 + 14, center_y, true);
+    assert(talk_begins == 1 && intercom.transmitting);
+    alarm_pointer_sample(input, bounds.x1 + 14, bounds.y1 - 15, true);
+    assert(talk_ends == 1 && !intercom.transmitting);
+    alarm_pointer_sample(input, bounds.x1 + 14, bounds.y1 - 15, false);
+    alarm_pointer_sample(input, bounds.x2 - 14, center_y, true);
+    assert(talk_begins == 2 && intercom.transmitting);
+
+    screen_sleeping = true;
+    ui->page_suspend(ui, true);
+    advance(220);
+    assert(!intercom.active && intercom_leaves == 1 && talk_ends == 2);
+    alarm_pointer_sample(input, bounds.x2 - 14, center_y, false);
+    screen_sleeping = false;
+    ui->page_suspend(ui, false);
+    advance(120);
+    assert(intercom.active && intercom_enters == 2 && talk_begins == 2 && !intercom.transmitting);
+
+    intercom.receiving = true;
+    advance(120);
+    assert(lv_obj_has_state(talk, LV_STATE_DISABLED));
+    alarm_tap(input, talk);
+    assert(talk_begins == 2);
+    intercom.receiving = false;
+    for (unsigned i = 0; i < 8; ++i) {
+        app_open_intercom(ui);
+        advance(40);
+        assert(lv_mem_test() == LV_RESULT_OK);
+    }
+    lv_indev_delete(input);
+    puts("PASS touch-to-talk target area, drag cancellation, sleep release, idle resume, receive lockout and 8 reopenings");
+}
+
+int main(int argc, char **argv)
 {
     lv_init();
     lv_display_t *display = lv_display_create(480, 480);
@@ -903,6 +1081,12 @@ int main(void)
     lv_display_set_buffers(display, ui_buffer, NULL, sizeof(ui_buffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display, ui_flush);
     app_ui_t ui = {0};
+    if (argc == 2 && strcmp(argv[1], "--layout-only") == 0) {
+        test_calendar_ui(&ui, display);
+        test_intercom_ui(&ui, display);
+        close_page(&ui);
+        return 0;
+    }
     app_open_notes(&ui);
     lv_obj_t *field = find_type(ui.screen, &lv_textarea_class);
     lv_obj_t *keyboard = find_type(ui.screen, &lv_keyboard_class);
@@ -926,18 +1110,8 @@ int main(void)
     assert(strcmp(lv_textarea_get_text(field), "") == 0);
     lv_textarea_add_text(field, "second");
 
-    app_open_calendar(&ui);
+    test_calendar_ui(&ui, display);
     assert(strcmp(notes[1], "second") == 0);
-    lv_obj_t *calendar = find_type(ui.screen, &lv_calendar_class);
-    const lv_calendar_date_t *shown = lv_calendar_get_showed_date(calendar);
-    assert(shown->year == 2026 && shown->month == 2);
-#if LV_USE_CALENDAR_CHINESE
-    lv_calendar_date_t date = {2026, 2, 17};
-    assert(strcmp(lv_calendar_get_day_name(&date), "春节") == 0);
-#endif
-    lv_obj_t *next = find_label(ui.screen, LV_SYMBOL_RIGHT);
-    lv_obj_send_event(lv_obj_get_parent(next), LV_EVENT_CLICKED, NULL);
-    assert(lv_calendar_get_showed_date(calendar)->month == 3);
 
     app_open_weather(&ui);
     assert(find_label(ui.screen, "21 °C"));
@@ -950,6 +1124,7 @@ int main(void)
     assert(refreshes == 1);
 
     test_alarm_ui(&ui, display);
+    test_intercom_ui(&ui, display);
 
     app_open_wifi(&ui);
     lv_obj_t *ap_row = find_label(ui.screen, "Test network");

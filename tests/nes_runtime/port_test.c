@@ -78,7 +78,7 @@ static void generate_audio(void *buffer, int samples)
 static void on_frame(const uint16_t *pixels, uint16_t width, uint16_t height,
                      uint32_t number, void *context)
 {
-    assert(pixels == frame && width == 480 && height == 420 && number > 0);
+    assert(pixels == frame && width == 384 && height == 336 && number > 0);
     assert(context == &handle);
     ++frame_callbacks;
     clock_us += callback_us;
@@ -98,6 +98,7 @@ static void reset(void)
     handle.input_gate_context = &handle;
     atomic_init(&handle.stop_requested, false);
     atomic_init(&handle.paused, false);
+    atomic_init(&handle.screen_paused, false);
     atomic_init(&handle.pause_request, -1);
     atomic_init(&handle.external_input, 0);
     handle.running = true;
@@ -189,8 +190,8 @@ static void test_blit_has_no_audio_clock(void)
     for (int y=0;y<224;++y)for(int x=0;x<256;++x)bitmap->line[y][x]=(uint8_t)(x+3*y);
     driver_blit(bitmap, 0, NULL);
     assert(frame_callbacks == 1 && generated == 0 && write_calls == 0);
-    for (unsigned y=0;y<420;++y) for (unsigned x=0;x<480;++x)
-        assert(frame[y*480+x] == (uint8_t)(x*256/480+3*(y*224/420))*17);
+    for (unsigned y=0;y<336;++y) for (unsigned x=0;x<384;++x)
+        assert(frame[y*384+x] == (uint8_t)(x*256/384+3*(y*224/336))*17);
     atomic_store(&handle.paused, true);
     driver_blit(bitmap, 0, NULL);
     assert(frame_callbacks == 1);
@@ -303,12 +304,34 @@ static void test_remote_pause_owner(void)
     atomic_store(&handle.stop_requested, true);
     osd_getinput();
     assert(quit_calls == 1 && !stop_calls && !event_calls[event_togglepause][1]);
+
+    reset();
+    assert(osd_installtimer(60,(void *)tick,0,NULL,0)==0&&timer_running);
+    assert(aether_nes_set_paused(&handle,true)==ESP_OK);
+    assert(aether_nes_set_screen_paused(&handle,true)==ESP_OK);
+    osd_getinput();
+    assert(handle.state==AETHER_NES_PAUSED&&!timer_running&&!touch_reads&&stop_calls==1);
+    osd_waitframe();
+    assert(delay_ticks==pdMS_TO_TICKS(20)&&!touch_reads);
+    assert(aether_nes_set_screen_paused(&handle,false)==ESP_OK);
+    osd_getinput();
+    assert(handle.state==AETHER_NES_PAUSED&&!timer_running&&!start_calls);
+    assert(aether_nes_set_paused(&handle,false)==ESP_OK);
+    osd_getinput();
+    assert(handle.state==AETHER_NES_RUNNING&&timer_running&&start_calls==1);
+    assert(aether_nes_set_screen_paused(&handle,true)==ESP_OK);
+    osd_getinput();
+    assert(handle.state==AETHER_NES_PAUSED&&!timer_running);
+    assert(aether_nes_set_screen_paused(&handle,false)==ESP_OK);
+    osd_getinput();
+    assert(handle.state==AETHER_NES_RUNNING&&timer_running&&start_calls==2);
+    assert(aether_nes_port_shutdown()==ESP_OK);
 }
 
 int main(void)
 {
     test_audio_and_measurement();test_stage_measurement();test_blit_has_no_audio_clock();
-    test_external_controls_and_touch_exit();test_remote_pause_owner();test_timer_cleanup();
+    test_external_controls_and_touch_exit();test_timer_cleanup();test_remote_pause_owner();
     reset();assert(osd_storage_available());card_inserted=false;assert(!osd_storage_available());
     osd_persistence_error("old save retained");osd_persistence_error("later error");
     assert(handle.persistence_error==ESP_FAIL&&handle.last_error==ESP_FAIL&&!strcmp(handle.detail,"old save retained"));
@@ -317,6 +340,6 @@ int main(void)
     config_folder_exists=true;select_config_path();assert(!strcmp(s_config_path,"/sdcard/ROMs/nofrendo.cfg"));
     strcpy(handle.path,"/usb/Games/game.nes");select_config_path();assert(!strcmp(s_config_path,"/usb/ROMs/nofrendo.cfg"));
     config_folder_exists=false;select_config_path();assert(!strcmp(s_config_path,"/usb/nofrendo.cfg"));
-    puts("PASS NES producer exact480x420 nearest pixels, two audio writes/frame, HID edges/disconnect/sleep gate, low-frequency touch exit and100 timer cleanup cycles/faults");
+    puts("PASS NES producer exact384x336 nearest pixels, audio, manual/screen pause isolation and timer/touch suspension, HID release and cleanup faults");
     return 0;
 }

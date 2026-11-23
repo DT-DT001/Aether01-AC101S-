@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include "app_text.h"
+#include "ui/app_screen.h"
 #include "ui/app_scroll_list.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -480,12 +481,13 @@ void app_open_video_path(app_ui_t *ui, const char *path)
     lv_obj_remove_flag(ui->app_obj[0], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     lv_image_set_inner_align(ui->app_obj[0], LV_IMAGE_ALIGN_CONTAIN); lv_obj_center(ui->app_obj[0]);
     page->header = media_panel(ui->screen, 0, 0, 480, 70, LV_OPA_70);
-    media_button(page->header, "返回", 12, 12, 64, media_back, ui);
-    lv_obj_t *name = app_ui_add_text(page->header, base_name(selected), LV_ALIGN_TOP_LEFT, 88, 12, 0xEAF2FF, NULL);
-    lv_obj_set_size(name, 300, 20); lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    ui->app_obj[1] = app_ui_add_text(page->header, "正在准备视频…", LV_ALIGN_TOP_LEFT, 88, 38, 0xAFC6E9, NULL);
-    lv_obj_set_size(ui->app_obj[1], 300, 20); lv_label_set_long_mode(ui->app_obj[1], LV_LABEL_LONG_DOT);
-    lv_obj_t *stop = media_button(page->header, "停止", 404, 12, 64, video_stop_event, ui);
+    media_button(page->header, "返回", APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET, 64, media_back, ui);
+    lv_obj_t *name = app_ui_add_text(page->header, base_name(selected), LV_ALIGN_TOP_LEFT, 112, 12, 0xEAF2FF, NULL);
+    lv_obj_set_size(name, 254, 20); lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    ui->app_obj[1] = app_ui_add_text(page->header, "正在准备视频…", LV_ALIGN_TOP_LEFT, 112, 38, 0xAFC6E9, NULL);
+    lv_obj_set_size(ui->app_obj[1], 254, 20); lv_label_set_long_mode(ui->app_obj[1], LV_LABEL_LONG_DOT);
+    lv_obj_t *stop = media_button(page->header, "停止", 480 - APP_HEADER_SIDE_INSET - 64,
+                                  APP_HEADER_TOP_INSET, 64, video_stop_event, ui);
     lv_obj_add_event_cb(lv_obj_get_parent(stop), video_control_activity, LV_EVENT_ALL, ui);
     page->controls = media_panel(ui->screen, 0, 304, 480, 176, LV_OPA_70);
     page->time = app_ui_add_text(page->controls, "总时长未知", LV_ALIGN_TOP_LEFT, 24, 10, 0xEAF2FF, NULL);
@@ -590,6 +592,7 @@ static void nes_loaded(app_ui_t *ui, const app_io_result_t *result)
     ui->media_started = true;
     ui->touch_restore_pending = false;
     app_frames_set_active(ui->frames, true);
+    app_frames_set_refresh_image(ui->frames, ui->app_obj[0]);
     if (ui->touch_indev) app_touch_set_enabled(ui->touch_indev, false);
     app_ui_set_timer(ui, nes_status_timer, 200);
     esp_err_t err = aether_nes_start(ui->nes, ui->app_path, nes_frame_cb, ui);
@@ -608,15 +611,14 @@ void app_open_nes_path(app_ui_t *ui, const char *path)
     strlcpy(selected, path, sizeof(selected));
     lv_obj_t *content = media_fullscreen(ui, "NES 模拟器");
     if (!ui->nes) {
-        media_button(ui->screen, "返回", 14, 12, 72, media_back, ui);
+        media_button(ui->screen, "返回", APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET, 72, media_back, ui);
         app_ui_add_text(content, "NES 未就绪，请检查触摸和存储", LV_ALIGN_CENTER, 0, 0, 0xFF8888, NULL); return;
     }
     lv_obj_t *viewport = content;
     ui->app_obj[0] = lv_image_create(viewport);
-    lv_obj_set_size(ui->app_obj[0], 480, 480);
-    lv_obj_add_event_cb(ui->app_obj[0], media_contain_ext_draw, LV_EVENT_REFR_EXT_DRAW_SIZE, NULL);
-    app_frames_set_viewport(ui->frames, 480, 480);
-    lv_image_set_inner_align(ui->app_obj[0], LV_IMAGE_ALIGN_CONTAIN);
+    lv_obj_set_size(ui->app_obj[0], AETHER_NES_OUTPUT_WIDTH, AETHER_NES_OUTPUT_HEIGHT);
+    app_frames_set_viewport(ui->frames, AETHER_NES_OUTPUT_WIDTH, AETHER_NES_OUTPUT_HEIGHT);
+    lv_image_set_inner_align(ui->app_obj[0], LV_IMAGE_ALIGN_CENTER);
     lv_image_set_antialias(ui->app_obj[0], false);
     lv_obj_remove_flag(ui->app_obj[0], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_center(ui->app_obj[0]);
@@ -625,7 +627,8 @@ void app_open_nes_path(app_ui_t *ui, const char *path)
                                      app_ui_chinese_font());
     lv_obj_set_size(ui->app_obj[1], 440, 204);
     lv_label_set_long_mode(ui->app_obj[1], LV_LABEL_LONG_WRAP);
-    ui->app_obj[2] = lv_obj_get_parent(media_button(ui->screen, "返回", 14, 12, 72, media_back, ui));
+    ui->app_obj[2] = lv_obj_get_parent(media_button(ui->screen, "返回",
+        APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET, 72, media_back, ui));
 
     ui->page_cleanup = nes_cleanup;
     app_ui_set_user_key_exit(ui, true);

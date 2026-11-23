@@ -88,7 +88,22 @@ idf_component_register(
              aether_video_player aether_bluetooth aether_wifi aether_intercom_radio aether_intercom_audio aether_nes co5300_display
              aether_usb_camera aether_camera_record aether_image esp_driver_jpeg
              aether_gnss esp_driver_uart esp_lvgl_port esp_psram esp_timer esp_app_format spi_flash lvgl nvs_flash fatfs esp_netif lwip
-             esp_http_client mbedtls esp_partition)
+             esp_http_client mbedtls esp_partition esp_pm)
+if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_PM_ENABLE)
+    target_link_options(${COMPONENT_LIB} INTERFACE "LINKER:--wrap=lv_timer_handler")
+endif()
+if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_IDF_TARGET_ESP32S31)
+    # Keep the factory slot compatible with installed devices. Prefer code
+    # size for setup, configuration and other non-realtime page handlers.
+    set_property(SOURCE
+        app_io.c app_power.c app_tools.c app_utilities.c app_weather_data.c
+        app_gps.c app_otg.c app_audio_system.c app_pc_remote.c
+        apps/app_system.c apps/app_utilities.c apps/app_controls.c
+        apps/app_sensors.c apps/app_motion.c apps/app_displacement.c apps/app_gps.c
+        apps/app_usb.c apps/app_bluetooth.c apps/app_pc_remote.c apps/app_wifi.c
+        apps/app_recorder.c apps/app_intercom.c ui/app_home.c apps/app_files.c
+        APPEND PROPERTY COMPILE_OPTIONS -Os)
+endif()
 # Pull the project custom memory provider before the later LVGL archive is read.
 # All nine public allocator entry points live in this single object.
 if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_LV_USE_CUSTOM_MALLOC)

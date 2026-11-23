@@ -34,6 +34,7 @@ static bool s_started;
 static bool s_warm_imu;
 static bool s_quiesce_requested;
 static bool s_quiesced;
+static bool s_screen_suspended;
 static bool s_imu_available;
 static app_gyro_calibration_status_t s_gyro_calibration;
 static uint32_t s_gyro_generation, s_gyro_deadline_ms;
@@ -213,6 +214,18 @@ void app_telemetry_resume(void)
     portEXIT_CRITICAL(&s_lock);
 }
 
+void app_telemetry_set_screen_suspended(bool suspended)
+{
+    portENTER_CRITICAL(&s_lock);
+    if (s_screen_suspended != suspended) {
+        s_screen_suspended = suspended;
+        ++s_interest_generation;
+        s_snapshot.imu_error = ESP_ERR_NOT_FINISHED;
+        s_snapshot.barometer_error = ESP_ERR_NOT_FINISHED;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
 void app_telemetry_set_interest(uint32_t mask)
 {
     mask &= APP_TELEMETRY_IMU | APP_TELEMETRY_BAROMETER;
@@ -353,6 +366,26 @@ static bool collect_gyro_sample(qmi8658a_handle_t imu, gyro_calibration_job_t *j
     return error == ESP_OK;
 }
 
+static void update_sensor_sleep(aether_board_t *board, bool suspended,
+                                uint32_t *sleeping, uint32_t *uncertain)
+{
+    const uint32_t target = suspended ? APP_TELEMETRY_IMU | APP_TELEMETRY_BAROMETER : 0;
+    const uint32_t changed = (*sleeping ^ target) | *uncertain;
+    uint32_t verified = 0;
+    if (board->imu_ready && (changed & APP_TELEMETRY_IMU) &&
+        qmi8658a_set_sleep(board->imu, suspended) == ESP_OK)
+        verified |= APP_TELEMETRY_IMU;
+    if (board->barometer_ready && (changed & APP_TELEMETRY_BAROMETER) &&
+        dps368_set_sleep(board->barometer, suspended) == ESP_OK)
+        verified |= APP_TELEMETRY_BAROMETER;
+    *sleeping = (*sleeping & ~verified) | (target & verified);
+    /* A failed readback can follow a successful write. Retry on the next
+     * transition even if the recorded mode already matches its destination. */
+    *uncertain = changed & ~verified;
+    if (verified) ESP_LOGI("telemetry", "screen sensor power mode=%s verified=0x%x",
+                          suspended ? "standby" : "running", (unsigned)verified);
+}
+
 static void telemetry_task(void *argument)
 {
     aether_board_t *board = argument;
@@ -365,6 +398,8 @@ static void telemetry_task(void *argument)
     const uint32_t warm_until = uptime_ms() + 12000;
     bool warm_imu = s_warm_imu && board->imu_ready;
     bool previous_measurement = false;
+    bool previous_suspend = false;
+    uint32_t sleeping_sensors = 0, uncertain_sensors = 0, sensor_retry_due = 0;
     float pressures[3] = {0};
     unsigned pressure_count = 0, pressure_index = 0;
     unsigned imu_reads = 0, still_reads = 0;
@@ -375,6 +410,7 @@ static void telemetry_task(void *argument)
         /* This acknowledgement is published only between complete read batches.
          * Once observed by quiesce(), no sensor or RTC transaction remains live. */
         const bool paused = s_quiesce_requested;
+        const bool suspended = s_screen_suspended;
         s_quiesced = paused;
         const uint32_t interest = s_interest;
         const uint32_t generation = s_interest_generation;
@@ -388,10 +424,14 @@ static void telemetry_task(void *argument)
             void (*probe)(void *) = s_media_probe;
             void *context = s_media_probe_context;
             portEXIT_CRITICAL(&s_lock);
-            if (!paused && probe) probe(context);
+            if (!paused && !suspended && probe) probe(context);
             media_due = now + 5000;
         }
         if (paused) {
+            /* The shutdown coordinator now owns and verifies the sensors. */
+            sleeping_sensors = 0;
+            uncertain_sensors = 0;
+            sensor_retry_due = 0;
             pressure_count = pressure_index = 0;
             if (consumer) consumer(NULL);
             if (measurement_consumer) measurement_consumer(NULL);
@@ -399,11 +439,25 @@ static void telemetry_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        app_display_sync_poll_diagnostics(board->display_io);
-        const bool measurement = measurement_consumer && measurement_requested && measurement_requested();
-        bool sampling_started;
-        const bool gyro_sampling = prepare_gyro_calibration(board->imu, &gyro_job, now,
-                                                              measurement, &sampling_started);
+        const bool suspension_changed = suspended != previous_suspend;
+        if (suspension_changed || (int32_t)(now - sensor_retry_due) >= 0) {
+            update_sensor_sleep(board, suspended, &sleeping_sensors, &uncertain_sensors);
+            sensor_retry_due = now + 250;
+        }
+        if (suspension_changed) {
+            if (suspended && measurement_consumer) measurement_consumer(NULL);
+            pressure_count = pressure_index = 0;
+            due_imu = due_baro = now;
+            previous_suspend = suspended;
+        }
+        if (!suspended) app_display_sync_poll_diagnostics(board->display_io);
+        const uint32_t parked_sensors = sleeping_sensors | uncertain_sensors;
+        const bool can_sample_imu = !suspended && !(parked_sensors & APP_TELEMETRY_IMU);
+        const bool measurement = can_sample_imu && measurement_consumer &&
+            measurement_requested && measurement_requested();
+        bool sampling_started = false;
+        const bool gyro_sampling = can_sample_imu && prepare_gyro_calibration(
+            board->imu, &gyro_job, now, measurement, &sampling_started);
         if (sampling_started) due_imu = now;
         if (measurement != previous_measurement) due_imu = now;
         previous_measurement = measurement;
@@ -423,7 +477,8 @@ static void telemetry_task(void *argument)
                          (int)(1000 * sqrtf(corrected_squared / still_reads)));
             } else ESP_LOGI("imu", "startup calibration: no qualified stationary samples (%u reads)", imu_reads);
         }
-        const bool sample_imu = measurement || warm_imu || gyro_sampling || (interest & APP_TELEMETRY_IMU);
+        const bool sample_imu = can_sample_imu &&
+            (measurement || warm_imu || gyro_sampling || (interest & APP_TELEMETRY_IMU));
         const bool read_imu = sample_imu && (int32_t)(now - due_imu) >= 0;
         bool waiting_for_frame = false;
         esp_err_t imu_error = ESP_ERR_NOT_FINISHED;
@@ -460,7 +515,8 @@ static void telemetry_task(void *argument)
             next.imu_error = ESP_ERR_NOT_FINISHED;
             due_imu = uptime_ms();
         }
-        if ((interest & APP_TELEMETRY_BAROMETER) && (int32_t)(now - due_baro) >= 0) {
+        if (!suspended && !(parked_sensors & APP_TELEMETRY_BAROMETER) &&
+            (interest & APP_TELEMETRY_BAROMETER) && (int32_t)(now - due_baro) >= 0) {
             dps368_sample_t reading;
             const esp_err_t error = board->barometer_ready
                 ? dps368_read(board->barometer, &reading) : ESP_ERR_NOT_FOUND;
@@ -499,7 +555,7 @@ static void telemetry_task(void *argument)
             s_snapshot.rtc_updated_ms = next.rtc_updated_ms;
         }
         portEXIT_CRITICAL(&s_lock);
-        if (consumer) consumer(&next);
+        if (consumer) consumer(suspended ? NULL : &next);
         if (measurement && read_imu) {
             if (waiting_for_frame) next.imu_error = ESP_ERR_NOT_FINISHED;
             measurement_consumer(&next);
@@ -532,7 +588,7 @@ static void telemetry_task(void *argument)
                     (unsigned long)display.dropped_regions, display.staging_error);
             }
         }
-        unsigned sleep_ms = sample_imu ? 10U : 50U;
+        unsigned sleep_ms = suspended ? 100U : sample_imu ? 10U : 50U;
         if (measurement) {
             const int32_t until_imu = (int32_t)(due_imu - uptime_ms());
             if (until_imu <= 0) sleep_ms = 1U;

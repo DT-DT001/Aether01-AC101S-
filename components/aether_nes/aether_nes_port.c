@@ -28,12 +28,13 @@ static const char *TAG = "aether_nes_port";
 static aether_nes_handle_t s_active;
 static void (*s_audio_callback)(void *buffer, int length);
 static esp_timer_handle_t s_timer;
+static uint32_t s_timer_period_us;
+static bool s_timer_paused, s_manual_paused;
 typedef void (*nes_tick_func_t)(void);
 static _Atomic(nes_tick_func_t) s_tick_func;
 static unsigned s_old_input_mask;
 static bool s_consume_touch, s_consume_external;
 static int64_t s_touch_due_us, s_exit_touch_us;
-static uint8_t s_expand_x[AETHER_NES_OUTPUT_WIDTH];
 static int64_t s_input_due_us;
 static int64_t s_metrics_us;
 static uint32_t s_metrics_emulated;
@@ -74,8 +75,7 @@ void aether_nes_port_set_active(aether_nes_handle_t handle)
     s_consume_touch = true;
     s_consume_external = false;
     s_touch_due_us = 0; s_exit_touch_us = 0;
-    for (unsigned x = 0; x < AETHER_NES_OUTPUT_WIDTH; ++x)
-        s_expand_x[x] = (uint8_t)(x * AETHER_NES_FRAME_WIDTH / AETHER_NES_OUTPUT_WIDTH);
+    s_manual_paused = false;
     s_input_due_us = 0;
     s_metrics_us = esp_timer_get_time();
     s_metrics_emulated = 0;
@@ -210,7 +210,8 @@ void osd_frame_end(void)
 void osd_waitframe(void)
 {
     osd_getinput();
-    vTaskDelay(1);
+    const TickType_t pause_poll = pdMS_TO_TICKS(20);
+    vTaskDelay(s_active && atomic_load(&s_active->paused) && pause_poll ? pause_poll : 1);
 }
 
 void osd_setsound(void (*playfunc)(void *buffer, int length))
@@ -253,7 +254,9 @@ int osd_installtimer(int frequency, void *func, int funcsize, void *counter,
         if (esp_timer_create(&args, &s_timer) != ESP_OK) return -1;
     }
     atomic_store(&s_tick_func, (nes_tick_func_t)func);
-    const esp_err_t started = esp_timer_start_periodic(s_timer, 1000000U / (uint32_t)frequency);
+    s_timer_period_us = 1000000U / (uint32_t)frequency;
+    s_timer_paused = false;
+    const esp_err_t started = esp_timer_start_periodic(s_timer, s_timer_period_us);
     if (started != ESP_OK) atomic_store(&s_tick_func, NULL);
     return started == ESP_OK ? 0 : -1;
 }
@@ -326,9 +329,10 @@ static void driver_blit(bitmap_t *bitmap, int num_dirties,
         bitmap->width < (int)AETHER_NES_FRAME_WIDTH ||
         bitmap->height < (int)AETHER_NES_FRAME_HEIGHT || atomic_load(&s_active->paused)) return;
     const int64_t convert_begin = esp_timer_get_time();
-    /* Expand once on the producer. LVGL receives an exact480x420 RGB565 image,
-     * so every20-line flush can use its unscaled path. Vertical duplicates are
-     * memcpy'd rather than palette-converted again; there is no alpha overlay. */
+    /* Nearest-neighbor 3:2 expansion keeps the original aspect ratio. The
+     * 384x336 rectangle takes 10.75ms of raw QSPI at 48MHz, leaving time to
+     * render and submit it within the panel's roughly 16.7ms TE interval. */
+    _Static_assert(AETHER_NES_OUTPUT_WIDTH * 2 == AETHER_NES_FRAME_WIDTH * 3, "NES output scale");
     unsigned previous_y = UINT_MAX;
     for (unsigned y = 0; y < AETHER_NES_OUTPUT_HEIGHT; ++y) {
         const unsigned source_y = y * AETHER_NES_FRAME_HEIGHT / AETHER_NES_OUTPUT_HEIGHT;
@@ -337,8 +341,12 @@ static void driver_blit(bitmap_t *bitmap, int num_dirties,
                                            AETHER_NES_OUTPUT_WIDTH * sizeof(*dst));
         else {
             const uint8_t *src = bitmap->line[source_y];
-            for (unsigned x = 0; x < AETHER_NES_OUTPUT_WIDTH; ++x)
-                dst[x] = s_active->palette565[src[s_expand_x[x]]];
+            for (unsigned x = 0; x < AETHER_NES_FRAME_WIDTH; x += 2, dst += 3) {
+                const uint16_t first = s_active->palette565[src[x]];
+                dst[0] = first;
+                dst[1] = first;
+                dst[2] = s_active->palette565[src[x + 1]];
+            }
         }
         previous_y = source_y;
     }
@@ -370,10 +378,34 @@ esp_err_t aether_nes_set_paused(aether_nes_handle_t handle, bool paused)
     return ESP_OK;
 }
 
+esp_err_t aether_nes_set_screen_paused(aether_nes_handle_t handle, bool paused)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    atomic_store(&handle->screen_paused, paused);
+    return ESP_OK;
+}
+
 /* Only the emulator task may call Nofrendo events or change its audio owner. */
 static void apply_pause(bool paused)
 {
     if (atomic_exchange(&s_active->paused, paused) == paused) return;
+    if (paused && s_timer && s_timer_period_us) {
+        const esp_err_t stopped = esp_timer_stop(s_timer);
+        s_timer_paused = stopped == ESP_OK || stopped == ESP_ERR_INVALID_STATE;
+    } else if (!paused && s_timer_paused) {
+        const esp_err_t started = esp_timer_start_periodic(s_timer, s_timer_period_us);
+        if (started != ESP_OK) {
+            portENTER_CRITICAL(&s_active->lock);
+            s_active->last_error = started;
+            s_active->state = AETHER_NES_ERROR;
+            strlcpy(s_active->detail, "NES 定时器恢复失败", sizeof(s_active->detail));
+            portEXIT_CRITICAL(&s_active->lock);
+            atomic_store(&s_active->stop_requested, true);
+            main_quit();
+            return;
+        }
+        s_timer_paused = false;
+    }
     if (paused && s_active->audio_started) {
         const esp_err_t stopped = ac101s_audio_stop(s_active->audio);
         s_active->audio_started = stopped != ESP_OK;
@@ -421,18 +453,24 @@ void osd_getinput(void)
         return;
     }
     const int pause_request = atomic_exchange(&s_active->pause_request, -1);
-    if (pause_request >= 0) apply_pause(pause_request != 0);
+    if (pause_request >= 0) s_manual_paused = pause_request != 0;
+    const bool screen_paused = atomic_load(&s_active->screen_paused);
+    apply_pause(s_manual_paused || screen_paused);
+    if (atomic_load(&s_active->stop_requested)) return;
     const int64_t now = esp_timer_get_time();
     if (now < s_input_due_us) return;
     s_input_due_us = now + 8000;
     unsigned mask = atomic_load(&s_active->external_input);
-    const bool gated = s_active->input_gate && s_active->input_gate(s_active->input_gate_context);
+    const bool gated = screen_paused || (s_active->input_gate && s_active->input_gate(s_active->input_gate_context));
     if (!mask) s_consume_external = false;
     else if (gated) s_consume_external = true;
     if (gated || s_consume_external) mask = 0;
     /* The screen has no joypad hit boxes. Low-frequency raw touch only supports
      * holding the upper-left72x72 corner for1.2s to leave a game without HID. */
-    if (now >= s_touch_due_us) {
+    if (screen_paused) {
+        s_consume_touch = true;
+        s_exit_touch_us = 0;
+    } else if (now >= s_touch_due_us) {
         s_touch_due_us = now + 125000;
         esp_lcd_touch_point_data_t points[OSD_TOUCH_POINTS];
         uint8_t count = 0;
@@ -462,15 +500,13 @@ void osd_getinput(void)
     /* All emulator-global state stays on its owner task. Touch buttons are
      * edge-triggered so holding a finger cannot repeatedly pause or reset. */
     if ((changed & mask) & (1U << 8)) {
-        apply_pause(!atomic_load(&s_active->paused));
+        s_manual_paused = !s_manual_paused;
+        apply_pause(s_manual_paused);
     }
     if ((changed & mask) & (1U << 9)) {
-        if (atomic_exchange(&s_active->paused, false)) {
-            event_t resume = event_get(event_togglepause);
-            if (resume) resume(INP_STATE_MAKE);
-            if (s_active->audio && !s_active->audio_started)
-                s_active->audio_started = ac101s_audio_start(s_active->audio, 65, 0.0f) == ESP_OK;
-        }
+        s_manual_paused = false;
+        apply_pause(false);
+        if (atomic_load(&s_active->stop_requested)) return;
         event_t reset = event_get(event_hard_reset);
         if (reset) reset(INP_STATE_MAKE);
         portENTER_CRITICAL(&s_active->lock);
@@ -486,7 +522,6 @@ void osd_getinput(void)
             }
         }
     }
-    if (atomic_load(&s_active->paused)) vTaskDelay(pdMS_TO_TICKS(20));
 }
 
 void osd_getmouse(int *x, int *y, int *button)
@@ -585,5 +620,7 @@ esp_err_t aether_nes_port_shutdown(void)
     }
     s_audio_callback = NULL;
     s_active = NULL;
+    s_timer_paused = false;
+    s_timer_period_us = 0;
     return error;
 }

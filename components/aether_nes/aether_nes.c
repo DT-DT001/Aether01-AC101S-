@@ -173,10 +173,9 @@ static void nes_task(void *argument)
     if (atomic_load(&handle->stop_requested)) {
         goto done;
     }
-    if (handle->audio && ac101s_audio_start(handle->audio, 65, 0.0f) == ESP_OK) {
-        handle->audio_started = true;
-    } else {
-        ESP_LOGW(TAG, "NES audio unavailable; emulator continues silently");
+    if (!atomic_load(&handle->screen_paused) && atomic_load(&handle->pause_request) != 1) {
+        handle->audio_started = handle->audio && ac101s_audio_start(handle->audio, 65, 0.0f) == ESP_OK;
+        if (!handle->audio_started) ESP_LOGW(TAG, "NES audio unavailable; emulator continues silently");
     }
 
     aether_nes_port_set_active(handle);
@@ -188,6 +187,7 @@ static void nes_task(void *argument)
         if (handle->persistence_error == ESP_OK) set_detail(handle,detail);
         result = ESP_FAIL;
     }
+    if (handle->state == AETHER_NES_ERROR) result = handle->last_error;
     const esp_err_t port_stopped = aether_nes_port_shutdown();
     handle->port_cleanup_pending = port_stopped != ESP_OK;
     if (port_stopped != ESP_OK) { result = port_stopped; set_detail(handle, "NES定时器停止失败，等待清理后重试"); }
@@ -222,7 +222,7 @@ done:
         handle->release_frame_requested = false;
     }
     if (result == ESP_OK && handle->persistence_error != ESP_OK) result = handle->persistence_error;
-    if (result != ESP_OK && (!stopped || handle->audio_started || handle->port_cleanup_pending ||
+    if (result != ESP_OK && (!stopped || handle->state == AETHER_NES_ERROR || handle->audio_started || handle->port_cleanup_pending ||
                             handle->persistence_error != ESP_OK)) {
         handle->last_error = result;
         handle->state = AETHER_NES_ERROR;
@@ -250,6 +250,7 @@ esp_err_t aether_nes_new(aether_storage_handle_t storage,
     handle->lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     atomic_init(&handle->stop_requested, false);
     atomic_init(&handle->paused, false);
+    atomic_init(&handle->screen_paused, false);
     atomic_init(&handle->pause_request, -1);
     atomic_init(&handle->external_input, 0);
     handle->storage = storage;

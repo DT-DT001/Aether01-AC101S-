@@ -121,6 +121,7 @@ static unsigned expect_recording_pcm(const uint8_t *pcm, size_t begin, size_t en
 
 static void read_plan(const struct read_step *steps, unsigned n)
 { memcpy(reads,steps,n*sizeof(*steps)); read_count=n; read_index=0; fill_offset=0; }
+int i2s_channel_enable(i2s_chan_handle_t channel) { assert(channel); return ESP_OK; }
 int i2s_channel_read(i2s_chan_handle_t rx, void *data, size_t bytes, size_t *received, unsigned timeout)
 {
     assert(rx==(void*)2 && data && bytes && !pa && mute && codec_open && audio->capture_ready);

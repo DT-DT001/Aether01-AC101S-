@@ -8,18 +8,23 @@ compatibility and real-device FPS are not established by host tests.
 The owner task runs at priority7 with its existing12KiB stack. It advances APU
 time for every emulated frame, including undisplayed frames, and writes800 mono
 samples as two400-sample stereo fragments. No periodic console log is emitted
-from the supply loop. The producer palette-converts and nearest-expands256x224
-into480x420 RGB565 in PSRAM; LVGL consumes the unscaled image with no controller
-or title overlays. This frame buffer is403200 bytes,288512 bytes larger than the
-previous native frame. Releasing the page requests safe deferred deallocation.
+from the supply loop. The producer uses a 3:2 nearest-neighbor expansion from
+256×224 to 384×336 RGB565. The resulting 258,048-byte image fits the centered
+viewport without further LVGL scaling. At 48 MHz QSPI, pixel transfer alone
+takes 10.75 ms within the panel's approximately 16.7 ms scan period. LVGL
+adopts the latest complete frame at refresh start and keeps its source stable
+through all DMA strips, with the existing TE alignment before the first strip.
+Releasing the page requests safe deferred deallocation.
 
 `aether_nes_set_external_input(handle,buttons)` publishes a complete snapshot
 without calling the core, audio, filesystem or LVGL. Bits0..7 are UP,DOWN,LEFT,
 RIGHT,A,B,SELECT,START; bits8/9/10 are edge-triggered PAUSE,RESET,EXIT. Send zero
 on controller disconnect or host shutdown. Nonzero input is rejected while no
 session runs or a stop barrier owns cleanup; zero always releases stale state.
-Sleeping input is consumed until all buttons are released and never wakes the
-screen. Holding the upper-left72x72 screen corner for1.2s exits without a HID
+Screen-off and in-game pause are independent. A screen wake clears only the
+screen-off pause. Both pause states stop the emulation tick timer and audio.
+Screen-off suspends raw touch reads and consumes held inputs through release.
+Holding the upper-left72x72 screen corner for1.2s exits without a HID
 controller; screen contacts do not supply joypad input. The raw touch poll rate
 is8Hz instead of one I2C read per emulated frame.
 

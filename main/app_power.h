@@ -37,14 +37,20 @@ typedef struct {
     void *task;
     bool sleeping;
     bool dimmed;
+    bool apps_suspended;
     bool render_paused; /* Own exactly one LVGL invalidation-disable reference. */
     bool key_irq_enabled;
+    bool user_key_irq_enabled, power_key_irq_enabled;
     bool user_key_irq_pending, user_key_irq_seen;
     uint32_t user_key_irq_tick;
     int64_t user_key_irq_at_us;
     void (*user_key_handler)(void *, int64_t);
     void (*user_key_press_handler)(void *, int64_t);
     void *user_key_context;
+    void (*screen_hook)(void *, bool);
+    void *screen_hook_context;
+    void *awake_pm_lock;
+    bool awake_pm_lock_held;
     uint32_t timeout_seconds;
     uint8_t brightness;
     uint8_t applied_brightness;
@@ -97,6 +103,9 @@ void app_power_set_persistence_guard(app_power_t *manager, bool (*busy)(void *),
 /** Install once during initialization; replacing an active hook is rejected. */
 esp_err_t app_power_set_shutdown_hook(app_power_t *manager,
     app_power_shutdown_hook_t hook, void *context);
+/** Called under the LVGL lock once per display transition. Callback must
+ * return promptly and leave asynchronous cleanup to the relevant owners. */
+void app_power_set_screen_hook(app_power_t *manager, void (*hook)(void *, bool), void *context);
 /** True while asleep or a sleep request is pending; safe from the input task. */
 bool app_power_is_sleeping(const app_power_t *manager);
 /** Enqueue a transition; panel I/O runs in the power task. */
@@ -105,7 +114,7 @@ esp_err_t app_power_wake(app_power_t *manager);
 
 /* BOOT/user-key held for two seconds while awake. The power task passes the
  * original press timestamp so a new page cannot inherit an earlier hold.
- * A sleeping press wakes and is consumed. The TG29 key is independent. */
+ * Presses while asleep are consumed. Only the TG29 key handles button wake. */
 esp_err_t app_power_set_user_key_handler(app_power_t *manager, void (*handler)(void *, int64_t), void *context);
 /* Optional down-edge action shares the user-key handler context. An awake,
  * unblocked press invokes it once while the key is still down. The regular

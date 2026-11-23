@@ -91,6 +91,19 @@ int main(void)
     keyboard(0,false);advance(20);assert(clicks[0]==before+4);
     puts("PASS reset cancels Enter gesture; sleep/queued-sleep, NES page gate and disable consume held keys/buttons through wake without injecting clicks");
 
+    lv_group_focus_obj(one);
+    const unsigned before_capture=clicks[0];
+    keyboard(40,false);advance(16);
+    assert(app_usb_input_capture_keys(true)&&app_usb_input_take_captured_usage()==0);
+    keyboard(40,false);advance(20);assert(app_usb_input_take_captured_usage()==0);
+    keyboard(0,false);keyboard(0x45,false);keyboard(0,false);
+    assert(app_usb_input_take_captured_usage()==0x45&&app_usb_input_take_captured_usage()==0);
+    keyboard(40,false);
+    assert(app_usb_input_take_captured_usage()==40&&app_usb_input_capture_keys(false));
+    advance(20);keyboard(0,false);advance(20);
+    assert(clicks[0]==before_capture);key(40,false);assert(clicks[0]==before_capture+1);
+    puts("PASS binding capture accepts raw F12 and Enter, ignores initially held keys and consumes through modal close");
+
     lv_group_t *base=lv_group_get_default();
     lv_group_focus_obj(one);
     lv_obj_t *modal=lv_obj_create(screen);lv_obj_set_size(modal,480,480);lv_obj_set_pos(modal,0,0);

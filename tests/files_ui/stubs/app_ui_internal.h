@@ -1,6 +1,6 @@
 #pragma once
 #include "lvgl.h"
-#include "app_io.h"
+#include "../../../main/app_io.h"
 #include <stdarg.h>
 typedef struct app_ui app_ui_t;
 typedef struct {

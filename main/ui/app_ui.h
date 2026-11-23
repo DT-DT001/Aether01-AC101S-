@@ -32,6 +32,8 @@ esp_err_t app_ui_quiesce_storage_resume(app_ui_t *ui);
 
 /* Cache-only input gate, retained until an aborted shutdown resumes IO. */
 bool app_ui_input_blocked(const app_ui_t *ui);
+/** Pause the foreground and preserve its screen. Called under the LVGL lock. */
+void app_ui_screen_suspend(void *context, bool suspended);
 
 /* Power-task publication only; the GUI checks page identity before navigation. */
 void app_ui_queue_user_key(void *context, int64_t pressed_at_us);

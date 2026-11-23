@@ -474,6 +474,13 @@ int main(void)
     result = load(io,path);
     assert(result.offset == 4242 && result.encoding_hint == 2 && result.turn_mode == APP_READER_TURN_TAP_VERTICAL);
     puts("PASS v1/v2 bookmarks upgrade and v3 page turn preference persists without a binary layout change");
+    const char *same_name_other_directory = "/sdcard/Other/one.txt";
+    const char *same_path_other_volume = "/usb/Books/one.txt";
+    save(io, same_name_other_directory, 1234);
+    save(io, same_path_other_volume, 9876);
+    assert(load(io, same_name_other_directory).offset == 1234);
+    assert(load(io, same_path_other_volume).offset == 9876);
+    assert(load(io, path).offset == 4242);
     puts("PASS safe paths and immediate close/reopen SAVE-before-LOAD ordering");
     size_t before = writes;
     for (unsigned i = 0; i < 20; ++i) save(io, path, 5000 + i);
@@ -611,6 +618,11 @@ int main(void)
     test_file_operations(io);
     test_usb_and_shutdown(io,path);
     destroy_io(io);
+    assert(app_io_start((void *)1, NULL, NULL, NULL, &io) == ESP_OK);
+    assert(load(io, same_name_other_directory).offset == 1234);
+    assert(load(io, same_path_other_volume).offset == 9876);
+    destroy_io(io);
+    puts("PASS bookmarks for same filename under different folders and volumes survive IO reboot");
     init_error = ESP_FAIL; assert(app_io_start((void *)1, NULL, NULL, NULL, &io) == ESP_OK);
     assert(app_io_bookmark_status(io) == ESP_FAIL && load(io, path).error == ESP_FAIL);
     app_io_request_t bad = {.operation = APP_IO_READER_SAVE}; strlcpy(bad.path, path, sizeof(bad.path));

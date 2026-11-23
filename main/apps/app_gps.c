@@ -21,6 +21,7 @@ typedef struct {
     unsigned last_satellite_count;
     bool satellites_published;
     bool had_fix;
+    bool resume_on_wake;
     uint32_t state_color;
     esp_err_t submit_error;
 } gps_page_t;
@@ -200,7 +201,36 @@ static void update_gps(app_ui_t *ui)
     else app_ui_label_text(page->help, status.external_power ? "USB 输入供电，不启用 OTG。" : "");
 }
 
-static void gps_timer(lv_timer_t *timer) { update_gps(lv_timer_get_user_data(timer)); }
+static void gps_resume(app_ui_t *ui)
+{
+    gps_page_t *page = ui->page_context;
+    if (!page->resume_on_wake) return;
+    app_gps_status_t status;
+    app_gps_get_status(&status);
+    if (status.state == APP_GPS_STOPPING) return;
+    page->resume_on_wake = false;
+    page->submit_error = app_gps_set_enabled(true);
+}
+
+static void gps_suspend(app_ui_t *ui, bool suspended)
+{
+    gps_page_t *page = ui->page_context;
+    if (!suspended) {
+        gps_resume(ui);
+        return;
+    }
+    app_gps_status_t status;
+    app_gps_get_status(&status);
+    page->resume_on_wake |= status.requested_enabled;
+    app_gps_cancel();
+}
+
+static void gps_timer(lv_timer_t *timer)
+{
+    app_ui_t *ui = lv_timer_get_user_data(timer);
+    gps_resume(ui);
+    update_gps(ui);
+}
 
 static void gps_command(lv_event_t *event)
 {
@@ -209,7 +239,9 @@ static void gps_command(lv_event_t *event)
     if (!page) return;
     app_gps_status_t status;
     app_gps_get_status(&status);
-    page->submit_error = app_gps_set_enabled(!(status.requested_enabled || status.active || status.state == APP_GPS_POWERING));
+    const bool was_enabled = page->resume_on_wake || status.requested_enabled || status.active || status.state == APP_GPS_POWERING;
+    page->resume_on_wake = false;
+    page->submit_error = app_gps_set_enabled(!was_enabled);
     update_gps(ui);
 }
 
@@ -227,6 +259,7 @@ void app_open_gps(app_ui_t *ui)
     if (!page) { text(content, "定位界面内存不足", 0, 0, 380, 0xFFB7A5, app_ui_chinese_font()); return; }
     ui->page_context = page;
     ui->page_cleanup = gps_cleanup;
+    ui->page_suspend = gps_suspend;
     lv_obj_set_style_pad_all(content, 12, 0);
     lv_obj_set_scroll_dir(content, LV_DIR_VER);
     const lv_font_t *small = app_ui_chinese_font();

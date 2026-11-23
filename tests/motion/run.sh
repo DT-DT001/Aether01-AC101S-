@@ -20,6 +20,6 @@ cc -std=c11 -Wall -Wextra -Werror -O1 -g -pthread -fsanitize=address,undefined \
     -I"$root/tests/power/telemetry_stubs" -I"$root/tests/tg29/stubs" \
     -I"$root/tests/bluetooth_runtime/stubs" -I"$root/tests/nes_controls/stubs" \
     -I"$root/components/aether_bluetooth/include" -I"$root/main" \
-    "$root/main/app_air_mouse.c" "$root/main/app_pc_remote.c" \
+    "$root/main/app_air_mouse.c" "$root/main/app_pc_remote.c" "$root/main/app_text.c" \
     "$root/tests/motion/pc_remote_test.c" -lm -o "$out/pc_remote_test"
 "$out/pc_remote_test"

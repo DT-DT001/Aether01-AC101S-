@@ -27,6 +27,7 @@ struct aether_mjpeg_player_t {
     bool running;
     atomic_bool stop_requested;
     atomic_bool pause_requested;
+    bool user_paused, screen_paused;
     aether_mjpeg_state_t state;
     esp_err_t last_error;
     uint32_t frame_number;
@@ -325,7 +326,8 @@ esp_err_t aether_mjpeg_player_play(aether_mjpeg_player_handle_t handle,
     handle->frame_cb = frame_cb;
     handle->user_ctx = user_ctx;
     handle->stop_requested = false;
-    handle->pause_requested = false;
+    handle->user_paused = false;
+    handle->pause_requested = handle->screen_paused;
     handle->frame_number = 0;
     handle->width = 0;
     handle->height = 0;
@@ -355,10 +357,20 @@ esp_err_t aether_mjpeg_player_set_paused(aether_mjpeg_player_handle_t handle,
     portENTER_CRITICAL(&handle->lock);
     const bool running = handle->running;
     if (running) {
-        atomic_store(&handle->pause_requested, paused);
+        handle->user_paused = paused;
+        atomic_store(&handle->pause_requested, paused || handle->screen_paused);
     }
     portEXIT_CRITICAL(&handle->lock);
     return running ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+void aether_mjpeg_player_set_screen_paused(aether_mjpeg_player_handle_t handle, bool paused)
+{
+    if (!handle) return;
+    portENTER_CRITICAL(&handle->lock);
+    handle->screen_paused = paused;
+    atomic_store(&handle->pause_requested, paused || handle->user_paused);
+    portEXIT_CRITICAL(&handle->lock);
 }
 
 esp_err_t aether_mjpeg_player_set_fps(aether_mjpeg_player_handle_t handle, uint8_t fps)

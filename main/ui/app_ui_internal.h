@@ -36,6 +36,7 @@ struct app_ui {
     uint32_t app_value;
     lv_timer_t *timer;
     void (*page_cleanup)(app_ui_t *ui);
+    void (*page_suspend)(app_ui_t *ui, bool suspended);
     bool (*page_can_exit)(app_ui_t *ui, void (*destination)(app_ui_t *));
     void (*page_back)(app_ui_t *ui);
     void *page_context;
@@ -55,6 +56,7 @@ struct app_ui {
     bool io_media_pending;
     lv_obj_t *shutdown_overlay;
     atomic_bool storage_resume_pending;
+    atomic_bool screen_suspended;
     bool shutdown_failure_shown;
     bool user_key_exit_armed, user_key_exit_pending;
     int64_t user_key_armed_at_us;
@@ -65,6 +67,7 @@ struct app_ui {
 
 extern const lv_font_t font_16;
 extern const lv_font_t font_24;
+
 
 const lv_font_t *app_ui_chinese_font(void);
 const lv_font_t *app_ui_chinese_font_size(unsigned px);

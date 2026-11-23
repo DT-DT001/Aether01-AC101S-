@@ -54,6 +54,7 @@ typedef struct {
 struct ac101s_audio_dev_t {
     i2s_chan_handle_t tx;
     i2s_chan_handle_t rx;
+    bool tx_enabled, rx_enabled;
     i2c_master_dev_handle_t codec;
     gpio_num_t pa_enable;
     uint32_t sample_rate_hz;
@@ -119,6 +120,42 @@ static bool take_io_mutex(ac101s_audio_handle_t handle)
     const TickType_t elapsed = xTaskGetTickCount() - began;
     const TickType_t budget = pdMS_TO_TICKS(4500);
     return elapsed < budget && xSemaphoreTake(handle->mutex, budget - elapsed) == pdTRUE;
+}
+
+static esp_err_t ensure_clocks(ac101s_audio_handle_t handle)
+{
+    if (!handle->tx_enabled) {
+        const esp_err_t error = i2s_channel_enable(handle->tx);
+        if (error != ESP_OK) return error;
+        handle->tx_enabled = true;
+    }
+    if (!handle->rx_enabled) {
+        const esp_err_t error = i2s_channel_enable(handle->rx);
+        if (error != ESP_OK) return error;
+        handle->rx_enabled = true;
+    }
+    return ESP_OK;
+}
+
+esp_err_t ac101s_audio_idle_clocks(ac101s_audio_handle_t handle)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(handle->mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t error = ESP_ERR_INVALID_STATE;
+    if (!handle->board_owner && (!handle->started || handle->external_started) &&
+        (!handle->capture_active || handle->capture_external)) {
+        error = ESP_OK;
+        if (handle->rx_enabled) {
+            error = i2s_channel_disable(handle->rx);
+            if (error == ESP_OK) handle->rx_enabled = false;
+        }
+        if (error == ESP_OK && handle->tx_enabled) {
+            error = i2s_channel_disable(handle->tx);
+            if (error == ESP_OK) handle->tx_enabled = false;
+        }
+    }
+    xSemaphoreGive(handle->mutex);
+    return error;
 }
 
 esp_err_t ac101s_audio_new(const ac101s_audio_config_t *config,
@@ -191,8 +228,7 @@ esp_err_t ac101s_audio_new(const ac101s_audio_config_t *config,
     ESP_GOTO_ON_ERROR(i2s_channel_register_event_callback(handle->tx, &callbacks, handle), fail,
                       TAG, "monitor I2S TX queue");
 #endif
-    ESP_GOTO_ON_ERROR(i2s_channel_enable(handle->tx), fail, TAG, "enable I2S TX");
-    ESP_GOTO_ON_ERROR(i2s_channel_enable(handle->rx), fail, TAG, "enable I2S RX");
+    ESP_GOTO_ON_ERROR(ensure_clocks(handle), fail, TAG, "enable I2S clocks");
 
     ESP_GOTO_ON_ERROR(ac101s_codec_new(config->i2c_bus, &handle->codec), fail, TAG,
                       "init AC101S at I2C 0x33");
@@ -332,7 +368,9 @@ static esp_err_t start_locked(ac101s_audio_handle_t handle, int volume, float mi
     const int effective = alert ? speaker_volume(volume, master) :
         (volume ? AC101S_AUDIO_SPEAKER_VOLUME_MAX : 0);
     const bool enabled = effective && master;
-    esp_err_t err = ac101s_codec_start(handle->codec, false, mic_gain_db);
+    esp_err_t err = ensure_clocks(handle);
+    if (err != ESP_OK) return err;
+    err = ac101s_codec_start(handle->codec, false, mic_gain_db);
     if (err == ESP_OK) err = ac101s_codec_set_speaker(handle->codec, effective);
     if (err == ESP_OK && enabled) err = gpio_set_level(handle->pa_enable, 1);
     if (err != ESP_OK) {
@@ -430,6 +468,11 @@ static esp_err_t capture_start_locked(ac101s_audio_handle_t handle, float gain_d
         err = handle->usb_source.start(handle->usb_source.context);
         if (err != ESP_OK) capture_stop_locked(handle);
         else handle->capture_ready = true;
+        return err;
+    }
+    err = ensure_clocks(handle);
+    if (err != ESP_OK) {
+        handle->capture_active = false;
         return err;
     }
     err = ac101s_codec_start(handle->codec, true, gain_db);
@@ -788,11 +831,11 @@ esp_err_t ac101s_audio_del(ac101s_audio_handle_t handle)
         }
     }
     if (handle->tx) {
-        i2s_channel_disable(handle->tx);
+        if (handle->tx_enabled) i2s_channel_disable(handle->tx);
         i2s_del_channel(handle->tx);
     }
     if (handle->rx) {
-        i2s_channel_disable(handle->rx);
+        if (handle->rx_enabled) i2s_channel_disable(handle->rx);
         i2s_del_channel(handle->rx);
     }
     gpio_set_level(handle->pa_enable, 0);

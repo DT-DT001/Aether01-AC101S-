@@ -1,5 +1,6 @@
 #include "app_telemetry.h"
 #include "app_arcade.h"
+#include "app_tools.h"
 #include "app_ui_internal.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -34,10 +35,18 @@ static bool imu_publish_during_read;
 static bool imu_gyro_bias_valid = true;
 static float imu_gravity = 9.80665f;
 static float imu_roll_bias;
+static app_tools_arcade_preferences_t arcade_preferences;
 
 uint32_t esp_random(void) { return 41; }
 int64_t esp_timer_get_time(void) { return (int64_t)(clock_ms + callback_elapsed_ms) * 1000; }
 bool app_power_is_sleeping(const app_power_t *power) { (void)power; return sleeping; }
+app_tools_arcade_preferences_t app_tools_get_arcade_preferences(void) { return arcade_preferences; }
+void app_tools_set_arcade_tilt(app_tools_arcade_control_t control, bool tilt)
+{
+    if (tilt) arcade_preferences.tilt_modes |= control;
+    else arcade_preferences.tilt_modes &= ~control;
+}
+void app_tools_set_crates_level(uint8_t level) { arcade_preferences.crates_level = level; }
 void app_telemetry_set_interest(uint32_t mask) { interest = mask; }
 void app_telemetry_get(app_telemetry_snapshot_t *snapshot)
 {
@@ -105,6 +114,13 @@ void app_ui_set_timer(app_ui_t *ui, lv_timer_cb_t callback, uint32_t period_ms)
 
 void app_ui_clear_timer(app_ui_t *ui) { lv_timer_pause(ui->timer); }
 
+static void header_back(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    if (ui->page_back) ui->page_back(ui);
+    else app_ui_begin_page(ui, "应用列表");
+}
+
 lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
 {
     interest = 0;
@@ -129,6 +145,11 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_remove_flag(ui->screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x070A12), 0);
     lv_obj_set_style_text_font(ui->screen, app_ui_chinese_font(), 0);
+    lv_obj_t *back = lv_button_create(ui->screen);
+    lv_obj_set_size(back, 48, 44);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET);
+    app_ui_add_text(back, LV_SYMBOL_LEFT, LV_ALIGN_CENTER, 0, 0, 0xBFD7FF, &lv_font_montserrat_20);
+    lv_obj_add_event_cb(back, header_back, LV_EVENT_CLICKED, ui);
     app_ui_add_text(ui->screen, title, LV_ALIGN_TOP_MID, 0, 20, 0xEAF2FF, app_ui_chinese_font_size(24));
     ui->content = lv_obj_create(ui->screen);
     lv_obj_set_size(ui->content, 448, 394);
@@ -416,7 +437,8 @@ int main(int argc, char **argv)
     assert(ui.page_back == app_open_game);
     assert(!interest && label_visible(ui.screen, "滑动棋盘") && label_visible(ui.screen, "滑动"));
     assert(!label_visible(ui.screen, LV_SYMBOL_GPS));
-    lv_obj_t *board = lv_obj_get_child(ui.content, 4);
+    assert(!find(ui.content, LV_SYMBOL_LIST));
+    lv_obj_t *board = lv_obj_get_child(ui.content, 3);
     assert(lv_obj_get_width(board) >= 280 && lv_obj_get_height(board) >= 280);
     arcade_tiles_t expected_swipe;
     arcade_tiles_init(&expected_swipe, esp_random());
@@ -515,7 +537,7 @@ int main(int argc, char **argv)
     advance(150);
     assert(find(ui.screen, "轻倾移块，回正后再倾"));
     screenshot(display, argv[1], "game-2048");
-    click(ui.content, LV_SYMBOL_LIST);
+    click(ui.screen, LV_SYMBOL_LEFT);
     assert(!ui.page_context && !interest && cleanups == 1);
     puts("PASS LVGL 2048 default swipe in four directions with release/reset/sleep guards, mode/board retention, gyro directions and sensor fault handling");
 
@@ -581,7 +603,8 @@ int main(int argc, char **argv)
     screenshot(display, argv[1], "game-crates");
     tap(next);
     assert(find(ui.screen, "2 / 6  ·  0 步"));
-    click(ui.content, LV_SYMBOL_LIST);
+    assert(arcade_preferences.crates_level == 1);
+    click(ui.screen, LV_SYMBOL_LEFT);
     assert(cleanups == 2 && !interest);
     puts("PASS LVGL Sokoban 320×320, board and both screen margins/bottom touch, center/hold/sleep guards, undo, completion and next level");
 
@@ -725,12 +748,12 @@ int main(int argc, char **argv)
     imu_gravity = 9.80665f;
     imu_roll_bias = 0;
     pitch_angle = roll_angle = 0;
-    click(ui.content, LV_SYMBOL_LIST);
+    click(ui.screen, LV_SYMBOL_LEFT);
     assert(cleanups == 3);
     puts("PASS LVGL Snake 406×318, board and both screen margin touch, pause/start/center/tilt guards, Replay, calibration fallback and gravity steering");
 
     click(ui.content, "跳一跳");
-    board = lv_obj_get_child(ui.content, 4);
+    board = lv_obj_get_child(ui.content, 3);
     assert(find(ui.screen, "按住蓄力，松手跳跃"));
     press(board, 300);
     screenshot(display, argv[1], "game-jump-charge");
@@ -762,7 +785,9 @@ int main(int argc, char **argv)
     puts("PASS LVGL jump charging, landing, input reset, sleep cancellation, falling and held exit");
 
     click(ui.content, "2048");
-    board = lv_obj_get_child(ui.content, 4);
+    assert(interest && label_visible(ui.screen, "倾斜"));
+    click(ui.content, "倾斜");
+    board = lv_obj_get_child(ui.content, 3);
     assert(lv_obj_get_event_count(board) == 4);
     press(board, 45);
     extend_drag(84, 0);
@@ -777,7 +802,11 @@ int main(int argc, char **argv)
     static const char *const region_games[] = {"推箱子", "贪吃蛇"};
     for (unsigned i = 0; i < sizeof(region_games) / sizeof(region_games[0]); ++i) {
         click(ui.content, region_games[i]);
-        if (i) click(ui.content, "开始游戏");
+        if (i) {
+            assert(interest && label_visible(ui.screen, "模式 · 倾斜"));
+            click(ui.content, "模式 · 倾斜");
+            click(ui.content, "开始游戏");
+        } else assert(find(ui.screen, "2 / 6  ·  0 步"));
         board = i ? region_board(ui.content, 406, 318) : region_board(ui.content, 320, 320);
         lv_obj_t *surface = region_surface(board);
         assert(lv_obj_get_event_count(board) == 1 && lv_obj_get_event_count(surface) > 0);
@@ -793,6 +822,7 @@ int main(int argc, char **argv)
     }
     assert(cleanups == 7);
     puts("PASS held margin-touch exit retires both game boards' draw and surface callbacks safely");
+    puts("PASS reopening 2048 and Snake restores independent control modes; Sokoban resumes its saved level");
 
     static const char *const games[] = {"2048", "推箱子", "贪吃蛇", "跳一跳"};
     for (unsigned i = 0; i < 24; ++i) {
@@ -802,6 +832,9 @@ int main(int argc, char **argv)
         assert(!ui.page_context && !interest && lv_mem_test() == LV_RESULT_OK);
     }
     assert(cleanups == 31);
+    click(ui.screen, LV_SYMBOL_LEFT);
+    assert(label_visible(ui.screen, "应用列表") && !ui.page_context);
+    puts("PASS the common header Back returns from a game to the hub and from the hub to the drawer");
     lv_timer_delete(ui.timer);
     lv_deinit();
     puts("PASS 24 game entry/exit cycles with LVGL");

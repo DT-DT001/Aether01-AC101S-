@@ -59,6 +59,18 @@ esp_err_t qmi8658a_read_fresh(void *h, qmi8658a_sample_t *s)
 {
     return atomic_load(&no_new_imu_frame) ? ESP_ERR_NOT_FINISHED : qmi8658a_read(h, s);
 }
+esp_err_t qmi8658a_set_sleep(void *handle, bool sleep)
+{
+    assert(handle);
+    (void)sleep;
+    return ESP_OK;
+}
+esp_err_t dps368_set_sleep(void *handle, bool sleep)
+{
+    assert(handle);
+    (void)sleep;
+    return ESP_OK;
+}
 bool qmi8658a_gyro_zero_add(qmi8658a_gyro_zero_t *window, const qmi8658a_sample_t *sample)
 {
     assert(!auto_bias_enabled);

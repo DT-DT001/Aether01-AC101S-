@@ -15,6 +15,7 @@ static const char *book_path;
 static const char *fixture_directory;
 static bool mounted = true;
 static bool usb_blocked;
+static bool dense_shelf;
 static unsigned book_catalog_calls,music_catalog_calls,text_calls;
 static int64_t now_us;
 static lv_point_t pointer;
@@ -55,6 +56,7 @@ bool app_io_bookmark_pending(app_io_handle_t io) { (void)io; return false; }
 esp_err_t app_io_submit_request(app_io_handle_t io, const app_io_request_t *q)
 { (void)io; assert(q->operation == APP_IO_READER_SAVE); saved = *q; has_saved = true; return ESP_OK; }
 esp_err_t app_io_release_media(app_io_handle_t io) { (void)io; return ESP_OK; }
+void app_io_cancel(app_io_handle_t io, uint32_t generation) { (void)io; (void)generation; }
 
 void app_ui_request_io_ex(app_ui_t *ui, const app_io_request_t *q,
                           void (*complete)(app_ui_t *, const app_io_result_t *))
@@ -70,7 +72,7 @@ void app_ui_request_io_ex(app_ui_t *ui, const app_io_request_t *q,
             return;
         }
         struct stat info; assert(!stat(book_path, &info));
-        r.count = r.total_count = q->filter == APP_IO_MUSIC ? 2 : 1;
+        r.count = r.total_count = q->filter == APP_IO_MUSIC ? 2 : dense_shelf ? 14 : 1;
         r.entries = calloc(r.count, sizeof(*r.entries)); assert(r.entries);
         strlcpy(r.entries->path, q->filter == APP_IO_MUSIC ?
                 "/sdcard/Music/海边的风.mp3" : book_path, sizeof(r.entries->path));
@@ -80,6 +82,11 @@ void app_ui_request_io_ex(app_ui_t *ui, const app_io_request_t *q,
             const char *paths[] = {r.entries[0].path, r.entries[1].path};
             r.error = aether_audio_player_set_playlist(ui->audio_player, paths, r.count);
             r.playlist_prepared = r.error == ESP_OK;
+        } else if (dense_shelf) {
+            for (size_t i = 0; i + 1 < r.count; ++i)
+                snprintf(r.entries[i].path, sizeof(r.entries[i].path), "/sdcard/Books/book-%zu.txt", i);
+            strlcpy(r.entries[r.count - 1].path, book_path, sizeof(r.entries[0].path));
+            r.entries[r.count - 1].size = (uint64_t)info.st_size;
         }
     } else if (q->operation == APP_IO_READER_LOAD) {
         r.font_px = has_saved ? saved.font_px : 24; r.dark = has_saved ? saved.dark : true;
@@ -126,6 +133,8 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
     if (ui->page_cleanup) { ui->page_cleanup(ui); ui->page_cleanup = NULL; }
     ui->page_back = NULL;
+    ui->page_suspend = NULL;
+    ui->io_complete = NULL;
     lv_obj_t *old = ui->screen;
     ui->screen = lv_obj_create(NULL); lv_obj_remove_flag(ui->screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x070A12), 0);
@@ -142,6 +151,13 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_screen_load(ui->screen); if (old) lv_obj_delete(old);
     return ui->content;
 }
+bool app_ui_go_back(app_ui_t *ui)
+{
+    assert(ui->page_back);
+    ui->page_back(ui);
+    return true;
+}
+static void parent_files(app_ui_t *ui) { (void)app_ui_begin_page(ui, "文件管理"); }
 void app_ui_set_timer(app_ui_t *ui, lv_timer_cb_t callback, uint32_t ms)
 {
     if (ui->timer) lv_timer_delete(ui->timer);
@@ -243,7 +259,7 @@ static void gesture(int x, int y, int end_x, int end_y, unsigned hold_ms)
     advance(70);
 }
 
-static void show_reader_toolbar(void) { gesture(220, 145, 220, 145, 700); }
+static void show_reader_toolbar(void) { gesture(220, 145, 220, 145, 2100); }
 static void swipe_next(void) { gesture(385, 150, 85, 150, 60); }
 static void swipe_previous(void) { gesture(85, 150, 385, 150, 60); }
 static void snapshot(const char *directory, const char *name)
@@ -308,6 +324,8 @@ int main(int argc, char **argv)
     assert(lv_obj_has_flag(toolbar, LV_OBJ_FLAG_HIDDEN));
     assert(!find_text(ui.screen, "下一页") && !find_text(ui.screen, "上一页"));
     const unsigned before_modes = text_calls;
+    gesture(220, 145, 220, 145, 1700);
+    assert(lv_obj_has_flag(toolbar, LV_OBJ_FLAG_HIDDEN));
     show_reader_toolbar();
     assert(!lv_obj_has_flag(toolbar, LV_OBJ_FLAG_HIDDEN) && text_calls == before_modes);
     assert(find_text_contains(ui.screen,"0.0% · ") && !find_text_contains(ui.screen,"缺字0/坏码0"));
@@ -357,6 +375,33 @@ int main(int argc, char **argv)
     assert(has_saved && saved.encoding_hint == 1 && find_text(ui.screen,"UTF-8"));
     click(&ui,"UTF-8"); click(&ui,"GBK"); click(&ui,"UTF-16LE"); click(&ui,"UTF-16BE");
     assert(find_text(ui.screen,"自动编码"));
+    const char *book_label = strrchr(book_path, '/') + 1;
+    dense_shelf = true;
+    app_open_reader(&ui);
+    lv_obj_t *shelf = lv_obj_get_child(ui.content, 3);
+    lv_obj_update_layout(ui.screen);
+    lv_obj_scroll_to_y(shelf, 14 * 59, LV_ANIM_OFF);
+    const int32_t shelf_scroll = lv_obj_get_scroll_y(shelf);
+    const unsigned scans = book_catalog_calls;
+    assert(shelf_scroll > 0 && find_text(ui.screen, book_label));
+    click(&ui, book_label);
+    assert(lv_obj_has_flag(ui.content, LV_OBJ_FLAG_HIDDEN));
+    assert(ui.page_suspend);
+    ui.page_suspend(&ui, true);
+    assert(has_saved && !strcmp(saved.path, book_path));
+    ui.page_suspend(&ui, false);
+    show_reader_toolbar();
+    click(&ui, "退出");
+    assert(!lv_obj_has_flag(ui.content, LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_get_child(ui.content, 3) == shelf && lv_obj_get_scroll_y(shelf) == shelf_scroll);
+    assert(book_catalog_calls == scans);
+    dense_shelf = false;
+    app_open_reader_path(&ui, book_path);
+    ui.page_back = parent_files;
+    show_reader_toolbar();
+    click(&ui, "退出");
+    assert(find_text(ui.screen, "文件管理") && !find_text(ui.screen, "书架"));
+    puts("PASS reader 2s toolbar, sleep snapshot, preserved shelf scroll and explicit Files return");
     for (unsigned i = 0; i < 50; ++i) { app_open_reader(&ui); app_open_reader_path(&ui, book_path); tick(); }
     ui.audio_player = (aether_audio_player_handle_t)1;
     fixture_directory = argv[2];

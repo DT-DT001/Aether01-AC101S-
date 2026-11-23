@@ -225,8 +225,12 @@ static void test_errors(app_ui_t *ui)
 }
 static void test_nes(app_ui_t *ui)
 {
-    app_open_nes_path(ui,"/sdcard/ROMs/全屏测试.nes");deliver(ui,ESP_OK);assert(ui->media_active&&!touch_enabled&&user_exit_arms);fixture(480,420,true);nes_callback(pixels,480,420,1,nes_context);nes.emulation_fps_x100=5980;nes.render_fps_x100=3000;advance(220);
-    dimensions(ui,480,420,480,420);assert(!lv_image_get_antialias(ui->app_obj[0]));capture(ui,"nes-playing");
+    app_open_nes_path(ui,"/sdcard/ROMs/全屏测试.nes");deliver(ui,ESP_OK);assert(ui->media_active&&!touch_enabled&&user_exit_arms);fixture(384,336,true);nes_callback(pixels,384,336,1,nes_context);nes.emulation_fps_x100=5980;nes.render_fps_x100=3000;advance(220);
+    lv_obj_t *image=ui->app_obj[0];lv_area_t viewport=area(image);
+    assert(viewport.x1==48&&viewport.y1==72&&viewport.x2==431&&viewport.y2==407);
+    assert(lv_image_get_src_width(image)==384&&lv_image_get_src_height(image)==336);
+    assert(lv_image_get_inner_align(image)==LV_IMAGE_ALIGN_CENTER&&!lv_image_get_antialias(image));
+    capture(ui,"nes-playing");
     const char *buttons[]={"A","B","SEL","STA","暂停","重启"};
     for(unsigned i=0;i<sizeof(buttons)/sizeof(*buttons);++i)assert(!find(ui->screen,buttons[i]));
     assert(hidden(ui->app_obj[1])&&hidden(ui->app_obj[2])&&lv_obj_get_child_count(ui->screen)==3);
@@ -238,7 +242,7 @@ static void test_nes(app_ui_t *ui)
     unsigned stops=nes_stops,releases=nes_releases;send_click(ui,"返回");assert(nes_stops==stops+1&&nes_releases==releases+1);touch_enabled=true;
     nes_error=ESP_FAIL;app_open_nes_path(ui,"/sdcard/ROMs/test.nes");deliver(ui,ESP_OK);assert(!ui->media_active&&!ui->media_started);nes_error=ESP_OK;
     app_open_nes_path(ui,"/sdcard/ROMs/test.nes");deliver(ui,ESP_OK);nes.state=AETHER_NES_STOPPED;advance(220);assert(!ui->media_active&&!ui->timer);
-    puts("PASS NES nearest full-screen 480x420, equal axes, clean game with no joypad/overlays, pause/error/stop and touch handoff");
+    puts("PASS NES TE-budgeted 384x336 nearest viewport, equal axes, no overlays, pause/error/stop and touch handoff");
 }
 static void test_storage_ready(app_ui_t *ui)
 {

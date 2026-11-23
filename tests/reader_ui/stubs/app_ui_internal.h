@@ -8,7 +8,9 @@ struct app_ui {
     lv_obj_t *screen, *content;
     void *page_context;
     void (*page_cleanup)(app_ui_t *);
+    void (*page_suspend)(app_ui_t *, bool suspended);
     void (*page_back)(app_ui_t *);
+    void (*io_complete)(app_ui_t *, const app_io_result_t *);
     app_io_handle_t io;
     aether_storage_handle_t storage;
     aether_audio_player_handle_t audio_player;
@@ -18,6 +20,7 @@ struct app_ui {
 const lv_font_t *app_ui_chinese_font_size(unsigned px);
 const lv_font_t *app_ui_chinese_font(void);
 lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title);
+bool app_ui_go_back(app_ui_t *ui);
 lv_obj_t *app_ui_add_text(lv_obj_t *, const char *, lv_align_t, int32_t, int32_t, uint32_t, const lv_font_t *);
 void app_ui_label_text(lv_obj_t *, const char *);
 void app_ui_label_fmt(lv_obj_t *, const char *, ...);

@@ -17,6 +17,8 @@ esp_err_t aether_video_player_new(aether_storage_handle_t, ac101s_audio_handle_t
 esp_err_t aether_video_player_play(aether_video_player_handle_t, const char *, uint8_t fps,
                                    aether_video_frame_cb_t, void *);
 esp_err_t aether_video_player_set_paused(aether_video_player_handle_t, bool);
+/** Pause on screen-off without changing any manual pause or seek state. */
+void aether_video_player_set_screen_paused(aether_video_player_handle_t, bool);
 /* Active MP4 only; MJPEG returns NOT_SUPPORTED. No blocking decoder/file I/O. */
 esp_err_t aether_video_player_seek(aether_video_player_handle_t,uint32_t position_ms);
 /* GUI callers should clear copied frames in this synchronous reset callback;

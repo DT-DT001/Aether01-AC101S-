@@ -43,6 +43,27 @@ static unsigned hook_begin_calls, hook_finish_calls, hook_cancel_calls;
 static uint32_t hook_finish_delay, cancel_budget_max;
 static char shutdown_order[64];
 static unsigned shutdown_order_length;
+static esp_pm_config_t pm_config;
+static bool awake_clock_locked, clock_at_panel_wake;
+
+esp_err_t esp_pm_lock_create(int type, int argument, const char *name, esp_pm_lock_handle_t *lock)
+{
+    (void)argument;
+    (void)name;
+    if (type != ESP_PM_CPU_FREQ_MAX) return ESP_ERR_INVALID_ARG;
+    *lock = &awake_clock_locked;
+    return ESP_OK;
+}
+esp_err_t esp_pm_lock_delete(esp_pm_lock_handle_t lock) { (void)lock; return ESP_OK; }
+esp_err_t esp_pm_lock_acquire(esp_pm_lock_handle_t lock) { *(bool *)lock = true; return ESP_OK; }
+esp_err_t esp_pm_lock_release(esp_pm_lock_handle_t lock) { *(bool *)lock = false; return ESP_OK; }
+esp_err_t esp_pm_configure(const esp_pm_config_t *config) { pm_config = *config; return ESP_OK; }
+esp_err_t lvgl_port_stop(void) { return ESP_OK; }
+esp_err_t lvgl_port_resume(void) { return ESP_OK; }
+esp_err_t gpio_intr_disable(int pin) { return pin == AETHER_GPIO_BOOT_KEY ? ESP_OK : ESP_FAIL; }
+esp_err_t ac101s_audio_idle_clocks(void *audio) { (void)audio; return ESP_OK; }
+uint32_t __real_lv_timer_handler(void) { return 7; }
+
 static void step(char c) { shutdown_order[shutdown_order_length++] = c; }
 
 esp_err_t app_telemetry_quiesce(uint32_t timeout)
@@ -73,6 +94,7 @@ esp_err_t aether_board_set_display_sleep(aether_board_t *target, bool sleeping)
 {
     if (sleeping) { ++sleeps; target->display_sleeping = true; return sleep_error; }
     ++wakes;
+    clock_at_panel_wake = awake_clock_locked;
     target->display_sleeping = wake_error != ESP_OK;
     return wake_error;
 }
@@ -186,6 +208,28 @@ static void reset(void)
     hook_begin_calls = hook_finish_calls = hook_cancel_calls = 0;
     hook_finish_delay = cancel_budget_max = 0;
     memset(shutdown_order, 0, sizeof(shutdown_order)); shutdown_order_length = 0;
+    pm_config = (esp_pm_config_t){.light_sleep_enable = true};
+    awake_clock_locked = clock_at_panel_wake = false;
+    atomic_store(&s_gui_asleep, false);
+}
+
+static int test_standby_clock_policy(void)
+{
+    reset();
+    CHECK(app_power_init(&manager, &board, &display) == ESP_OK);
+    CHECK(awake_clock_locked && pm_config.min_freq_mhz == CONFIG_XTAL_FREQ);
+    CHECK(pm_config.max_freq_mhz == CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ && !pm_config.light_sleep_enable);
+    CHECK(apply_sleep(&manager) == ESP_OK && __wrap_lv_timer_handler() == LV_NO_TIMER_READY);
+    set_screen_clock(&manager, false);
+    CHECK(!awake_clock_locked && !pm_config.light_sleep_enable);
+    wake_error = ESP_FAIL;
+    CHECK(apply_wake(&manager) == ESP_FAIL && clock_at_panel_wake && manager.apps_suspended);
+    set_screen_clock(&manager, false);
+    wake_error = ESP_OK;
+    CHECK(apply_wake(&manager) == ESP_OK && clock_at_panel_wake && awake_clock_locked);
+    CHECK(!manager.apps_suspended && __wrap_lv_timer_handler() == 7);
+    puts("PASS production standby keeps automatic MCU sleep disabled and raises the CPU clock before every panel wake attempt");
+    return 0;
 }
 
 static int test_software_shutdown(void)
@@ -649,7 +693,7 @@ static int test_user_key_dispatch(void)
     clock_ms=3200;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1);
     dispatch_user_key(&manager,false,&key);CHECK(user_presses==1);
     manager.sleeping=true;clock_ms=4000;user_key_interrupt(&manager);
-    dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&manager.wake_requested);
+    dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&!manager.wake_requested);
     manager.sleeping=false;manager.wake_requested=false;
     clock_ms=6500;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&user_presses==1);
     dispatch_user_key(&manager,false,&key);
@@ -666,11 +710,12 @@ static int test_user_key_dispatch(void)
     dispatch_user_key(&manager,false,&key);
     CHECK(user_presses==3&&user_down_at==13000000);
     CHECK(app_power_set_user_key_handler(NULL,user_action,NULL)==ESP_ERR_INVALID_ARG);
-    puts("PASS live AC101S intercom press edges and one-shot two-second exit, with wake and shutdown consumption");
+    puts("PASS awake intercom press edges and two-second exit; a sleeping hold is consumed through wake");
     return 0;
 }
 int main(void)
 {
+    CHECK(test_standby_clock_policy() == 0);
     reset();
     sleep_error = ESP_FAIL;
     CHECK(apply_sleep(&manager) == ESP_FAIL);
@@ -866,8 +911,8 @@ int main(void)
     CHECK(wakes == 0 && consumed_gestures == 0 && manager.sleeping);
     boot_level = 0;
     run_worker(2);
-    CHECK(wakes == 1 && !manager.sleeping);
-    puts("PASS NES ownership prevents GUI IRQ fallback while the BOOT key still wakes");
+    CHECK(wakes == 0 && manager.sleeping);
+    puts("PASS touch and GPIO61 cannot wake a paused NES or the sleeping panel");
     CHECK(test_user_key_dispatch() == 0);
     CHECK(test_power_key_gestures() == 0);
     CHECK(test_software_shutdown() == 0);

@@ -5,8 +5,8 @@
 #include <string.h>
 #include "../../components/aether_video_player/aether_video_player.c"
 
-struct aether_mjpeg_player_t { atomic_int state; uint8_t fps; };
-struct aether_mp4_player { atomic_int state; };
+struct aether_mjpeg_player_t { atomic_int state; uint8_t fps; bool screen_paused; };
+struct aether_mp4_player { atomic_int state; bool screen_paused; };
 static atomic_llong clock_us;
 static unsigned lock_cost, wait_cost[2], wait_budget[2], deletes[2], stops[2];
 static bool fail_mp4_new, fail_mp4_del;
@@ -57,6 +57,8 @@ esp_err_t aether_mp4_player_get_status(aether_mp4_player_handle_t h,aether_mp4_s
 {if(!h)return ESP_ERR_INVALID_ARG;memset(s,0,sizeof(*s));s->state=h->state;s->fps=24;s->source_fps_x100=2398;s->has_audio=true;return ESP_OK;}
 esp_err_t aether_mjpeg_player_set_paused(aether_mjpeg_player_handle_t h,bool p) {h->state=p?AETHER_MJPEG_PAUSED:AETHER_MJPEG_PLAYING;return ESP_OK;}
 esp_err_t aether_mp4_player_set_paused(aether_mp4_player_handle_t h,bool p) {h->state=p?AETHER_MJPEG_PAUSED:AETHER_MJPEG_PLAYING;return ESP_OK;}
+void aether_mjpeg_player_set_screen_paused(aether_mjpeg_player_handle_t h,bool p) {h->screen_paused=p;}
+void aether_mp4_player_set_screen_paused(aether_mp4_player_handle_t h,bool p) {h->screen_paused=p;}
 esp_err_t aether_mjpeg_player_set_fps(aether_mjpeg_player_handle_t h,uint8_t fps) {h->fps=fps;return ESP_OK;}
 esp_err_t aether_mp4_player_seek_with_reset(aether_mp4_player_handle_t h,uint32_t ms,void (*reset)(void *),void *context)
 {assert(h);if(reset)reset(context);last_seek=ms;++seek_calls;return ESP_OK;}
@@ -114,6 +116,10 @@ static void test_routing(void)
     unsigned resets=0;
     assert(aether_video_player_seek_with_reset(h,731,reset_consumer,&resets)==ESP_OK && seek_calls==1 && last_seek==731 && resets==1);
     assert(aether_video_player_set_paused(h,true)==ESP_OK&&h->mp4->state==AETHER_MJPEG_PAUSED);
+    aether_video_player_set_screen_paused(h,true);
+    assert(h->mjpeg->screen_paused && h->mp4->screen_paused);
+    aether_video_player_set_screen_paused(h,false);
+    assert(!h->mjpeg->screen_paused && !h->mp4->screen_paused && h->mp4->state==AETHER_MJPEG_PAUSED);
     assert(aether_video_player_play(h,"/sdcard/a.avi",0,frame,NULL)==ESP_ERR_INVALID_STATE);
     assert(aether_video_player_stop_wait(h,100)==ESP_OK);
     assert(aether_video_player_play(h,"/sdcard/a.avi",0,frame,NULL)==ESP_OK&&h->mjpeg->fps==0);

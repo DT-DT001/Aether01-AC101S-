@@ -26,14 +26,14 @@ static const home_app_t apps[] = {
     {&icon_reader, "阅读", 0x7EDDB6, app_open_reader, NULL},
     {&icon_video, "视频", 0xD4ABFF, app_open_video, NULL},
     {&icon_files, "文件", 0x9ABEFF, app_open_files, NULL},
-    {&icon_game, "游戏", 0xFF9DAE, app_open_game, NULL},
+    {&icon_game, "小游戏", 0xFF9DAE, app_open_game, NULL},
     {&icon_nes, "NES 游戏", 0xBBA8F5, app_open_nes, NULL},
     {NULL, "录音", 0xFF9FAD, app_open_recorder, NULL},
     {&icon_settings, "设置", 0xBCC9E5, app_open_settings, NULL},
     {&icon_motion, "运动", 0xFFA4CA, app_open_motion, NULL},
     {&icon_barometer, "气压高度", 0xA0DBFF, app_open_barometer, NULL},
     {&icon_motion, "位移测量", 0x97DFCE, app_open_displacement, NULL},
-    {&icon_bluetooth, "电脑遥控", 0x94D9ED, app_open_pc_remote, NULL},
+    {NULL, "空中飞鼠", 0x94D9ED, app_open_pc_remote, NULL},
     {&icon_video, "OBS 切换", 0xD7B3FF, app_open_obs_switcher, NULL},
     {&icon_network, "无线对讲", 0x8FDBEC, app_open_intercom, NULL},
     {NULL, "定位", 0x69E4AD, app_open_gps, NULL},
@@ -220,10 +220,25 @@ static void status_bar(app_ui_t *ui, lv_obj_t *screen)
     const lv_font_t *font = &lv_font_montserrat_20;
     const uint32_t muted = 0x7984A2;
     lv_obj_t *battery = app_battery_create(screen, 70);
-    if (battery) lv_obj_align(battery, LV_ALIGN_TOP_RIGHT, -24, 15);
-    ui->app_obj[HOME_WIFI] = app_ui_add_text(screen, LV_SYMBOL_WIFI, LV_ALIGN_TOP_RIGHT, -180, 18, muted, font);
-    ui->app_obj[HOME_BT] = app_ui_add_text(screen, LV_SYMBOL_BLUETOOTH, LV_ALIGN_TOP_RIGHT, -146, 18, muted, font);
-    ui->app_obj[HOME_SD] = app_ui_add_text(screen, LV_SYMBOL_SD_CARD, LV_ALIGN_TOP_RIGHT, -112, 18, muted, font);
+    if (battery) lv_obj_align(battery, LV_ALIGN_TOP_RIGHT, -APP_HEADER_SIDE_INSET, 18);
+    ui->app_obj[HOME_WIFI] = app_ui_add_text(screen, LV_SYMBOL_WIFI, LV_ALIGN_TOP_RIGHT, -192, 21, muted, font);
+    ui->app_obj[HOME_BT] = app_ui_add_text(screen, LV_SYMBOL_BLUETOOTH, LV_ALIGN_TOP_RIGHT, -158, 21, muted, font);
+    ui->app_obj[HOME_SD] = app_ui_add_text(screen, LV_SYMBOL_SD_CARD, LV_ALIGN_TOP_RIGHT, -124, 21, muted, font);
+}
+
+static lv_obj_t *air_mouse_icon(lv_obj_t *parent)
+{
+    static const lv_point_precise_t outline[] = {
+        {14, 8}, {14, 35}, {21, 29}, {26, 39}, {31, 36}, {26, 26}, {36, 26}, {14, 8},
+    };
+    lv_obj_t *tile = shape(parent, 48, 48, 14, 0x27374A);
+    lv_obj_t *cursor = lv_line_create(tile);
+    lv_line_set_points(cursor, outline, sizeof(outline) / sizeof(outline[0]));
+    lv_obj_set_style_line_width(cursor, 3, 0);
+    lv_obj_set_style_line_color(cursor, lv_color_hex(0x94D9ED), 0);
+    lv_obj_set_style_line_rounded(cursor, true, 0);
+    lv_obj_remove_flag(cursor, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    return tile;
 }
 
 void app_ui_show_drawer(app_ui_t *ui)
@@ -233,7 +248,7 @@ void app_ui_show_drawer(app_ui_t *ui)
     status_bar(ui, screen);
     lv_obj_t *home = lv_button_create(screen);
     lv_obj_set_size(home, 50, 42);
-    lv_obj_set_pos(home, 15, 9);
+    lv_obj_set_pos(home, APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET);
     lv_obj_set_style_bg_color(home, lv_color_hex(0x242940), 0);
     lv_obj_set_style_shadow_width(home, 0, 0);
     app_ui_add_text(home, LV_SYMBOL_HOME, LV_ALIGN_CENTER, 0, 0, 0xD6DDF7, &lv_font_montserrat_20);
@@ -277,6 +292,8 @@ void app_ui_show_drawer(app_ui_t *ui)
                             &lv_font_montserrat_28);
         } else if (apps[i].open == app_open_gps) {
             icon = gps_icon(tile);
+        } else if (apps[i].open == app_open_pc_remote) {
+            icon = air_mouse_icon(tile);
         } else icon = microphone_icon(tile);
         lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
         lv_obj_t *name = app_ui_add_text(tile, apps[i].name, LV_ALIGN_BOTTOM_MID,

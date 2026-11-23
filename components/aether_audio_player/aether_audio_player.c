@@ -41,6 +41,7 @@ struct aether_audio_player_t {
     aether_audio_player_status_t status;
     bool stop_requested;
     bool pause_requested;
+    bool screen_paused;
     bool terminate;
     bool exited;
     uint32_t release_serial;
@@ -79,7 +80,7 @@ typedef struct {
 static controls_t controls(aether_audio_player_handle_t h)
 {
     portENTER_CRITICAL(&h->state_lock);
-    const controls_t c = {.stop = h->stop_requested, .pause = h->pause_requested,
+    const controls_t c = {.stop = h->stop_requested, .pause = h->pause_requested || h->screen_paused,
         .terminate = h->terminate, .volume = h->status.volume, .eq = h->status.eq,
         .seek_revision = h->seek_revision, .seek_ms = h->seek_ms};
     portEXIT_CRITICAL(&h->state_lock);
@@ -129,6 +130,16 @@ static bool music_resume_path(const char *path)
     if (directory && !strncasecmp(directory, recordings, length))
         return directory[length] && directory[length] != '/';
     return true;
+}
+
+void aether_audio_player_set_screen_suspended(aether_audio_player_handle_t h, bool suspended)
+{
+    if (!h) return;
+    portENTER_CRITICAL(&h->state_lock);
+    h->screen_paused = suspended &&
+        (h->status.state != AETHER_AUDIO_PLAYING || !music_resume_path(h->status.path));
+    portEXIT_CRITICAL(&h->state_lock);
+    if (h->task) xTaskNotifyGive(h->task);
 }
 
 static void load_preferences(aether_audio_player_handle_t h)

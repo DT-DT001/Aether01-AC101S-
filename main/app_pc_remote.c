@@ -1,24 +1,26 @@
 #include "app_pc_remote.h"
 #include "app_air_mouse.h"
 #include "app_telemetry.h"
+#include "app_text.h"
 
+#include <stdio.h>
+#include <string.h>
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "nvs.h"
 
 #define MOTION_LEASE_US 200000
 #define IMU_MAX_AGE_MS 100U
-#define SHORTCUT_VERSION 1U
+#define SHORTCUT_VERSION 2U
+#define SHORTCUT_RETRY_US 2000000
 
 typedef struct {
     uint32_t version;
     app_pc_shortcut_t shortcut[APP_PC_REMOTE_SCENES];
+    char scene_names[APP_PC_REMOTE_SCENES][APP_PC_REMOTE_SCENE_BYTES];
 } shortcut_settings_t;
 
-static shortcut_settings_t s_shortcuts = {
-    .version = SHORTCUT_VERSION,
-    .shortcut = {{0x05, 0x42}, {0x05, 0x43}, {0x05, 0x44}, {0x05, 0x45}},
-};
+static shortcut_settings_t s_shortcuts;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static aether_bluetooth_handle_t s_bluetooth;
 static app_power_t *s_power;
@@ -29,6 +31,7 @@ static int64_t s_motion_until;
 static uint32_t s_motion_epoch, s_save_revision;
 static bool s_save_pending;
 static esp_err_t s_save_error;
+static int64_t s_save_retry_at;
 /* The telemetry task is the only owner of the motion filter. */
 static app_air_mouse_t s_mouse;
 static uint32_t s_mouse_epoch;
@@ -54,10 +57,30 @@ static bool supported_key(uint8_t key)
     return key >= 0x04 && key <= 0x73;
 }
 
-static void service_shortcuts(void)
+static bool scene_name_copy(char stored[APP_PC_REMOTE_SCENE_BYTES], const char *name)
+{
+    if (!name) return false;
+    size_t length = 0;
+    while (length < APP_PC_REMOTE_SCENE_BYTES && name[length]) ++length;
+    if (length == APP_PC_REMOTE_SCENE_BYTES) return false;
+    while (length && *name == ' ') { ++name; --length; }
+    while (length && name[length - 1] == ' ') --length;
+    if (!length) return false;
+    unsigned characters = 0;
+    for (size_t i = 0; i < length; ++i) {
+        const unsigned char byte = (unsigned char)name[i];
+        if (byte < 0x20 || byte == 0x7f) return false;
+        if ((byte & 0xc0) != 0x80) ++characters;
+    }
+    if (characters > APP_PC_REMOTE_SCENE_CHARACTERS) return false;
+    memcpy(stored, name, length);
+    return app_text_sanitize_utf8(stored, length) == length && !memcmp(stored, name, length);
+}
+
+static void service_shortcuts(int64_t now)
 {
     portENTER_CRITICAL(&s_lock);
-    const bool pending = s_save_pending;
+    const bool pending = s_save_pending && now >= s_save_retry_at;
     const uint32_t revision = s_save_revision;
     const shortcut_settings_t settings = s_shortcuts;
     portEXIT_CRITICAL(&s_lock);
@@ -73,7 +96,8 @@ static void service_shortcuts(void)
     portENTER_CRITICAL(&s_lock);
     if (s_save_revision == revision) {
         s_save_error = error;
-        s_save_pending = false;
+        s_save_pending = error != ESP_OK;
+        s_save_retry_at = error == ESP_OK ? 0 : now + SHORTCUT_RETRY_US;
     }
     portEXIT_CRITICAL(&s_lock);
 }
@@ -113,7 +137,7 @@ static void service_remote(const app_telemetry_snapshot_t *sample)
             portEXIT_CRITICAL(&s_lock);
         }
     }
-    service_shortcuts();
+    service_shortcuts(now);
 }
 
 void app_pc_remote_init(aether_bluetooth_handle_t bluetooth, app_power_t *power,
@@ -123,16 +147,26 @@ void app_pc_remote_init(aether_bluetooth_handle_t bluetooth, app_power_t *power,
     s_power = power;
     s_imu_ready = imu_ready;
     s_flash_busy = flash_busy;
+    s_shortcuts = (shortcut_settings_t){
+        .version = SHORTCUT_VERSION,
+        .shortcut = {{0x05, 0x42}, {0x05, 0x43}, {0x05, 0x44}, {0x05, 0x45}},
+    };
+    s_save_pending = false;
+    s_save_error = ESP_OK;
+    s_save_retry_at = 0;
     nvs_handle_t nvs;
     if (nvs_open("pc_remote", NVS_READONLY, &nvs) == ESP_OK) {
-        shortcut_settings_t stored;
+        shortcut_settings_t stored = {0};
         size_t size = sizeof(stored);
-        if (nvs_get_blob(nvs, "shortcuts", &stored, &size) == ESP_OK &&
-            size == sizeof(stored) && stored.version == SHORTCUT_VERSION) {
-            bool valid = true;
-            for (unsigned i = 0; i < APP_PC_REMOTE_SCENES; ++i)
-                valid = valid && supported_key(stored.shortcut[i].key);
-            if (valid) s_shortcuts = stored;
+        if (nvs_get_blob(nvs, "shortcuts", &stored, &size) == ESP_OK) {
+            const bool legacy = stored.version == 1 && size == offsetof(shortcut_settings_t, scene_names);
+            const bool current = stored.version == SHORTCUT_VERSION && size == sizeof(stored);
+            for (unsigned i = 0; (legacy || current) && i < APP_PC_REMOTE_SCENES; ++i) {
+                if (supported_key(stored.shortcut[i].key)) s_shortcuts.shortcut[i] = stored.shortcut[i];
+                char name[APP_PC_REMOTE_SCENE_BYTES] = {0};
+                if (current && scene_name_copy(name, stored.scene_names[i]))
+                    memcpy(s_shortcuts.scene_names[i], name, sizeof(name));
+            }
         }
         nvs_close(nvs);
     }
@@ -190,12 +224,6 @@ esp_err_t app_pc_remote_key(uint8_t modifiers, uint8_t key)
     return aether_bluetooth_hid_key(s_bluetooth, modifiers, key);
 }
 
-esp_err_t app_pc_remote_text(const char *ascii)
-{
-    if (!s_bluetooth || !power_allows_input()) return ESP_ERR_INVALID_STATE;
-    return aether_bluetooth_hid_text(s_bluetooth, ascii);
-}
-
 esp_err_t app_pc_remote_click(uint8_t buttons)
 {
     if (!s_bluetooth || !power_allows_input()) return ESP_ERR_INVALID_STATE;
@@ -248,15 +276,46 @@ esp_err_t app_pc_remote_get_shortcut(unsigned slot, app_pc_shortcut_t *shortcut)
     return ESP_OK;
 }
 
+/* Called with s_lock held so both settings share the same NVS transaction. */
+static void queue_settings_save(void)
+{
+    ++s_save_revision;
+    s_save_pending = true;
+    s_save_error = ESP_OK;
+    s_save_retry_at = 0;
+}
+
 esp_err_t app_pc_remote_set_shortcut(unsigned slot, app_pc_shortcut_t shortcut)
 {
     if (slot >= APP_PC_REMOTE_SCENES || !supported_key(shortcut.key)) return ESP_ERR_INVALID_ARG;
     if (!power_allows_input()) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&s_lock);
     s_shortcuts.shortcut[slot] = shortcut;
-    ++s_save_revision;
-    s_save_pending = true;
-    s_save_error = ESP_OK;
+    queue_settings_save();
+    portEXIT_CRITICAL(&s_lock);
+    return ESP_OK;
+}
+
+esp_err_t app_pc_remote_get_scene_name(unsigned slot, char name[APP_PC_REMOTE_SCENE_BYTES])
+{
+    if (slot >= APP_PC_REMOTE_SCENES || !name) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_lock);
+    memcpy(name, s_shortcuts.scene_names[slot], APP_PC_REMOTE_SCENE_BYTES);
+    portEXIT_CRITICAL(&s_lock);
+    if (!name[0]) snprintf(name, APP_PC_REMOTE_SCENE_BYTES, "场景 %u", slot + 1);
+    return ESP_OK;
+}
+
+esp_err_t app_pc_remote_set_scene_name(unsigned slot, const char *name)
+{
+    char stored[APP_PC_REMOTE_SCENE_BYTES] = {0};
+    if (slot >= APP_PC_REMOTE_SCENES || !scene_name_copy(stored, name)) return ESP_ERR_INVALID_ARG;
+    if (!power_allows_input()) return ESP_ERR_INVALID_STATE;
+    portENTER_CRITICAL(&s_lock);
+    if (strcmp(s_shortcuts.scene_names[slot], stored)) {
+        memcpy(s_shortcuts.scene_names[slot], stored, sizeof(stored));
+        queue_settings_save();
+    }
     portEXIT_CRITICAL(&s_lock);
     return ESP_OK;
 }

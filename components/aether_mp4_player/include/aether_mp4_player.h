@@ -62,6 +62,7 @@ esp_err_t aether_mp4_player_new(aether_storage_handle_t storage,
 esp_err_t aether_mp4_player_play(aether_mp4_player_handle_t handle,const char *path,
                                 aether_mp4_frame_cb_t callback,void *context);
 esp_err_t aether_mp4_player_set_paused(aether_mp4_player_handle_t handle,bool paused);
+void aether_mp4_player_set_screen_paused(aether_mp4_player_handle_t handle,bool paused);
 /** Nonblocking active-session seek. Rebuild from a preceding IDR and resync AAC.
  * Paused sessions publish one preview and stay paused. INVALID_STATE can mean
  * a short frame-publication gate is busy; retain the last GUI target and retry.

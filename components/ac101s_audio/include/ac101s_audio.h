@@ -72,6 +72,9 @@ esp_err_t ac101s_audio_play_alert(ac101s_audio_handle_t handle, const int16_t *p
  * external stop keeps its ownership for retry; do not destroy its transport. */
 esp_err_t ac101s_audio_stop(ac101s_audio_handle_t handle);
 esp_err_t ac101s_audio_del(ac101s_audio_handle_t handle);
+/** Release the board I2S clocks when no local audio owner is active.
+ * Never interrupts playback or capture. A local start restores the clocks. */
+esp_err_t ac101s_audio_idle_clocks(ac101s_audio_handle_t handle);
 
 esp_err_t ac101s_audio_write(ac101s_audio_handle_t handle, void *data, size_t bytes);
 typedef struct {

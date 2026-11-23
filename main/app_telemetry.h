@@ -27,6 +27,8 @@ esp_err_t app_telemetry_start(aether_board_t *board);
  * Call before start. The regular page subscriptions remain independent. */
 void app_telemetry_warm_imu(void);
 void app_telemetry_set_interest(uint32_t mask);
+/* Stop sensing motion/pressure and keep the RTC sampling for alarms. */
+void app_telemetry_set_screen_suspended(bool suspended);
 void app_telemetry_get(app_telemetry_snapshot_t *snapshot);
 /* Background consumer. NULL sample during I2C quiescence. */
 void app_telemetry_set_consumer(void (*consumer)(const app_telemetry_snapshot_t *));

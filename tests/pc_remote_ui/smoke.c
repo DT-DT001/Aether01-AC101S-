@@ -2,6 +2,7 @@
 #include "app_gyro_calibration.h"
 #include "app_ui_internal.h"
 #include "app_ui_modal.h"
+#include "app_otg_control.h"
 #include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -11,15 +12,21 @@ extern const lv_font_t font_16, font_24;
 static uint16_t frame[480 * 480], buffer[480 * 20];
 static app_pc_remote_status_t status = {.available=true};
 static app_pc_shortcut_t shortcuts[] = {{5,0x42},{5,0x43},{5,0x44},{5,0x45}};
+static char scene_names[APP_PC_REMOTE_SCENES][APP_PC_REMOTE_SCENE_BYTES];
 static bool pressed, air_mode, moving, confirm_value;
 static lv_point_t pointer;
 static unsigned confirmations, releases, motion_on, motion_off, recenters;
 static unsigned calibration_cancels;
 static app_gyro_calibration_status_t calibration;
-static unsigned keys, clicks, text_requests, triggers, saves, last_slot;
-static uint8_t last_key, last_click;
-static esp_err_t text_error;
-static char sent[APP_PC_REMOTE_TEXT_MAX + 1];
+static unsigned keys, clicks, triggers, saves, renames, last_slot;
+static uint8_t last_key, last_modifiers, last_click;
+static bool external_keyboard;
+
+esp_err_t app_otg_get_status(aether_usb_host_status_t *out)
+{
+    *out = (aether_usb_host_status_t){.active = external_keyboard, .keyboard_interfaces = external_keyboard};
+    return ESP_OK;
+}
 
 esp_err_t app_telemetry_gyro_calibration_begin(void)
 {
@@ -56,17 +63,10 @@ esp_err_t app_pc_remote_confirm(bool accept)
 }
 esp_err_t app_pc_remote_key(uint8_t modifiers, uint8_t key)
 {
-    assert(status.requested && status.connected && !status.confirm_pending && modifiers == 0);
+    assert(status.requested && status.connected && !status.confirm_pending);
     ++keys;
     last_key = key;
-    return ESP_OK;
-}
-esp_err_t app_pc_remote_text(const char *ascii)
-{
-    assert(status.connected && strlen(ascii) <= APP_PC_REMOTE_TEXT_MAX);
-    ++text_requests;
-    if (text_error) return text_error;
-    snprintf(sent, sizeof(sent), "%s", ascii);
+    last_modifiers = modifiers;
     return ESP_OK;
 }
 esp_err_t app_pc_remote_click(uint8_t buttons)
@@ -104,6 +104,22 @@ esp_err_t app_pc_remote_set_shortcut(unsigned slot, app_pc_shortcut_t value)
     status.save_pending = true;
     return ESP_OK;
 }
+esp_err_t app_pc_remote_get_scene_name(unsigned slot, char name[APP_PC_REMOTE_SCENE_BYTES])
+{
+    assert(slot < APP_PC_REMOTE_SCENES);
+    if (scene_names[slot][0]) snprintf(name, APP_PC_REMOTE_SCENE_BYTES, "%s", scene_names[slot]);
+    else snprintf(name, APP_PC_REMOTE_SCENE_BYTES, "场景 %u", slot + 1);
+    return ESP_OK;
+}
+esp_err_t app_pc_remote_set_scene_name(unsigned slot, const char *name)
+{
+    assert(slot < APP_PC_REMOTE_SCENES && name);
+    if (!*name) return ESP_ERR_INVALID_ARG;
+    snprintf(scene_names[slot], sizeof(scene_names[slot]), "%s", name);
+    ++renames;
+    status.save_pending = true;
+    return ESP_OK;
+}
 esp_err_t app_pc_remote_trigger(unsigned slot)
 {
     assert(status.connected && !status.confirm_pending && slot < APP_PC_REMOTE_SCENES);
@@ -116,6 +132,7 @@ const char *esp_err_to_name(esp_err_t error) { return error ? "ESP_FAIL" : "ESP_
 esp_err_t app_usb_input_modal_open(lv_obj_t *modal, lv_obj_t *preferred)
 {
     assert(modal && preferred);
+    if (lv_obj_check_type(preferred, &lv_textarea_class)) return ESP_OK;
     const char *label = lv_label_get_text(lv_obj_get_child(preferred, 0));
     assert(!strcmp(label, "拒绝配对") || !strcmp(label, "取消"));
     return ESP_OK;
@@ -159,6 +176,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
         cleanup(ui);
     }
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
+    ui->page_suspend = NULL;
     ui->screen = lv_obj_create(NULL);
     lv_obj_remove_flag(ui->screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x070A12), 0);
@@ -313,13 +331,15 @@ int main(int argc, char **argv)
     app_ui_t ui = {0};
     app_open_pc_remote(&ui);
     advance(170);
-    assert(lv_obj_has_state(control(ui.screen, "发送文本"), LV_STATE_USER_1));
+    assert(air_mode && find_label(ui.screen, "空中飞鼠"));
+    assert(lv_obj_has_state(control(ui.screen, "回车"), LV_STATE_USER_1));
+    assert(!find_class(ui.screen, &lv_keyboard_class) && !find_class(ui.screen, &lv_textarea_class));
     tap(control(ui.screen, "开启键鼠"));
     assert(status.requested && find_label(ui.screen, "等待设备配对"));
     status.reconnecting = true;
     advance(170);
     assert(find_label(ui.screen, "正在重连设备…"));
-    assert(lv_obj_has_state(control(ui.screen, "发送文本"), LV_STATE_USER_1));
+    assert(lv_obj_has_state(control(ui.screen, "回车"), LV_STATE_USER_1));
     status.reconnecting = false;
     status.confirm_pending = true; status.confirm_code = 12345;
     advance(170);
@@ -344,59 +364,12 @@ int main(int argc, char **argv)
     status.confirm_pending = false; status.connected = true; advance(170);
     puts("PASS pairing code, stale reply rejection, explicit confirm/reject and modal OFF");
 
-    lv_obj_t *text = find_class(ui.screen, &lv_textarea_class);
-    lv_obj_t *keyboard = find_class(ui.screen, &lv_keyboard_class);
-    assert(text && keyboard && find_label(ui.screen, "设备已连接"));
-    lv_obj_update_layout(ui.screen);
-    lv_area_t field_area, keyboard_area, key_area;
-    lv_obj_get_coords(text, &field_area);
-    lv_obj_get_coords(keyboard, &keyboard_area);
-    lv_obj_get_coords(control(ui.screen, "回车"), &key_area);
-    assert(field_area.y2 < keyboard_area.y1 && keyboard_area.y2 < key_area.y1);
-    tap(text);
-    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && text_caret_drawn(display, text));
-    assert(lv_obj_get_style_anim_duration(text, LV_PART_CURSOR) == 500);
-    advance(450);
-    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && !text_caret_drawn(display, text));
-    advance(500);
-    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && text_caret_drawn(display, text));
-    /* The first row's 52 units place q at unit 7, after the 5-unit mode key. */
-    pointer = (lv_point_t){keyboard_area.x1 + lv_area_get_width(&keyboard_area) * 7 / 52,
-                           keyboard_area.y1 + lv_area_get_height(&keyboard_area) / 8};
-    pressed = true;
-    advance(90);
-    lift();
-    assert(!strcmp(lv_textarea_get_text(text), "q") && lv_textarea_get_cursor_pos(text) == 1);
-    assert_text_caret_blinks(display, text);
-    lv_textarea_add_text(text, "Z1!中文");
-    assert(!strcmp(lv_textarea_get_text(text), "qZ1!"));
-    snapshot(display, argv[1], "pc-keyboard");
-    text_error = ESP_FAIL;
-    tap(control(ui.screen, "发送文本"));
-    assert(text_requests == 1 && !strcmp(lv_textarea_get_text(text), "qZ1!"));
-    assert(!lv_obj_has_state(text, LV_STATE_FOCUSED) && !text_caret_drawn(display, text));
-    advance(650);
-    assert(!text_caret_drawn(display, text));
-    text_error = ESP_OK;
-    tap(control(ui.screen, "发送文本"));
-    assert(text_requests == 2 && !strcmp(sent, "qZ1!") && !lv_textarea_get_text(text)[0]);
-    keyboard_key(keyboard, "x");
-    keyboard_key(keyboard, LV_SYMBOL_OK);
-    assert(text_requests == 3 && !strcmp(sent, "x"));
-    keyboard_key(keyboard, "y");
-    keyboard_key(keyboard, LV_SYMBOL_NEW_LINE);
-    assert(text_requests == 4 && !strcmp(sent, "y"));
-    keyboard_key(keyboard, LV_SYMBOL_KEYBOARD);
-    assert(lv_obj_has_flag(keyboard, LV_OBJ_FLAG_HIDDEN));
-    tap(text);
-    assert(!lv_obj_has_flag(keyboard, LV_OBJ_FLAG_HIDDEN));
-    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && text_caret_drawn(display, text));
+    assert(find_label(ui.screen, "设备已连接"));
     tap(control(ui.screen, "回车"));
-    assert(keys == 1 && last_key == 0x28);
-    puts("PASS actual LVGL keyboard input, ASCII filter, Enter/OK once, dismiss/restore, retained text on error and direct Enter");
-    puts("PASS PC Remote caret blinks on/off/on and after typing, stays hidden when Send takes focus, and returns on touching the field");
-
-    tap(control(ui.screen, "空气鼠标"));
+    assert(keys == 1 && last_key == 0x28 && last_modifiers == 0);
+    tap(control(ui.screen, "切应用"));
+    assert(keys == 2 && last_key == 0x2b && last_modifiers == 0x04);
+    puts("PASS air mouse opens directly with common shortcuts and no PC keyboard");
     lv_obj_t *move = control(ui.screen, "按住移动");
     assert(air_mode && lv_obj_has_state(move, LV_STATE_USER_1));
     assert(find_label(ui.screen, "未检测到陀螺仪，仍可使用鼠标按键。"));
@@ -460,9 +433,17 @@ int main(int argc, char **argv)
     advance(90);
     touch(move);
     assert(moving);
+    assert(ui.page_suspend);
+    ui.page_suspend(&ui, true);
+    assert(releases == 1 && !moving && !air_mode && status.connected);
+    lift();
+    ui.page_suspend(&ui, false);
+    assert(!moving && air_mode && status.connected);
+    touch(move);
+    assert(moving);
     app_open_obs_switcher(&ui);
     lift();
-    assert(releases == 1 && !moving && !air_mode && status.requested && status.connected && !triggers);
+    assert(releases == 2 && !moving && !air_mode && status.requested && status.connected && !triggers);
     puts("PASS leaving the air mouse stops motion and OBS immediately reuses the existing HID link");
 
     lv_obj_t *scenes[4];
@@ -478,6 +459,45 @@ int main(int argc, char **argv)
     status.connected = false;
     status.reconnecting = true;
     advance(170);
+    touch(lv_obj_get_child(scenes[2], 0));
+    advance(550);
+    lift();
+    box = find_class(ui.screen, &lv_msgbox_class);
+    assert(box && find_label(box, "重命名场景") && !triggers);
+    lv_obj_t *field = find_class(box, &lv_textarea_class);
+    lv_obj_t *keyboard = find_class(ui.screen, &lv_keyboard_class);
+    assert(field && keyboard && lv_obj_is_visible(keyboard));
+    assert(!strcmp(lv_textarea_get_text(field), "场景 3"));
+    lv_obj_update_layout(ui.screen);
+    lv_area_t dialog_area, dock_area;
+    lv_obj_get_coords(box, &dialog_area);
+    lv_obj_get_coords(lv_obj_get_parent(keyboard), &dock_area);
+    assert(dialog_area.y1 >= 0 && dialog_area.y2 < dock_area.y1);
+    assert_text_caret_blinks(display, field);
+    external_keyboard = true;
+    advance(180);
+    assert(!lv_obj_is_visible(keyboard));
+    external_keyboard = false;
+    advance(180);
+    assert(lv_obj_is_visible(keyboard));
+    lv_textarea_set_text(field, "");
+    tap(control(box, "保存名称"));
+    assert(find_label(box, "请输入 1 至 16 个字符") && !renames);
+    lv_textarea_set_text(field, "直播");
+    keyboard_key(keyboard, "s");
+    keyboard_key(keyboard, "h");
+    keyboard_key(keyboard, "i");
+    tap(control(lv_obj_get_parent(keyboard), "是"));
+    assert(!strcmp(lv_textarea_get_text(field), "直播是"));
+    snapshot(display, argv[1], "obs-rename");
+    tap(control(box, "保存名称"));
+    assert(renames == 1 && !app_ui_modal_present(ui.screen) && find_label(ui.screen, "直播是") && !triggers);
+    touch(scenes[2]); advance(550); lift();
+    box = find_class(ui.screen, &lv_msgbox_class);
+    assert(box && !strcmp(lv_textarea_get_text(find_class(box, &lv_textarea_class)), "直播是"));
+    tap(control(box, "取消"));
+    assert(renames == 1 && !app_ui_modal_present(ui.screen) && !triggers);
+    puts("PASS long-hold OBS rename never triggers, Chinese candidate entry, hardware keyboard layout, validation, save and cancel");
     tap(control(ui.screen, "编辑快捷键"));
     tap(scenes[1]);
     assert(!triggers && find_label(ui.screen, "场景 2 快捷键"));
@@ -490,9 +510,9 @@ int main(int argc, char **argv)
     snapshot(display, argv[1], "obs-edit");
     tap(control(ui.screen, "保存快捷键"));
     assert(saves == 1 && last_slot == 1 && shortcuts[1].modifiers == 6 && shortcuts[1].key == 0x3d);
-    assert(find_label(ui.screen, "Alt+Shift+F4") && find_label(ui.screen, "正在保存快捷键…"));
+    assert(find_label(ui.screen, "Alt+Shift+F4") && find_label(ui.screen, "正在保存场景…"));
     status.save_pending = false; status.save_error = ESP_FAIL; advance(170);
-    assert(find_label(ui.screen, "快捷键保存失败 ESP_FAIL"));
+    assert(find_label(ui.screen, "保存失败，稍后重试"));
     status.save_error = ESP_OK;
     tap(scenes[0]);
     assert(!triggers && find_label(ui.screen, "电脑尚未连接"));
@@ -509,14 +529,14 @@ int main(int argc, char **argv)
     assert(find_label(ui.screen, "快捷键已提交"));
     app_open_pc_remote(&ui);
     advance(170);
-    assert(releases == 2 && find_label(ui.screen, "设备已连接"));
+    assert(releases == 3 && find_label(ui.screen, "设备已连接"));
     tap(control(ui.screen, "回车"));
-    assert(keys == 2 && last_key == 0x28);
+    assert(keys == 3 && last_key == 0x28 && last_modifiers == 0);
     status.connected = false;
     status.confirm_pending = true;
     app_ui_begin_page(&ui, "首页");
     advance(170);
-    assert(releases == 3 && status.requested && status.confirm_pending && !app_ui_modal_present(ui.screen));
+    assert(releases == 4 && status.requested && status.confirm_pending && !app_ui_modal_present(ui.screen));
     app_open_pc_remote(&ui);
     advance(170);
     tap(control(find_class(ui.screen, &lv_msgbox_class), "关闭键鼠"));

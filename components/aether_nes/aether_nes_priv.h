@@ -20,6 +20,7 @@ struct aether_nes_t {
     atomic_uint external_input;
     atomic_bool stop_requested;
     atomic_bool paused;
+    atomic_bool screen_paused;
     atomic_int pause_request; /* -1: none; 0/1: owner-task resume/pause */
     aether_nes_state_t state;
     esp_err_t last_error;

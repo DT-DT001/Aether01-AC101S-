@@ -24,7 +24,11 @@ struct app_frames {
     bool active;
     uint16_t viewport_width, viewport_height;
     lv_image_dsc_t descriptor;
+    lv_obj_t *refresh_image;
 };
+
+static void present_on_refresh(lv_event_t *event);
+static void refresh_image_deleted(lv_event_t *event);
 
 esp_err_t app_frames_new(app_frames_handle_t *out_frames)
 {
@@ -50,6 +54,7 @@ esp_err_t app_frames_new(app_frames_handle_t *out_frames)
 void app_frames_delete(app_frames_handle_t frames)
 {
     if (!frames) return;
+    app_frames_set_refresh_image(frames, NULL);
     for (unsigned i = 0; i < 3; ++i) free(frames->pixels[i]);
     vSemaphoreDelete(frames->lock);
     free(frames);
@@ -58,12 +63,35 @@ void app_frames_delete(app_frames_handle_t frames)
 void app_frames_set_active(app_frames_handle_t frames, bool active)
 {
     if (!frames) return;
+    if (!active) app_frames_set_refresh_image(frames, NULL);
     /* Producer holds this only for a bounded PSRAM memcpy, never for I/O. */
     xSemaphoreTake(frames->lock, portMAX_DELAY);
     frames->active = active;
     if (active) memset(&frames->metrics, 0, sizeof(frames->metrics));
     frames->pending = -1;
     xSemaphoreGive(frames->lock);
+}
+
+void app_frames_set_refresh_image(app_frames_handle_t frames, lv_obj_t *image)
+{
+    if (!frames || frames->refresh_image == image) return;
+    if (frames->refresh_image) {
+        lv_display_remove_event_cb_with_user_data(lv_obj_get_display(frames->refresh_image),
+                                                   present_on_refresh, frames);
+        lv_obj_remove_event_cb_with_user_data(frames->refresh_image, refresh_image_deleted, frames);
+    }
+    frames->refresh_image = image;
+    if (image) {
+        lv_display_add_event_cb(lv_obj_get_display(image), present_on_refresh, LV_EVENT_REFR_START, frames);
+        lv_obj_add_event_cb(image, refresh_image_deleted, LV_EVENT_DELETE, frames);
+    }
+}
+
+static void refresh_image_deleted(lv_event_t *event)
+{
+    app_frames_handle_t frames = lv_event_get_user_data(event);
+    if (frames->refresh_image == lv_event_get_target_obj(event))
+        app_frames_set_refresh_image(frames, NULL);
 }
 
 void app_frames_set_viewport(app_frames_handle_t frames, uint16_t width, uint16_t height)
@@ -95,9 +123,20 @@ void app_frames_push(app_frames_handle_t frames, const uint16_t *pixels,
     xSemaphoreGive(frames->lock);
 }
 
-void app_frames_present(app_frames_handle_t frames, lv_obj_t *image)
+static void present(app_frames_handle_t frames, lv_obj_t *image, bool refreshing)
 {
     if (!frames || !image || xSemaphoreTake(frames->lock, 0) != pdTRUE) return;
+    if (!refreshing && frames->refresh_image == image) {
+        /* LVGL pauses its render timer when nothing is dirty. Request one
+         * iteration; REFR_START will adopt the newest complete frame before
+         * LVGL collects dirty areas, keeping it fixed through all TE/DMA strips. */
+        if (frames->active && frames->pending >= 0) {
+            lv_timer_t *timer = lv_display_get_refr_timer(lv_obj_get_display(image));
+            if (timer) { lv_timer_resume(timer); lv_timer_ready(timer); }
+        }
+        xSemaphoreGive(frames->lock);
+        return;
+    }
     if (frames->active && frames->pending >= 0) {
         const int slot = frames->pending;
         frames->pending = -1;
@@ -107,6 +146,9 @@ void app_frames_present(app_frames_handle_t frames, lv_obj_t *image)
         frames->metrics.queue_delay_us = delay <= 0 ? 0 : delay > UINT32_MAX ? UINT32_MAX : (uint32_t)delay;
         if (frames->metrics.queue_delay_us > frames->metrics.max_queue_delay_us)
             frames->metrics.max_queue_delay_us = frames->metrics.queue_delay_us;
+        const bool same_source = refreshing && lv_image_get_src(image) == &frames->descriptor &&
+            frames->descriptor.header.w == frames->width[slot] &&
+            frames->descriptor.header.h == frames->height[slot];
         lv_image_cache_drop(&frames->descriptor);
         frames->descriptor.header.magic = LV_IMAGE_HEADER_MAGIC;
         frames->descriptor.header.cf = LV_COLOR_FORMAT_RGB565;
@@ -132,12 +174,22 @@ void app_frames_present(app_frames_handle_t frames, lv_obj_t *image)
                 lv_obj_center(image);
             }
         }
-        lv_image_set_src(image, &frames->descriptor);
+        if (!same_source) lv_image_set_src(image, &frames->descriptor);
         if (!frames->viewport_width || !frames->viewport_height) lv_obj_center(image);
         lv_obj_invalidate(image);
-        lv_display_trigger_activity(lv_obj_get_display(image));
     }
     xSemaphoreGive(frames->lock);
+}
+
+void app_frames_present(app_frames_handle_t frames, lv_obj_t *image)
+{
+    present(frames, image, false);
+}
+
+static void present_on_refresh(lv_event_t *event)
+{
+    app_frames_handle_t frames = lv_event_get_user_data(event);
+    present(frames, frames->refresh_image, true);
 }
 
 esp_err_t app_frames_get_metrics(app_frames_handle_t frames, app_frames_metrics_t *metrics)

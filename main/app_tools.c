@@ -17,6 +17,9 @@
 
 #define TOOLS_MAGIC 0x41545433U
 #define TOOLS_V2_MAGIC 0x41545432U
+#define TOOLS_DIRTY_SETTINGS (1U << 0)
+#define TOOLS_DIRTY_ARCADE (1U << 1)
+#define TOOLS_ARCADE_TILT_MASK (APP_TOOLS_ARCADE_TILES | APP_TOOLS_ARCADE_SNAKE)
 #define RTC_UTC_OFFSET_SECONDS (8 * 60 * 60)
 #define UNIX_SECONDS_IN_2000 INT64_C(946684800)
 #define NTP_DNS_TIMEOUT_MS 7000U
@@ -49,6 +52,7 @@ static bool s_started;
 static bool s_clock_quiesced;
 static bool s_clock_cancel_network;
 static uint32_t s_revision;
+static unsigned s_dirty_preferences;
 static pcf85063_time_t s_clock_request;
 static app_tools_snapshot_t s_snapshot = {
     .reference_pressure_pa = 101325,
@@ -106,7 +110,21 @@ static esp_err_t load_preferences(persisted_tools_t *settings)
     return ESP_OK;
 }
 
-static esp_err_t save_preferences(const app_tools_snapshot_t *snapshot)
+static esp_err_t load_arcade_preferences(app_tools_arcade_preferences_t *preferences)
+{
+    nvs_handle_t nvs;
+    esp_err_t error = nvs_open("tools", NVS_READONLY, &nvs);
+    if (error != ESP_OK) return error;
+    size_t size = sizeof(*preferences);
+    error = nvs_get_blob(nvs, "arcade_v1", preferences, &size);
+    nvs_close(nvs);
+    if (error != ESP_OK) return error;
+    if (size != sizeof(*preferences) || (preferences->tilt_modes & ~TOOLS_ARCADE_TILT_MASK))
+        return ESP_ERR_INVALID_RESPONSE;
+    return ESP_OK;
+}
+
+static esp_err_t save_preferences(const app_tools_snapshot_t *snapshot, unsigned dirty)
 {
     persisted_tools_t settings = {
         .magic = TOOLS_MAGIC, .best_score = snapshot->best_score,
@@ -115,7 +133,10 @@ static esp_err_t save_preferences(const app_tools_snapshot_t *snapshot)
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("tools", NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
-    err = nvs_set_blob(nvs, "settings_v3", &settings, sizeof(settings));
+    if (dirty & TOOLS_DIRTY_SETTINGS)
+        err = nvs_set_blob(nvs, "settings_v3", &settings, sizeof(settings));
+    if (err == ESP_OK && (dirty & TOOLS_DIRTY_ARCADE))
+        err = nvs_set_blob(nvs, "arcade_v1", &snapshot->arcade, sizeof(snapshot->arcade));
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     return err;
@@ -391,6 +412,8 @@ static void tools_task(void *argument)
     (void)argument;
     persisted_tools_t settings;
     const esp_err_t loaded = load_preferences(&settings);
+    app_tools_arcade_preferences_t arcade;
+    const esp_err_t arcade_loaded = load_arcade_preferences(&arcade);
     if (s_board->rtc_ready && s_board->rtc) {
         pcf85063_time_t time;
         if (pcf85063_get_time(s_board->rtc, &time) == ESP_OK) restore_system_clock(&time);
@@ -400,7 +423,9 @@ static void tools_task(void *argument)
         s_snapshot.best_score = settings.best_score;
         s_snapshot.reference_pressure_pa = settings.reference_pa;
     }
-    s_snapshot.preferences_error = loaded == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : loaded;
+    if (arcade_loaded == ESP_OK) s_snapshot.arcade = arcade;
+    s_snapshot.preferences_error = loaded != ESP_ERR_NVS_NOT_FOUND && loaded != ESP_OK ? loaded :
+        arcade_loaded == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : arcade_loaded;
     s_snapshot.ready = true;
     portEXIT_CRITICAL(&s_lock);
 
@@ -412,10 +437,12 @@ static void tools_task(void *argument)
         app_tools_snapshot_t snapshot;
         pcf85063_time_t request;
         uint32_t revision;
+        unsigned dirty;
         portENTER_CRITICAL(&s_lock);
         snapshot = s_snapshot;
         request = s_clock_request;
         revision = s_revision;
+        dirty = s_dirty_preferences;
         portEXIT_CRITICAL(&s_lock);
         if (snapshot.clock_pending) commit_clock(&request, false);
         service_network_clock(&network_clock);
@@ -460,10 +487,13 @@ static void tools_task(void *argument)
         s_snapshot.preferences_deferred = deferred;
         portEXIT_CRITICAL(&s_lock);
         if (snapshot.preferences_pending && !deferred && (int32_t)(now - save_due) >= 0) {
-            const esp_err_t err = save_preferences(&snapshot);
+            const esp_err_t err = save_preferences(&snapshot, dirty);
             portENTER_CRITICAL(&s_lock);
             s_snapshot.preferences_error = err;
-            if (err == ESP_OK && s_revision == revision) s_snapshot.preferences_pending = false;
+            if (err == ESP_OK && s_revision == revision) {
+                s_dirty_preferences = 0;
+                s_snapshot.preferences_pending = false;
+            }
             portEXIT_CRITICAL(&s_lock);
             save_due = now + (err == ESP_OK ? 1000 : 3000);
         }
@@ -570,8 +600,9 @@ void app_tools_set_clock_quiesced(bool quiesced)
     if (quiesced && s_task) xTaskNotifyGive(s_task);
 }
 
-static void mark_dirty(void)
+static void mark_dirty(unsigned preferences)
 {
+    s_dirty_preferences |= preferences;
     s_snapshot.preferences_pending = true;
     s_snapshot.preferences_error = ESP_ERR_NOT_FINISHED;
     ++s_revision;
@@ -586,7 +617,7 @@ esp_err_t app_tools_set_reference_pressure(float pressure_pa)
         return ESP_ERR_INVALID_STATE;
     }
     s_snapshot.reference_pressure_pa = pressure_pa;
-    mark_dirty();
+    mark_dirty(TOOLS_DIRTY_SETTINGS);
     portEXIT_CRITICAL(&s_lock);
     xTaskNotifyGive(s_task);
     return ESP_OK;
@@ -597,8 +628,43 @@ void app_tools_record_score(uint32_t score)
     portENTER_CRITICAL(&s_lock);
     if (s_snapshot.ready && score > s_snapshot.best_score && score <= 1000000) {
         s_snapshot.best_score = score;
-        mark_dirty();
+        mark_dirty(TOOLS_DIRTY_SETTINGS);
     }
     portEXIT_CRITICAL(&s_lock);
     if (s_task) xTaskNotifyGive(s_task);
+}
+
+app_tools_arcade_preferences_t app_tools_get_arcade_preferences(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    const app_tools_arcade_preferences_t preferences = s_snapshot.arcade;
+    portEXIT_CRITICAL(&s_lock);
+    return preferences;
+}
+
+void app_tools_set_arcade_tilt(app_tools_arcade_control_t control, bool tilt)
+{
+    if (control != APP_TOOLS_ARCADE_TILES && control != APP_TOOLS_ARCADE_SNAKE) return;
+    portENTER_CRITICAL(&s_lock);
+    uint8_t modes = s_snapshot.arcade.tilt_modes;
+    modes = tilt ? modes | control : modes & ~control;
+    const bool changed = s_snapshot.ready && modes != s_snapshot.arcade.tilt_modes;
+    if (changed) {
+        s_snapshot.arcade.tilt_modes = modes;
+        mark_dirty(TOOLS_DIRTY_ARCADE);
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (changed) xTaskNotifyGive(s_task);
+}
+
+void app_tools_set_crates_level(uint8_t level)
+{
+    portENTER_CRITICAL(&s_lock);
+    const bool changed = s_snapshot.ready && s_snapshot.arcade.crates_level != level;
+    if (changed) {
+        s_snapshot.arcade.crates_level = level;
+        mark_dirty(TOOLS_DIRTY_ARCADE);
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (changed) xTaskNotifyGive(s_task);
 }

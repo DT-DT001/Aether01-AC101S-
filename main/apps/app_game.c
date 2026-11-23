@@ -2,6 +2,7 @@
 #include "app_arcade.h"
 #include "app_motion_filter.h"
 #include "app_telemetry.h"
+#include "app_tools.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -13,6 +14,16 @@ typedef enum { GAME_TILES, GAME_CRATES, GAME_SNAKE, GAME_JUMP, GAME_COUNT } game
 static const char *const game_titles[GAME_COUNT] = {
     "2048", "推箱子", "贪吃蛇", "跳一跳",
 };
+
+static app_tools_arcade_preferences_t game_preferences(void)
+{
+#ifdef AETHER_UI_SELFTEST
+    /* The diagnostic gestures use touch by default and the first Sokoban map. */
+    return (app_tools_arcade_preferences_t){0};
+#else
+    return app_tools_get_arcade_preferences();
+#endif
+}
 
 typedef struct {
     app_ui_t *ui;
@@ -583,34 +594,39 @@ static void tilt_tick(game_page_t *page, uint32_t now)
     }
 }
 
-static void game_timer(lv_timer_t *timer)
+static void game_suspend(app_ui_t *ui, bool suspended)
 {
-    app_ui_t *ui = lv_timer_get_user_data(timer);
     game_page_t *page = ui->page_context;
-    if (!page) return;
+    if (!page || page->sleeping == suspended) return;
     const uint32_t now = now_ms();
-    if (app_power_is_sleeping(ui->power)) {
-        if (!page->sleeping) {
-            page->sleeping = true;
-            page->sleep_ms = now;
-            page->swipe_input = NULL;
-            if (page->kind == GAME_JUMP) {
-                page->jump_input = NULL;
-                arcade_jump_cancel(&page->model.jump);
-            }
+    page->sleeping = suspended;
+    if (suspended) {
+        page->sleep_ms = now;
+        page->swipe_input = NULL;
+        if (page->tilt_enabled) app_telemetry_set_interest(0);
+        if (page->kind == GAME_JUMP) {
+            page->jump_input = NULL;
+            arcade_jump_cancel(&page->model.jump);
         }
         return;
     }
-    if (page->sleeping) {
-        const uint32_t sleep = now - page->sleep_ms;
-        page->sleeping = false;
-        if (page->tilt_enabled) set_tilt(page, true);
-        if (page->kind == GAME_SNAKE) page->snake_due_ms += sleep;
-        if (page->kind == GAME_JUMP) {
-            page->model.jump.phase_ms += sleep;
-            jump_render(page, now, true);
-        }
+    const uint32_t sleep = now - page->sleep_ms;
+    if (page->tilt_enabled) set_tilt(page, true);
+    if (page->kind == GAME_SNAKE) page->snake_due_ms += sleep;
+    if (page->kind == GAME_JUMP) {
+        page->model.jump.phase_ms += sleep;
+        jump_render(page, now, true);
     }
+}
+
+static void game_timer(lv_timer_t *timer)
+{
+    app_ui_t *ui = lv_timer_get_user_data(timer);
+    const bool suspended = app_power_is_sleeping(ui->power);
+    game_suspend(ui, suspended);
+    game_page_t *page = ui->page_context;
+    if (!page || suspended) return;
+    const uint32_t now = now_ms();
     if (page->kind == GAME_JUMP) {
         const arcade_jump_phase_t old = page->model.jump.phase;
         arcade_jump_step(&page->model.jump, now);
@@ -700,6 +716,9 @@ static void crates_next_click(lv_event_t *event)
     game_page_t *page = lv_event_get_user_data(event);
     if (!arcade_crates_solved(&page->model.crates) || page->level + 1U >= arcade_crates_levels()) return;
     arcade_crates_init(&page->model.crates, ++page->level);
+#ifndef AETHER_UI_SELFTEST
+    app_tools_set_crates_level(page->level);
+#endif
     crates_render(page);
 }
 
@@ -715,6 +734,9 @@ static void tiles_mode_click(lv_event_t *event)
 {
     game_page_t *page = lv_event_get_user_data(event);
     tiles_set_mode(page, !page->tilt_enabled);
+#ifndef AETHER_UI_SELFTEST
+    app_tools_set_arcade_tilt(APP_TOOLS_ARCADE_TILES, page->tilt_enabled);
+#endif
 }
 
 static void snake_mode_click(lv_event_t *event)
@@ -722,6 +744,9 @@ static void snake_mode_click(lv_event_t *event)
     game_page_t *page = lv_event_get_user_data(event);
     const bool tilt = !page->tilt_enabled;
     set_tilt(page, tilt);
+#ifndef AETHER_UI_SELFTEST
+    app_tools_set_arcade_tilt(APP_TOOLS_ARCADE_SNAKE, tilt);
+#endif
     const uint32_t now = now_ms();
     if (!tilt && page->snake_started) page->snake_due_ms = now + arcade_snake_interval(&page->model.snake);
     app_ui_label_text(page->mode_label, tilt ? "模式 · 倾斜" : "模式 · 触摸");
@@ -820,7 +845,8 @@ static void build_tiles(game_page_t *page)
     page->recenter = button(parent, 241, 0, 43, 34, LV_SYMBOL_GPS, &lv_font_montserrat_20, zero_click, page);
     arcade_tiles_init(&page->model.tiles, esp_random());
     tiles_render(page);
-    tiles_set_mode(page, false);
+    const app_tools_arcade_preferences_t preferences = game_preferences();
+    tiles_set_mode(page, preferences.tilt_modes & APP_TOOLS_ARCADE_TILES);
 }
 
 static void build_crates(game_page_t *page)
@@ -835,7 +861,9 @@ static void build_crates(game_page_t *page)
     page->next_level = button(parent, 225, 0, 54, 34, LV_SYMBOL_NEXT, &lv_font_montserrat_20,
                               crates_next_click, page);
     lv_obj_align(page->hint, LV_ALIGN_TOP_MID, 0, 355);
-    arcade_crates_init(&page->model.crates, 0);
+    const app_tools_arcade_preferences_t preferences = game_preferences();
+    if (preferences.crates_level < arcade_crates_levels()) page->level = preferences.crates_level;
+    arcade_crates_init(&page->model.crates, page->level);
     crates_render(page);
 }
 
@@ -847,7 +875,10 @@ static void build_snake(game_page_t *page)
     lv_obj_align(page->board, LV_ALIGN_TOP_MID, 0, 38);
     lv_obj_add_event_cb(page->board, snake_draw, LV_EVENT_DRAW_MAIN, page);
     add_touch_regions(page);
-    lv_obj_t *mode = button(parent, 102, 0, 113, 34, "模式 · 触摸", app_ui_chinese_font(), snake_mode_click, page);
+    const app_tools_arcade_preferences_t preferences = game_preferences();
+    page->tilt_enabled = (preferences.tilt_modes & APP_TOOLS_ARCADE_SNAKE) != 0;
+    lv_obj_t *mode = button(parent, 102, 0, 113, 34, page->tilt_enabled ? "模式 · 倾斜" : "模式 · 触摸",
+                            app_ui_chinese_font(), snake_mode_click, page);
     page->mode_label = lv_obj_get_child(mode, 0);
     page->pause = button(parent, 229, 0, 51, 34, LV_SYMBOL_PAUSE, &lv_font_montserrat_20,
                          snake_pause_click, page);
@@ -921,12 +952,6 @@ static void game_cleanup(app_ui_t *ui)
     ui->page_context = NULL;
 }
 
-static void show_hub(lv_event_t *event)
-{
-    const game_page_t *page = lv_event_get_user_data(event);
-    app_open_game(page->ui);
-}
-
 static void open_game(app_ui_t *ui, game_kind_t kind)
 {
     lv_obj_t *content = app_ui_begin_page(ui, game_titles[kind]);
@@ -941,9 +966,9 @@ static void open_game(app_ui_t *ui, game_kind_t kind)
     page->kind = kind;
     ui->page_context = page;
     ui->page_cleanup = game_cleanup;
+    ui->page_suspend = game_suspend;
     page->score = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 4, TEXT_BRIGHT, app_ui_chinese_font_size(24));
     page->hint = app_ui_add_text(content, "", LV_ALIGN_TOP_MID, 0, 335, TEXT_MUTED, app_ui_chinese_font());
-    button(content, 294, 0, 48, 34, LV_SYMBOL_LIST, &lv_font_montserrat_20, show_hub, page);
     button(content, 350, 0, 48, 34, LV_SYMBOL_REFRESH, &lv_font_montserrat_20, restart_click, page);
     switch (kind) {
     case GAME_TILES: build_tiles(page); break;
@@ -1003,7 +1028,7 @@ static void game_preview(lv_obj_t *card, game_kind_t kind)
 
 void app_open_game(app_ui_t *ui)
 {
-    lv_obj_t *content = app_ui_begin_page(ui, "游戏");
+    lv_obj_t *content = app_ui_begin_page(ui, "小游戏");
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     const lv_event_cb_t callbacks[] = {select_tiles, select_crates, select_snake, select_jump};
     for (unsigned i = 0; i < GAME_COUNT; ++i) {

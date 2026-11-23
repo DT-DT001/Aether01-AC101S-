@@ -3,6 +3,16 @@
 #include "aether_board.h"
 #include "aether_audio_player.h"
 
+typedef enum {
+    APP_TOOLS_ARCADE_TILES = 1U << 0,
+    APP_TOOLS_ARCADE_SNAKE = 1U << 1,
+} app_tools_arcade_control_t;
+
+typedef struct {
+    uint8_t tilt_modes;
+    uint8_t crates_level;
+} app_tools_arcade_preferences_t;
+
 typedef struct {
     bool ready;
     bool preferences_pending;
@@ -12,6 +22,7 @@ typedef struct {
     bool network_clock_received;
     uint32_t best_score;
     float reference_pressure_pa;
+    app_tools_arcade_preferences_t arcade;
     esp_err_t preferences_error;
     esp_err_t clock_error;
     uint32_t clock_revision;
@@ -40,3 +51,6 @@ esp_err_t app_tools_sync_clock(void);
 void app_tools_set_clock_quiesced(bool quiesced);
 esp_err_t app_tools_set_reference_pressure(float pressure_pa);
 void app_tools_record_score(uint32_t score);
+app_tools_arcade_preferences_t app_tools_get_arcade_preferences(void);
+void app_tools_set_arcade_tilt(app_tools_arcade_control_t control, bool tilt);
+void app_tools_set_crates_level(uint8_t level);

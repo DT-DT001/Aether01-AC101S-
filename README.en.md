@@ -14,11 +14,13 @@ This standalone firmware demo targets the AC101S edition of Aether01, a handheld
 
 ![2048, Sokoban, Snake, and platform jumping](docs/images/03-built-in-games.png)
 
-The 480 × 480 previews use the current firmware's LVGL interface with demo content.
+The 480 × 480 previews show the LVGL interface with demo content.
 
 Swipe up from the desktop to open the app drawer. Returning to the drawer restores its scroll position. The drawer's Home button or a two-second hold of the physical user button opens the desktop.
 
 The firmware includes music playback with a live five-band EQ, video, recording, a TXT reader, NES emulation, USB OTG, Wi-Fi, Bluetooth controls, and ESP-NOW push-to-talk. Everyday tools include alarms, notes, a calendar, and weather. 2048 supports swipe and tilt controls. Sokoban and Snake respond to directional touch regions, and Snake also supports tilt.
+
+The power button and screen timeout pause the foreground app while music keeps playing. Press the power button to resume. Air Mouse includes common computer shortcuts, and OBS scene labels can be renamed.
 
 Music playback supports synchronized LRC lyrics, previews the target time while scrubbing, and remembers playback position. The recorder shows a live waveform and has its own recording list. The offline Pinyin keyboard supports Chinese text entry with word candidates and an optional vocabulary extension. Long-press a file to see its details, copy it, move it, or delete it.
 

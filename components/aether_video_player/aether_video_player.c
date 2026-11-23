@@ -69,6 +69,12 @@ esp_err_t aether_video_player_set_paused(aether_video_player_handle_t h, bool pa
     if (!h) return ESP_ERR_INVALID_ARG;
     return mode(h) ? aether_mp4_player_set_paused(h->mp4, paused) : aether_mjpeg_player_set_paused(h->mjpeg, paused);
 }
+void aether_video_player_set_screen_paused(aether_video_player_handle_t h, bool paused)
+{
+    if (!h) return;
+    aether_mjpeg_player_set_screen_paused(h->mjpeg, paused);
+    aether_mp4_player_set_screen_paused(h->mp4, paused);
+}
 esp_err_t aether_video_player_set_fps(aether_video_player_handle_t h, uint8_t fps)
 {
     if (!h) return ESP_ERR_INVALID_ARG;

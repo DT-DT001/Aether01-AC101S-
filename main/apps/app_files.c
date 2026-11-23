@@ -157,7 +157,7 @@ static void files_folder_back(app_ui_t *ui)
     files_refresh(ui);
 }
 
-static void files_back_from_audio(app_ui_t *ui)
+static void files_back_from_media(app_ui_t *ui)
 {
     const app_files_return_t previous = ui->files_return;
     files_open(ui, previous.directory, &previous);
@@ -402,8 +402,9 @@ static void file_clicked(lv_event_t *event)
         return;
     }
     const char *ext = strrchr(item.path, '.');
-    if (ext && !strcasecmp(ext, ".txt")) app_open_reader_path(ui, item.path);
-    else if (ext && (!strcasecmp(ext, ".wav") || !strcasecmp(ext, ".mp3") || !strcasecmp(ext, ".m4a"))) {
+    const bool text = ext && !strcasecmp(ext, ".txt");
+    const bool audio = ext && (!strcasecmp(ext, ".wav") || !strcasecmp(ext, ".mp3") || !strcasecmp(ext, ".m4a"));
+    if (text || audio) {
         files_capture_entry_route(ui, page);
         app_files_return_t previous = {
             .exit_path_length = page->exit_path_length,
@@ -411,11 +412,12 @@ static void file_clicked(lv_event_t *event)
             .media_generation = page->media_generation,
             .parent = page->exit_back,
         };
-        /* Opening the player frees this browser page. Keep only its return location. */
+        /* Opening a file frees this browser page. Keep its return location. */
         strlcpy(previous.directory, page->directory, sizeof(previous.directory));
-        app_open_music_path(ui, item.path);
+        if (text) app_open_reader_path(ui, item.path);
+        else app_open_music_path(ui, item.path);
         ui->files_return = previous;
-        ui->page_back = files_back_from_audio;
+        ui->page_back = files_back_from_media;
     }
     else if (ext && (!strcasecmp(ext, ".mp4") || !strcasecmp(ext, ".m4v") || !strcasecmp(ext, ".avi") || !strcasecmp(ext, ".mjpg") || !strcasecmp(ext, ".mjpeg"))) app_open_video_path(ui, item.path);
     else if (ext && !strcasecmp(ext, ".nes")) app_open_nes_path(ui, item.path);

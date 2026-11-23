@@ -13,6 +13,11 @@ void app_usb_input_publish(void *context, const aether_usb_input_event_t *event)
 void app_usb_input_set_gate(bool (*blocked)(void *), void *context);
 /* Thread-safe admission. Disabled/held inputs are consumed until release. */
 void app_usb_input_set_enabled(bool enabled);
+/* A binding dialog consumes new physical keyboard presses as raw HID usages.
+ * Existing presses are ignored until released; touch/mouse can still select.
+ * Disable this mode when the owning dialog closes. Zero means no new key. */
+bool app_usb_input_capture_keys(bool enable);
+uint8_t app_usb_input_take_captured_usage(void);
 /* LVGL-only modal keyboard scope. Call after the dialog controls exist.
  * DELETE automatically restores the previous scope/focus; close is needed for
  * hidden/reused panels. Pointer/touch still work. Failure blocks keypad input

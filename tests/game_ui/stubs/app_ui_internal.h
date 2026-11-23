@@ -9,6 +9,7 @@ typedef struct app_ui {
     lv_timer_t *timer;
     void *page_context;
     void (*page_cleanup)(struct app_ui *);
+    void (*page_suspend)(struct app_ui *, bool);
     void (*page_back)(struct app_ui *);
     app_power_t *power;
 } app_ui_t;

@@ -28,7 +28,7 @@ struct aether_recorder {
     aether_storage_handle_t storage;
     portMUX_TYPE lock;
     SemaphoreHandle_t commands;
-    atomic_bool stop, pause;
+    atomic_bool stop, pause, screen_paused;
     atomic_int error;
     bool destroying;
     aether_recorder_status_t status;
@@ -101,16 +101,30 @@ static void capture_task(void *argument)
 {
     session_t *s=argument;aether_recorder_handle_t h=s->h;
     bool capture_attempted=false;
-    if(atomic_load(&h->stop))goto done;
-    capture_attempted=true;
-    esp_err_t error=ac101s_audio_capture_start(h->audio,24.0f);
-    if(error!=ESP_OK){fail(h,error,"无法启动麦克风采集");goto done;}
     while(!atomic_load(&h->stop)) {
         if(!aether_storage_card_inserted(h->storage)){fail(h,ESP_ERR_INVALID_STATE,"TF卡已拔出，正在保存可恢复部分");break;}
-        error=ac101s_audio_capture_read(h->audio,s->rx,RX_BYTES);
+        if (atomic_load(&h->screen_paused)) {
+            if (capture_attempted) {
+                const esp_err_t error = ac101s_audio_capture_stop(h->audio);
+                if (error != ESP_OK) { fail(h, error, "息屏暂停麦克风失败"); break; }
+                capture_attempted = false;
+            }
+            portENTER_CRITICAL(&h->lock);
+            h->status.peak = 0;
+            if (!atomic_load(&h->stop)) h->status.state = AETHER_RECORDER_PAUSED;
+            portEXIT_CRITICAL(&h->lock);
+            vTaskDelay(pdMS_TO_TICKS(25));
+            continue;
+        }
+        if (!capture_attempted) {
+            capture_attempted = true;
+            const esp_err_t error = ac101s_audio_capture_start(h->audio, 24.0f);
+            if (error != ESP_OK) { fail(h, error, "无法启动麦克风采集"); break; }
+        }
+        const esp_err_t error=ac101s_audio_capture_read(h->audio,s->rx,RX_BYTES);
         if(error!=ESP_OK){fail(h,error,"麦克风采集失败，录音已停止");break;}
         if(atomic_load(&h->stop))break;
-        const bool paused=atomic_load(&h->pause);
+        const bool paused=atomic_load(&h->pause) || atomic_load(&h->screen_paused);
         uint16_t peak=0;
         const uint32_t produced=atomic_load_explicit(&s->produced,memory_order_relaxed);
         const uint32_t consumed=atomic_load_explicit(&s->consumed,memory_order_acquire);
@@ -137,7 +151,6 @@ static void capture_task(void *argument)
          * scheduler opportunity if a prefilled RX queue completes immediately. */
         taskYIELD();
     }
-done:
     if(capture_attempted) {
         /* A partially failed start/close may retain the codec reservation.
          * Keep this owner alive until the capture API confirms release. */
@@ -209,7 +222,10 @@ static void writer_task(void *argument)
             size_t wrote=fwrite(s->output,1,amount,file);accepted+=wrote;progress(h,accepted&~UINT64_C(1));
             if(wrote!=amount){fail(h,ESP_FAIL,"TF卡写入失败或空间已满");break;}
         } else if(atomic_load_explicit(&s->producer_done,memory_order_acquire))break;
-        else vTaskDelay(pdMS_TO_TICKS(5)?pdMS_TO_TICKS(5):1);
+        else {
+            const TickType_t delay = pdMS_TO_TICKS(atomic_load(&h->screen_paused) ? 25 : 5);
+            vTaskDelay(delay ? delay : 1);
+        }
         if(atomic_load(&h->stop))state(h,AETHER_RECORDER_SAVING);
         if(accepted!=checkpointed&&esp_timer_get_time()-checkpoint_at>=2000000) {
             if(!checkpoint(file,accepted)){fail(h,ESP_FAIL,"录音检查点写入失败");break;}
@@ -245,7 +261,8 @@ esp_err_t aether_recorder_new(ac101s_audio_handle_t audio,aether_storage_handle_
     *out=NULL;
     aether_recorder_handle_t h=calloc(1,sizeof(*h));if(!h)return ESP_ERR_NO_MEM;
     h->audio=audio;h->storage=storage;h->lock=(portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
-    atomic_init(&h->stop,false);atomic_init(&h->pause,false);atomic_init(&h->error,ESP_OK);
+    atomic_init(&h->stop,false);atomic_init(&h->pause,false);
+    atomic_init(&h->screen_paused,false);atomic_init(&h->error,ESP_OK);
     h->commands=xSemaphoreCreateMutex();if(!h->commands){free(h);return ESP_ERR_NO_MEM;}
     aether_recorder_handle_t expected=NULL;
     if(!atomic_compare_exchange_strong(&s_default,&expected,h)){vSemaphoreDelete(h->commands);free(h);return ESP_ERR_INVALID_STATE;}
@@ -272,6 +289,10 @@ esp_err_t aether_recorder_set_paused(aether_recorder_handle_t h,bool paused)
     portENTER_CRITICAL(&h->lock);
     if(!h->status.active||atomic_load(&h->stop)){portEXIT_CRITICAL(&h->lock);return ESP_ERR_INVALID_STATE;}
     atomic_store(&h->pause,paused);portEXIT_CRITICAL(&h->lock);return ESP_OK;
+}
+void aether_recorder_set_screen_paused(aether_recorder_handle_t h, bool paused)
+{
+    if (h) atomic_store(&h->screen_paused, paused);
 }
 esp_err_t aether_recorder_stop(aether_recorder_handle_t h)
 {

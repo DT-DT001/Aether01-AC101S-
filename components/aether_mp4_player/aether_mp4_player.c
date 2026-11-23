@@ -37,6 +37,7 @@ struct aether_mp4_player {
     ac101s_audio_handle_t audio;
     portMUX_TYPE lock;
     atomic_bool stop,pause;
+    bool user_paused, screen_paused;
     atomic_uint seek_revision;
     SemaphoreHandle_t publish,lifecycle;
     TaskHandle_t video_worker; /* External lifecycle owner alone creates/reaps. */
@@ -277,7 +278,7 @@ static void audio_segment(session_t *s)
                 if(error!=ESP_OK) goto done;
                 codec_started=false;
             }
-            while(atomic_load(&h->pause) && !cancelled(s)) vTaskDelay(1);
+            while(atomic_load(&h->pause) && !cancelled(s)) vTaskDelay(pdMS_TO_TICKS(10));
             if(cancelled(s)) break;
             atomic_store(&s->audio_pause_interrupted,false);
             /* Closing I2S discards queued audio. Resume at the common media
@@ -733,7 +734,7 @@ decode_video:
         if(audio_created && atomic_load(&s->audio_done) && atomic_load(&s->audio_result)!=ESP_OK) { error=atomic_load(&s->audio_result); goto done; }
         const bool paused=atomic_load(&h->pause);
         portENTER_CRITICAL(&h->lock); h->status.state=paused ? AETHER_MJPEG_PAUSED : AETHER_MJPEG_PLAYING; portEXIT_CRITICAL(&h->lock);
-        if(paused && !seek_preview) { vTaskDelay(1); continue; }
+        if(paused && !seek_preview) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         stage="video sample lookup";
         const int64_t lookup_begin=esp_timer_get_time();
         mp4_sample_t sample; error=mp4_demux_sample(s->demux,false,index,&sample);
@@ -1022,7 +1023,9 @@ esp_err_t aether_mp4_player_play(aether_mp4_player_handle_t h,const char *path,a
     h->status=(aether_mp4_status_t){.state=AETHER_MJPEG_STARTING}; copy_text(h->status.path,path,sizeof(h->status.path));
     h->callback=callback; h->context=context; h->release_frame=false;
     h->started_us=h->paused_us=h->pause_start_us=0; h->clock_waiting_audio=false; h->audio_clock_position_us=0;
-    atomic_store(&h->seek_revision,0); atomic_store(&h->stop,false); atomic_store(&h->pause,false); h->running=true;
+    h->user_paused=false;
+    atomic_store(&h->seek_revision,0); atomic_store(&h->stop,false);
+    atomic_store(&h->pause,h->screen_paused); h->running=true;
     portEXIT_CRITICAL(&h->lock);
     ESP_LOGI(TAG,"start path=%s",path);
     TaskHandle_t created=NULL;
@@ -1037,12 +1040,15 @@ esp_err_t aether_mp4_player_play(aether_mp4_player_handle_t h,const char *path,a
     xSemaphoreGive(h->lifecycle);
     return ESP_OK;
 }
-esp_err_t aether_mp4_player_set_paused(aether_mp4_player_handle_t h,bool paused)
+static esp_err_t set_pause(aether_mp4_player_handle_t h,bool paused,bool screen)
 {
     if(!h) return ESP_ERR_INVALID_ARG;
     const int64_t now=esp_timer_get_time();
     portENTER_CRITICAL(&h->lock);
-    if(!h->running) { portEXIT_CRITICAL(&h->lock); return ESP_ERR_INVALID_STATE; }
+    if(!h->running && !screen) { portEXIT_CRITICAL(&h->lock); return ESP_ERR_INVALID_STATE; }
+    if(screen) h->screen_paused=paused;
+    else h->user_paused=paused;
+    paused=h->screen_paused||h->user_paused;
     if(paused!=atomic_load(&h->pause)) {
         if(h->started_us) {
             if(paused) h->pause_start_us=now;
@@ -1052,6 +1058,10 @@ esp_err_t aether_mp4_player_set_paused(aether_mp4_player_handle_t h,bool paused)
     }
     portEXIT_CRITICAL(&h->lock); return ESP_OK;
 }
+esp_err_t aether_mp4_player_set_paused(aether_mp4_player_handle_t h,bool paused)
+{ return set_pause(h,paused,false); }
+void aether_mp4_player_set_screen_paused(aether_mp4_player_handle_t h,bool paused)
+{ (void)set_pause(h,paused,true); }
 esp_err_t aether_mp4_player_seek(aether_mp4_player_handle_t h,uint32_t position_ms)
 { return aether_mp4_player_seek_with_reset(h,position_ms,NULL,NULL); }
 esp_err_t aether_mp4_player_seek_with_reset(aether_mp4_player_handle_t h,uint32_t position_ms,

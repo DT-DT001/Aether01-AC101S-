@@ -23,6 +23,9 @@ void app_frames_set_active(app_frames_handle_t frames, bool active);
  * inside these bounds (max480x480), leaving letterbox pixels on the static
  * parent. Pass0,0 to retain the caller's existing image-object dimensions. */
 void app_frames_set_viewport(app_frames_handle_t frames, uint16_t width, uint16_t height);
+/* GUI owner. Adopt queued frames at the display refresh boundary instead of
+ * the UI service timer. Pass NULL or deactivate before deleting the image. */
+void app_frames_set_refresh_image(app_frames_handle_t frames, lv_obj_t *image);
 void app_frames_present(app_frames_handle_t frames, lv_obj_t *image);
 /* Snapshot of the application-to-LVGL handover, not physical display FPS. */
 esp_err_t app_frames_get_metrics(app_frames_handle_t frames, app_frames_metrics_t *metrics);

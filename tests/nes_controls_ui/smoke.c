@@ -11,6 +11,12 @@ static TickType_t now;
 static bool busy,stored;
 static settings_t saved;
 static unsigned writes;
+static bool capturing;
+static uint8_t captured;
+bool app_usb_input_capture_keys(bool enabled){capturing=enabled;captured=0;return true;}
+uint8_t app_usb_input_take_captured_usage(void){uint8_t u=captured;captured=0;return u;}
+esp_err_t app_usb_input_modal_open(lv_obj_t *modal,lv_obj_t *preferred)
+{assert(modal&&!preferred);return ESP_OK;}
 TickType_t xTaskGetTickCount(void){return now;}
 void vTaskDelay(TickType_t t){now+=t;}
 BaseType_t xTaskCreate(void (*f)(void*),const char *name,uint32_t stack,void *ctx,int prio,TaskHandle_t *out)
@@ -43,21 +49,25 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t period){ui->timer=lv_timer_create(cb,period,ui);}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p){const uint16_t *v=(const uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*v++;}lv_display_flush_ready(d);}
 static void advance(unsigned ms){for(unsigned i=0;i<ms;++i){++now;lv_tick_inc(1);lv_timer_handler();}}
-static lv_obj_t *find_dropdown(lv_obj_t *obj, unsigned index)
+static lv_obj_t *find_binding(lv_obj_t *obj, unsigned index)
 {
-    if(lv_obj_check_type(obj,&lv_dropdown_class)&&(uintptr_t)lv_obj_get_user_data(obj)==index)return obj;
+    if(lv_obj_check_type(obj,&lv_button_class)&&(uintptr_t)lv_obj_get_user_data(obj)==index+1)return obj;
     for(unsigned i=0;i<lv_obj_get_child_count(obj);++i){
-        lv_obj_t *found=find_dropdown(lv_obj_get_child(obj,i),index);
+        lv_obj_t *found=find_binding(lv_obj_get_child(obj,i),index);
         if(found)return found;
     }
     return NULL;
 }
-static lv_obj_t *dropdown(app_ui_t *ui,unsigned action,unsigned slot)
-{return find_dropdown(ui->content,action*2+slot);}
+static lv_obj_t *binding(app_ui_t *ui,unsigned action,unsigned slot)
+{return find_binding(ui->content,action*2+slot);}
+static lv_obj_t *by_type(lv_obj_t *obj,const lv_obj_class_t *type)
+{if(lv_obj_check_type(obj,type))return obj;for(unsigned i=0;i<lv_obj_get_child_count(obj);++i){lv_obj_t *r=by_type(lv_obj_get_child(obj,i),type);if(r)return r;}return NULL;}
 static lv_obj_t *find(lv_obj_t *o,const char *text)
 {if(lv_obj_check_type(o,&lv_label_class)&&strstr(lv_label_get_text(o),text))return o;for(unsigned i=0;i<lv_obj_get_child_count(o);++i){lv_obj_t *r=find(lv_obj_get_child(o,i),text);if(r)return r;}return NULL;}
+static lv_obj_t *open_editor(app_ui_t *ui,unsigned action,unsigned slot)
+{lv_obj_t *b=binding(ui,action,slot);assert(b);lv_obj_send_event(b,LV_EVENT_CLICKED,NULL);lv_obj_t *dlg=by_type(ui->screen,&lv_msgbox_class);assert(dlg&&capturing&&find(dlg,"USB 键盘"));return dlg;}
 static void choose(app_ui_t *ui,unsigned action,unsigned slot,uint8_t usage)
-{lv_obj_t *d=dropdown(ui,action,slot);assert(d);lv_dropdown_set_selected(d,app_nes_controls_key_index(usage));lv_obj_send_event(d,LV_EVENT_VALUE_CHANGED,NULL);}
+{lv_obj_t *dlg=open_editor(ui,action,slot);lv_obj_t *d=by_type(dlg,&lv_dropdown_class);assert(d&&lv_dropdown_get_option_count(d)==app_nes_controls_key_count());lv_dropdown_set_selected(d,app_nes_controls_key_index(usage));lv_obj_send_event(d,LV_EVENT_VALUE_CHANGED,NULL);}
 static uint16_t mapped(uint8_t usage){uint8_t keys[32]={0};keys[usage/8]|=1U<<(usage%8);return app_nes_controls_map(NULL,keys);}
 static void snapshot(lv_display_t *d,const char *dir,const char *name)
 {lv_refr_now(d);char path[1024];snprintf(path,sizeof(path),"%s/%s.ppm",dir,name);FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n480 480\n255\n");for(unsigned i=0;i<480*480;++i){uint16_t p=framebuffer[i];uint8_t rgb[]={(uint8_t)(((p>>11)&31)*255/31),(uint8_t)(((p>>5)&63)*255/63),(uint8_t)((p&31)*255/31)};assert(fwrite(rgb,1,3,f)==3);}assert(!fclose(f));}
@@ -65,23 +75,29 @@ int main(int argc,char **argv)
 {
  assert(argc==2);setbuf(stdout,NULL);lv_init();lv_display_t *d=lv_display_create(480,480);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);lv_display_set_buffers(d,draw_buffer,NULL,sizeof(draw_buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
  assert(app_nes_controls_init()==ESP_OK);app_nes_controls_set_persistence_guard(guard,NULL);app_ui_t ui={0};app_open_nes_controls(&ui);advance(100);
- assert(find(ui.screen,"默认 Esc 退出游戏")&&find(ui.screen,"长按用户键 2 秒回桌面")&&!find(ui.screen,"短按用户键"));
- for(unsigned a=0;a<APP_NES_CONTROL_COUNT;++a)for(unsigned k=0;k<2;++k){lv_obj_t *o=dropdown(&ui,a,k);assert(o&&lv_dropdown_get_option_count(o)==app_nes_controls_key_count()&&lv_dropdown_get_selected(o)==app_nes_controls_key_index(defaults[a][k]));}
+ assert(find(ui.screen,"点击任意键位修改")&&find(ui.screen,"主键")&&find(ui.screen,"备用键"));
+ for(unsigned a=0;a<APP_NES_CONTROL_COUNT;++a)for(unsigned k=0;k<2;++k){
+    lv_obj_t *o=binding(&ui,a,k);const unsigned i=app_nes_controls_key_index(defaults[a][k]);
+    assert(o&&!strcmp(lv_label_get_text(lv_obj_get_child(o,0)),i?app_nes_controls_key_name(i):"未设置"));
+ }
  snapshot(d,argv[1],"nes-keymap-defaults");
- choose(&ui,APP_NES_CONTROL_A,0,0x0a);assert(mapped(0x0a)==16&&mapped(0x1d)==0&&writes==0);
- lv_dropdown_open(dropdown(&ui,APP_NES_CONTROL_B,0));
- choose(&ui,APP_NES_CONTROL_B,0,0x0a);assert(mapped(0x1b)==32&&lv_dropdown_get_selected(dropdown(&ui,APP_NES_CONTROL_B,0))==app_nes_controls_key_index(0x1b));assert(find(ui.screen,"此键已用于"));
- lv_dropdown_close(dropdown(&ui,APP_NES_CONTROL_B,0));
- choose(&ui,APP_NES_CONTROL_A,0,0);choose(&ui,APP_NES_CONTROL_B,0,0x0a);choose(&ui,APP_NES_CONTROL_EXIT,0,0x45);
+ open_editor(&ui,APP_NES_CONTROL_A,0);captured=0x0a;advance(65);
+ assert(mapped(0x0a)==16&&mapped(0x1d)==0&&writes==0&&!capturing&&!by_type(ui.screen,&lv_msgbox_class));
+ choose(&ui,APP_NES_CONTROL_B,0,0x0a);assert(mapped(0x1b)==32&&find(ui.screen,"此键已用于")&&capturing);
+ lv_msgbox_close(by_type(ui.screen,&lv_msgbox_class));
+ lv_obj_t *editor=open_editor(&ui,APP_NES_CONTROL_A,0);snapshot(d,argv[1],"nes-keymap-edit");
+ lv_obj_send_event(lv_obj_get_parent(find(editor,"清除键位")),LV_EVENT_CLICKED,NULL);
+ assert(!capturing&&mapped(0x0a)==0);
+ choose(&ui,APP_NES_CONTROL_B,0,0x0a);choose(&ui,APP_NES_CONTROL_EXIT,0,0x45);
  assert(mapped(0x0a)==32&&mapped(0x45)==1024&&mapped(0x29)==0);
  busy=true;advance(300);assert(service_once()==250&&writes==0);advance(300);assert(find(ui.screen,"退出媒体后自动保存"));
  busy=false;assert(service_once()==portMAX_DELAY&&writes==1);advance(300);assert(find(ui.screen,"已保存"));
- puts("PASS actual11-action/22-selector LVGL page applies HID keys, rejects/reverts conflicts, supports unbind/alternate/exit binding and displays deferred/saved NVS state");
+ puts("PASS NES tap-to-edit LVGL page supports USB capture, touch choices, conflict rejection and deferred/saved status");
  lv_obj_t *reset=lv_obj_get_parent(find(ui.screen,"恢复默认"));lv_obj_send_event(reset,LV_EVENT_CLICKED,NULL);assert(mapped(0x1d)==16&&mapped(0x1b)==32&&mapped(0x29)==1024);advance(300);assert(service_once()==portMAX_DELAY);s.view.ready=false;assert(app_nes_controls_init()==ESP_OK);assert(mapped(0x1d)==16&&mapped(0x45)==0);
- lv_obj_scroll_to_view_recursive(dropdown(&ui,APP_NES_CONTROL_EXIT,0),LV_ANIM_OFF);
+ lv_obj_scroll_to_view_recursive(binding(&ui,APP_NES_CONTROL_EXIT,0),LV_ANIM_OFF);
  advance(300);snapshot(d,argv[1],"nes-keymap-exit-save");
- for(unsigned i=0;i<100;++i){app_open_nes_controls(&ui);advance(1);assert(dropdown(&ui,10,1));}
- if(ui.timer)lv_timer_delete(ui.timer);
+ for(unsigned i=0;i<100;++i){app_open_nes_controls(&ui);advance(1);assert(!capturing&&binding(&ui,10,1));open_editor(&ui,0,0);}
+ if(ui.timer){lv_timer_delete(ui.timer);ui.timer=NULL;}
  if(ui.page_cleanup)ui.page_cleanup(&ui);
  lv_obj_delete(ui.screen);assert(lv_mem_test()==LV_RESULT_OK);lv_display_delete(d);lv_deinit();
  puts("PASS actual restore-default action persists/reloads all bindings and100 page open/cleanup cycles preserve the LVGL heap");

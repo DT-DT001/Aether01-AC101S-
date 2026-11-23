@@ -41,6 +41,7 @@ typedef struct { float pressure_pa, temperature_c; } dps368_sample_t;
 typedef struct { unsigned value; } pcf85063_time_t;
 typedef struct { bool display_sleeping; bool touch_ready; tg29_handle_t pmic;
     qmi8658a_handle_t imu; dps368_handle_t barometer; bool imu_ready, barometer_ready;
+    void *audio; bool audio_ready;
 } aether_board_t;
 typedef struct { bool paused; unsigned ready_calls; } lv_timer_t;
 typedef struct { unsigned invalidations; } lv_obj_t;
@@ -67,6 +68,12 @@ uint32_t lv_display_get_inactive_time(lv_display_t *);
 uint32_t lv_tick_get(void);
 bool lvgl_port_lock(uint32_t);
 void lvgl_port_unlock(void);
+esp_err_t lvgl_port_stop(void);
+esp_err_t lvgl_port_resume(void);
+#define LV_NO_TIMER_READY UINT32_MAX
+#define CONFIG_XTAL_FREQ 40
+#define CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 320
+esp_err_t ac101s_audio_idle_clocks(void *audio);
 int gpio_get_level(int);
 TickType_t xTaskGetTickCount(void);
 unsigned ulTaskNotifyTake(BaseType_t, TickType_t);
@@ -91,4 +98,5 @@ esp_err_t gpio_isr_handler_add(int,void (*)(void *),void *);
 esp_err_t gpio_install_isr_service(int);
 esp_err_t gpio_set_intr_type(int,int);
 esp_err_t gpio_intr_enable(int);
+esp_err_t gpio_intr_disable(int);
 int64_t esp_timer_get_time(void);

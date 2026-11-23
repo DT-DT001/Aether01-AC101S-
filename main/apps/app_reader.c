@@ -19,6 +19,7 @@
 #define READER_CHUNK 16384U
 #define READER_HISTORY 512U
 #define READER_TOOLBAR_MS 3000U
+#define READER_MENU_HOLD_MS 2000U
 #define READER_TAP_DISTANCE 18
 #define READER_SWIPE_DISTANCE 48
 #define SHELF_WIDTH 424
@@ -34,6 +35,7 @@ typedef struct {
     app_scroll_list_t shelf;
     bool truncated;
     bool reading;
+    bool from_shelf;
     bool loading;
     bool dark;
     bool dirty;
@@ -56,12 +58,15 @@ typedef struct {
     lv_point_t press_start;
     bool press_moved;
     bool press_long;
+    uint32_t press_tick;
     uint32_t toolbar_shown;
     uint64_t history[READER_HISTORY];
     size_t history_count;
     reader_request_kind_t request_kind;
     char path[192];
     char page[4096];
+    lv_obj_t *read_view;
+    lv_obj_t *shelf_status;
     lv_obj_t *body;
     lv_obj_t *position;
     lv_obj_t *seek;
@@ -137,6 +142,15 @@ static void save_bookmark(reader_t *reader)
     if (app_io_submit_request(reader->ui->io, &request) == ESP_OK) reader->dirty = false;
 }
 
+static void reader_suspend(app_ui_t *ui, bool suspended)
+{
+    reader_t *reader = get_reader(ui);
+    if (suspended && reader && reader->reading) {
+        reader->press_device = NULL;
+        save_bookmark(reader);
+    }
+}
+
 static void reader_cleanup(app_ui_t *ui)
 {
     reader_t *reader = get_reader(ui);
@@ -166,7 +180,7 @@ static void apply_theme(reader_t *reader)
 {
     const uint32_t background = reader->dark ? 0x10192A : 0xF3E9D3;
     const uint32_t foreground = reader->dark ? 0xD8E2EC : 0x302D27;
-    lv_obj_set_style_bg_color(reader->ui->content, lv_color_hex(background), 0);
+    lv_obj_set_style_bg_color(reader->read_view, lv_color_hex(background), 0);
     lv_obj_set_style_text_color(reader->body, lv_color_hex(foreground), 0);
     lv_obj_set_style_text_font(reader->body, app_ui_chinese_font_size(reader->font_px), 0);
     app_ui_label_fmt(reader->font_label, "%u号字", (unsigned)reader->font_px);
@@ -377,6 +391,30 @@ static void bookshelf_event(lv_event_t *event)
     app_open_reader(lv_event_get_user_data(event));
 }
 
+static void exit_reader_event(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    reader_t *reader = get_reader(ui);
+    if (!reader || !reader->reading ||
+        lv_obj_get_screen(lv_event_get_current_target_obj(event)) != ui->screen) return;
+    if (!reader->from_shelf) {
+        if (ui->page_back) (void)app_ui_go_back(ui);
+        else app_open_reader(ui);
+        return;
+    }
+    save_bookmark(reader);
+    if (reader->loading) {
+        app_io_cancel(ui->io, ui->page_generation);
+        ui->io_complete = NULL;
+    }
+    reader->loading = reader->reading = false;
+    reader->press_device = NULL;
+    lv_obj_delete(reader->read_view);
+    reader->read_view = NULL;
+    lv_obj_remove_flag(ui->content, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_set_period(ui->timer, 500);
+}
+
 static void seek_event(lv_event_t *event)
 {
     reader_t *reader = get_reader(lv_event_get_user_data(event));
@@ -423,13 +461,15 @@ static void reader_press_event(lv_event_t *event)
         reader->press_start = point;
         reader->press_moved = false;
         reader->press_long = false;
+        reader->press_tick = lv_tick_get();
         return;
     }
     if (reader->press_device != device) return;
     const int dx = point.x - reader->press_start.x;
     const int dy = point.y - reader->press_start.y;
     if (abs(dx) > READER_TAP_DISTANCE || abs(dy) > READER_TAP_DISTANCE) reader->press_moved = true;
-    if (code == LV_EVENT_LONG_PRESSED && !reader->press_moved) {
+    if (!reader->press_long && !reader->press_moved &&
+        lv_tick_elaps(reader->press_tick) >= READER_MENU_HOLD_MS) {
         reader->press_long = true;
         show_toolbar(reader);
     }
@@ -445,7 +485,7 @@ static void reader_press_event(lv_event_t *event)
     if (tap) {
         if (reader->press_moved) return;
         lv_area_t bounds;
-        lv_obj_get_coords(reader->ui->content, &bounds);
+        lv_obj_get_coords(reader->read_view, &bounds);
         forward = vertical ? point.y >= (bounds.y1 + bounds.y2 + 1) / 2 :
                              point.x >= (bounds.x1 + bounds.x2 + 1) / 2;
     } else {
@@ -460,9 +500,9 @@ static void reader_press_event(lv_event_t *event)
 
 static void build_reader(reader_t *reader)
 {
-    lv_obj_t *content = reader->ui->content;
-    app_scroll_list_deinit(&reader->shelf);
-    lv_obj_clean(content);
+    lv_obj_add_flag(reader->ui->content, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *content = lv_obj_create(reader->ui->screen);
+    reader->read_view = content;
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_flag(content, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
     lv_obj_set_style_pad_all(content, 0, 0);
@@ -471,9 +511,8 @@ static void build_reader(reader_t *reader)
     lv_obj_set_style_bg_opa(content, LV_OPA_COVER, 0);
     lv_obj_set_size(content, LV_PCT(100), LV_PCT(100));
     lv_obj_center(content);
-    lv_obj_move_foreground(content);
     const lv_event_code_t input_events[] = {LV_EVENT_PRESSED, LV_EVENT_PRESSING, LV_EVENT_RELEASED,
-        LV_EVENT_LONG_PRESSED, LV_EVENT_PRESS_LOST, LV_EVENT_INDEV_RESET};
+        LV_EVENT_PRESS_LOST, LV_EVENT_INDEV_RESET};
     for (size_t i = 0; i < sizeof(input_events) / sizeof(input_events[0]); ++i)
         lv_obj_add_event_cb(content, reader_press_event, input_events[i], reader->ui);
     reader->body = app_ui_add_text(content, "正在恢复阅读位置…",
@@ -524,7 +563,7 @@ static void build_reader(reader_t *reader)
     reader->encoding_label = lv_obj_get_child(button, 0);
     button = reader_button(reader, toolbar, "左右滑动", 254, 80, 96, turn_mode_event);
     reader->turn_label = lv_obj_get_child(button, 0);
-    reader_button(reader, toolbar, "书架", 358, 80, 64, bookshelf_event);
+    reader_button(reader, toolbar, "退出", 358, 80, 64, exit_reader_event);
     lv_obj_add_flag(toolbar, LV_OBJ_FLAG_HIDDEN);
     apply_theme(reader);
 }
@@ -553,16 +592,23 @@ static void book_event(lv_event_t *event)
     app_ui_t *ui = lv_event_get_user_data(event);
     reader_t *reader = get_reader(ui);
     const size_t index = (size_t)(uintptr_t)lv_obj_get_user_data(lv_event_get_target_obj(event));
-    if (!reader || reader->loading || index >= reader->book_count) return;
+    if (!reader || reader->reading || reader->loading || index >= reader->book_count ||
+        !reader_storage_ready(reader)) return;
+    lv_obj_stop_scroll_anim(reader->shelf.viewport);
+    reader->from_shelf = true;
     reader->reading = true;
+    reader->dark = true;
+    reader->font_px = 24;
+    reader->encoding_hint = 0;
+    reader->turn_mode = APP_READER_TURN_SWIPE_HORIZONTAL;
+    reader->history_count = 0;
+    reader->text_start_offset = 0;
+    reader->dirty = false;
     reader->offset = reader->next_offset = 0;
     reader->file_size = reader->books[index].size;
     strlcpy(reader->path, reader->books[index].path, sizeof(reader->path));
     reader->card_was_mounted = reader_storage_ready(reader);
     build_reader(reader);
-    free(reader->books);
-    reader->books = NULL;
-    reader->book_count = 0;
     lv_timer_set_period(ui->timer, 100);
     app_io_request_t request = {.operation = APP_IO_READER_LOAD};
     strlcpy(request.path, reader->path, sizeof(request.path));
@@ -591,6 +637,7 @@ void app_open_reader_path(app_ui_t *ui, const char *path)
     reader->card_was_mounted = reader_storage_ready(reader);
     ui->page_context = reader;
     ui->page_cleanup = reader_cleanup;
+    ui->page_suspend = reader_suspend;
     build_reader(reader);
     app_ui_set_timer(ui, reader_timer, 100);
     app_io_request_t request = {.operation = APP_IO_READER_LOAD};
@@ -637,13 +684,13 @@ static void show_shelf(reader_t *reader)
     lv_obj_set_style_pad_all(content, 11, 0);
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     app_ui_add_text(content, "书架", LV_ALIGN_TOP_LEFT, 0, 2, 0xE9F2FF, app_ui_chinese_font_size(24));
-    reader->position = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 1, 32,
-                                        0xABC6CC, app_ui_chinese_font_size(16));
-    lv_obj_set_width(reader->position, 350);
+    reader->shelf_status = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 1, 32,
+                                           0xABC6CC, app_ui_chinese_font_size(16));
+    lv_obj_set_width(reader->shelf_status, 350);
     if (reader->book_count)
-        app_ui_label_fmt(reader->position, "%u 本%s", (unsigned)reader->book_count,
+        app_ui_label_fmt(reader->shelf_status, "%u 本%s", (unsigned)reader->book_count,
                           reader->truncated ? " · 索引已达上限" : "");
-    else app_ui_label_text(reader->position, "没有 TXT 小说");
+    else app_ui_label_text(reader->shelf_status, "没有 TXT 小说");
     lv_obj_t *refresh = reader_button(reader, content, LV_SYMBOL_REFRESH, 370, 4, 54, bookshelf_event);
     lv_obj_set_style_text_font(lv_obj_get_child(refresh, 0), &lv_font_montserrat_24, 0);
     lv_obj_t *viewport = lv_obj_create(content);
@@ -675,9 +722,9 @@ static void books_loaded(app_ui_t *ui, const app_io_result_t *result)
     reader->truncated = result->truncated;
     show_shelf(reader);
     if (result->error != ESP_OK)
-        app_ui_label_fmt(reader->position, "书架不可用：%s", esp_err_to_name(result->error));
+        app_ui_label_fmt(reader->shelf_status, "书架不可用：%s", esp_err_to_name(result->error));
     else if (result->count && !reader->books)
-        app_ui_label_text(reader->position, "内存不足，请退出其他应用后重试");
+        app_ui_label_text(reader->shelf_status, "内存不足，请退出其他应用后重试");
 }
 
 static void request_books(reader_t *reader)
@@ -711,7 +758,7 @@ static void reader_timer(lv_timer_t *timer)
         reader->reload_after_insert = true;
         save_bookmark(reader);
         if (reader->reading) reader_notice(reader, "存储设备已移除，阅读位置已保留");
-        else if (reader->position) app_ui_label_text(reader->position, "存储设备已移除");
+        else if (reader->shelf_status) app_ui_label_text(reader->shelf_status, "存储设备已移除");
     }
     if (mounted && !reader->loading &&
         (!reader->card_was_mounted || reader->reload_after_insert)) {
@@ -737,6 +784,7 @@ void app_open_reader(app_ui_t *ui)
     reader->card_was_mounted = reader_storage_ready(reader);
     ui->page_context = reader;
     ui->page_cleanup = reader_cleanup;
+    ui->page_suspend = reader_suspend;
     app_ui_add_text(content, "正在扫描书架…", LV_ALIGN_TOP_LEFT, 0, 0,
                       0xC9DCF8, app_ui_chinese_font_size(16));
     app_ui_set_timer(ui, reader_timer, 500);

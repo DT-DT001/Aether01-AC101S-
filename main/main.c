@@ -199,9 +199,15 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
     }
     if(stage==APP_POWER_SHUTDOWN_FINALIZE) {
         esp_err_t error=app_gps_stop_wait(shutdown_remaining(deadline));
-        if(error!=ESP_OK) return error;
+        if(error!=ESP_OK) {
+            ESP_LOGW(TAG,"shutdown GPS power not verified: %s",esp_err_to_name(error));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         error=app_otg_disable_wait(shutdown_remaining(deadline));
-        if(error!=ESP_OK) return error;
+        if(error!=ESP_OK) {
+            ESP_LOGW(TAG,"shutdown USB VBUS not verified off: %s",esp_err_to_name(error));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         error=app_ui_quiesce_storage_wait(s_ui,shutdown_remaining(deadline));
         if(error!=ESP_OK) return error;
         if(!shutdown_remaining(deadline)) return ESP_ERR_TIMEOUT;
@@ -404,7 +410,7 @@ static lv_display_t *init_lvgl(int64_t *logo_on_us)
     lvgl_cfg.task_priority = 6;
     /* Keep GUI and audio service work off the S31 video decoder's core. */
     lvgl_cfg.task_affinity = 0;
-    lvgl_cfg.task_max_sleep_ms = 8;
+    lvgl_cfg.task_max_sleep_ms = 100;
     lvgl_cfg.timer_period_ms = 2;
     ESP_LOGI(TAG, "LVGL scheduling: tick=%d ms refresh=%d ms max_sleep=%d ms",
              lvgl_cfg.timer_period_ms, CONFIG_LV_DEF_REFR_PERIOD, lvgl_cfg.task_max_sleep_ms);
@@ -630,6 +636,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(app_power_set_user_key_handler(&s_power, app_ui_queue_user_key, s_ui));
     ESP_ERROR_CHECK(app_power_set_user_key_press_handler(&s_power, intercom_user_key_press));
+    app_power_set_screen_hook(&s_power, app_ui_screen_suspend, s_ui);
     ESP_ERROR_CHECK(app_power_set_shutdown_hook(&s_power, prepare_shutdown, &s_shutdown));
     if (wifi_error == ESP_OK) {
         const esp_err_t restore_error = aether_wifi_restore_preference(s_wifi);

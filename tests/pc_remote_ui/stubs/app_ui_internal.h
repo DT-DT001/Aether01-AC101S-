@@ -6,6 +6,7 @@ typedef struct app_ui {
     lv_timer_t *timer;
     void *page_context;
     void (*page_cleanup)(struct app_ui *ui);
+    void (*page_suspend)(struct app_ui *ui, bool suspended);
 } app_ui_t;
 
 const lv_font_t *app_ui_chinese_font(void);

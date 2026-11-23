@@ -51,6 +51,7 @@ lv_obj_t *app_ui_add_text(lv_obj_t *parent, const char *value, lv_align_t align,
 lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
 {
     if (ui->page_cleanup) { void (*cleanup)(app_ui_t *) = ui->page_cleanup; ui->page_cleanup = NULL; cleanup(ui); }
+    ui->page_suspend = NULL;
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
     ui->screen = lv_obj_create(NULL); lv_obj_remove_flag(ui->screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x070A12), 0);
@@ -189,9 +190,28 @@ int main(int argc, char **argv)
     advance(600); assert(contains(ui.screen,"USB 输入") && !contains(ui.screen,"断开电脑"));
     tap(button); assert(status.state==APP_GPS_STOPPING);
     puts("PASS external-input startup and cancellation controls");
+    assert(ui.page_suspend);
+    const unsigned before_suspend = starts;
+    status = (app_gps_status_t){.available = true, .requested_enabled = true,
+                               .active = true, .state = APP_GPS_SEARCHING};
+    ui.page_suspend(&ui, true);
+    assert(!status.requested_enabled);
+    status.state = APP_GPS_STOPPING;
+    ui.page_suspend(&ui, false);
+    assert(starts == before_suspend);
+    status.state = APP_GPS_OFF;
+    advance(600);
+    assert(starts == before_suspend + 1 && status.requested_enabled);
+    status.requested_enabled = false;
+    ui.page_suspend(&ui, true);
+    ui.page_suspend(&ui, false);
+    advance(600);
+    assert(starts == before_suspend + 1);
+    puts("PASS navigation suspend, wake during cleanup and no restart when manually off");
+    const unsigned before_replacements = cancels;
     for (unsigned i=0; i<100; ++i) { app_open_gps(&ui); advance(5); }
-    assert(cancels==100);
-    ui.page_cleanup(&ui); assert(cancels==101 && !ui.page_context);
+    assert(cancels == before_replacements + 100);
+    ui.page_cleanup(&ui); assert(cancels == before_replacements + 101 && !ui.page_context);
     lv_timer_delete(ui.timer); lv_obj_delete(ui.screen); lv_indev_delete(indev); lv_display_delete(display); lv_deinit();
     puts("PASS 100 page replacements and asynchronous cancel cleanup");
 }

@@ -12,6 +12,10 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+#if CONFIG_PM_ENABLE
+#include <stdatomic.h>
+#include "esp_pm.h"
+#endif
 
 #define POWER_NVS_NAMESPACE "power"
 #define POWER_NVS_TIMEOUT   "timeout_s"
@@ -46,8 +50,7 @@ typedef struct {
 
 #define USER_KEY_HOLD_US INT64_C(2000000)
 
-/* The falling-edge latch preserves taps for screen wake between worker polls.
- * The shared GPIO ISR service is never uninstalled by this application. */
+/* Preserve awake press timing between polls. GPIO61 never requests a wake. */
 static void user_key_interrupt(void *context)
 {
     app_power_t *manager = context;
@@ -55,7 +58,8 @@ static void user_key_interrupt(void *context)
     const int64_t pressed_at_us = esp_timer_get_time();
     bool notify = false;
     portENTER_CRITICAL_ISR(&s_settings_lock);
-    if (!manager->user_key_irq_seen || (TickType_t)(now-manager->user_key_irq_tick) >= pdMS_TO_TICKS(30)) {
+    if (!manager->sleeping && !manager->sleep_requested &&
+        (!manager->user_key_irq_seen || (TickType_t)(now-manager->user_key_irq_tick) >= pdMS_TO_TICKS(30))) {
         manager->user_key_irq_seen = true; manager->user_key_irq_tick = now;
         manager->user_key_irq_pending = true; manager->user_key_irq_at_us=pressed_at_us; notify = true;
     }
@@ -82,7 +86,6 @@ static void dispatch_user_key(app_power_t *manager, bool pressed, user_key_t *ke
     void (*press_handler)(void *, int64_t) = manager->user_key_press_handler;
     void *context = manager->user_key_context;
     portEXIT_CRITICAL(&s_settings_lock);
-    const bool wake = !key->down && (pressed || edge) && sleeping && !blocked;
     if (!pressed) {
         *key = (user_key_t){0};
     } else {
@@ -98,8 +101,61 @@ static void dispatch_user_key(app_power_t *manager, bool pressed, user_key_t *ke
             press_handler(context, key->started_at_us);
         }
     }
-    if (wake) (void)app_power_wake(manager);
 }
+
+#if CONFIG_PM_ENABLE
+static atomic_bool s_gui_asleep;
+
+uint32_t __real_lv_timer_handler(void);
+
+uint32_t __wrap_lv_timer_handler(void)
+{
+    /* The port normally polls again after 1 ms when all LVGL timers are
+     * disabled. Give its task the idle wait instead while its clock is frozen. */
+    return atomic_load(&s_gui_asleep) ? LV_NO_TIMER_READY : __real_lv_timer_handler();
+}
+
+static void power_key_interrupt(void *context)
+{
+    app_power_t *manager = context;
+    BaseType_t higher = pdFALSE;
+    if (manager->task) vTaskNotifyGiveFromISR((TaskHandle_t)manager->task, &higher);
+    if (higher) portYIELD_FROM_ISR();
+}
+
+static void init_low_power(app_power_t *manager)
+{
+    esp_pm_lock_handle_t awake = NULL;
+    esp_err_t error = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "aether-screen", &awake);
+    const bool locked = error == ESP_OK && esp_pm_lock_acquire(awake) == ESP_OK;
+    if (!locked) {
+        if (awake) esp_pm_lock_delete(awake);
+        ESP_LOGW(TAG, "foreground power lock unavailable");
+        return;
+    }
+    manager->awake_pm_lock = awake;
+    manager->awake_pm_lock_held = true;
+    /* Keep the TG29 interrupt and worker alive during standby. This board
+     * stopped responding when automatic light sleep resumed its GPIOs. */
+    const esp_pm_config_t config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_XTAL_FREQ,
+        .light_sleep_enable = false,
+    };
+    error = esp_pm_configure(&config);
+    if (error != ESP_OK) ESP_LOGW(TAG, "low-power configuration: %s", esp_err_to_name(error));
+    else ESP_LOGI(TAG, "standby uses frequency scaling; automatic MCU light sleep disabled");
+}
+
+static void set_screen_clock(app_power_t *manager, bool awake)
+{
+    if (!manager->awake_pm_lock || manager->awake_pm_lock_held == awake) return;
+    const esp_err_t error = awake ? esp_pm_lock_acquire(manager->awake_pm_lock) :
+                                    esp_pm_lock_release(manager->awake_pm_lock);
+    if (error == ESP_OK) manager->awake_pm_lock_held = awake;
+    else ESP_LOGW(TAG, "foreground power lock: %s", esp_err_to_name(error));
+}
+#endif
 
 /* A physically black screen keeps wake priority, even if another wake request
  * is waiting for the LVGL lock. Decide and publish under the same lock. */
@@ -347,6 +403,7 @@ failed:
         ESP_LOGW(TAG, "shutdown aborted stage=%u error=%s sensors=%s cancel=%s; retaining power",
                  (unsigned)manager->shutdown_stage, esp_err_to_name(err),
                  esp_err_to_name(restore), esp_err_to_name(cancel));
+        if (manager->sleeping) (void)app_power_wake(manager);
     }
 }
 
@@ -378,6 +435,35 @@ static void set_render_enabled(app_power_t *manager, bool enabled)
         manager->render_paused = false;
         if (refresh) { lv_timer_resume(refresh); lv_timer_ready(refresh); }
     }
+}
+
+static void set_apps_suspended(app_power_t *manager, bool suspended)
+{
+    portENTER_CRITICAL(&s_settings_lock);
+    if (manager->apps_suspended == suspended) {
+        portEXIT_CRITICAL(&s_settings_lock);
+        return;
+    }
+    manager->apps_suspended = suspended;
+    void (*hook)(void *, bool) = manager->screen_hook;
+    void *context = manager->screen_hook_context;
+    if (suspended) manager->user_key_irq_pending = false;
+    portEXIT_CRITICAL(&s_settings_lock);
+#if CONFIG_PM_ENABLE
+    if (!suspended) {
+        (void)lvgl_port_resume();
+        atomic_store(&s_gui_asleep, false);
+        if (manager->user_key_irq_enabled) (void)gpio_intr_enable(AETHER_GPIO_BOOT_KEY);
+    }
+#endif
+    if (hook) hook(context, suspended);
+#if CONFIG_PM_ENABLE
+    if (suspended) {
+        if (manager->user_key_irq_enabled) (void)gpio_intr_disable(AETHER_GPIO_BOOT_KEY);
+        atomic_store(&s_gui_asleep, true);
+        (void)lvgl_port_stop();
+    }
+#endif
 }
 
 static esp_err_t save_u32(const char *key, uint32_t value)
@@ -420,6 +506,7 @@ static esp_err_t apply_sleep(app_power_t *manager)
 {
     ESP_RETURN_ON_FALSE(manager && manager->display && manager->board,
                         ESP_ERR_INVALID_ARG, TAG, "invalid manager");
+    set_apps_suspended(manager, true);
     set_render_enabled(manager, false);
     esp_err_t err = aether_board_set_display_sleep(manager->board, true);
     /* A partially completed command sequence can still leave the panel asleep.
@@ -429,6 +516,7 @@ static esp_err_t apply_sleep(app_power_t *manager)
     manager->display_error = err;
     portEXIT_CRITICAL(&s_settings_lock);
     set_render_enabled(manager, !manager->sleeping);
+    if (!manager->sleeping) set_apps_suspended(manager, false);
     manager->dimmed = false;
     return err;
 }
@@ -437,6 +525,9 @@ static esp_err_t apply_wake(app_power_t *manager)
 {
     ESP_RETURN_ON_FALSE(manager && manager->display && manager->board,
                         ESP_ERR_INVALID_ARG, TAG, "invalid manager");
+#if CONFIG_PM_ENABLE
+    set_screen_clock(manager, true);
+#endif
     esp_err_t err = ESP_OK;
     if (manager->sleeping || manager->board->display_sleeping) {
         app_touch_consume_wake_gesture();
@@ -447,6 +538,7 @@ static esp_err_t apply_wake(app_power_t *manager)
     manager->display_error = err;
     portEXIT_CRITICAL(&s_settings_lock);
     set_render_enabled(manager, !manager->sleeping);
+    if (!manager->sleeping) set_apps_suspended(manager, false);
     if (err == ESP_OK && !manager->sleeping) {
         lv_obj_invalidate(lv_display_get_screen_active(manager->display));
         lv_display_trigger_activity(manager->display);
@@ -493,7 +585,9 @@ static void power_task(void *argument)
     power_key_t key = {0};
     esp_err_t previous_cc_error = ESP_OK;
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POWER_TASK_PERIOD_MS));
+        const unsigned period = manager->sleeping && manager->power_key_irq_enabled && !key.hold_active ?
+            250U : POWER_TASK_PERIOD_MS;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(period));
         const TickType_t tick_now = xTaskGetTickCount();
         if (manager->shutdown_state == APP_POWER_SHUTDOWN_REQUESTED) continue;
         if (manager->shutdown_cancel_error != ESP_OK && (int32_t)(tick_now - cancel_retry_due) >= 0) {
@@ -650,6 +744,12 @@ static void power_task(void *argument)
             lvgl_port_unlock();
         }
 
+#if CONFIG_PM_ENABLE
+        if (manager->sleeping && manager->board->audio_ready)
+            (void)ac101s_audio_idle_clocks(manager->board->audio);
+        set_screen_clock(manager, !manager->sleeping);
+#endif
+
         /* Flash commit runs outside both the UI callbacks and LVGL lock. */
         const TickType_t now = xTaskGetTickCount();
         const bool deferred = persist && persistence_busy && persistence_busy(persistence_context);
@@ -705,7 +805,15 @@ esp_err_t app_power_init(app_power_t *manager, aether_board_t *board,
     }
     if (key_irq == ESP_OK) key_irq = gpio_set_intr_type(AETHER_GPIO_BOOT_KEY, GPIO_INTR_NEGEDGE);
     if (key_irq == ESP_OK) key_irq = gpio_intr_enable(AETHER_GPIO_BOOT_KEY);
+    manager->user_key_irq_enabled = key_irq == ESP_OK;
     if (key_irq != ESP_OK) ESP_LOGW(TAG, "user key IRQ unavailable; polling fallback: %s", esp_err_to_name(key_irq));
+#if CONFIG_PM_ENABLE
+    esp_err_t pmic_irq = gpio_isr_handler_add(AETHER_GPIO_TG29_INT, power_key_interrupt, manager);
+    if (pmic_irq == ESP_OK) pmic_irq = gpio_set_intr_type(AETHER_GPIO_TG29_INT, GPIO_INTR_NEGEDGE);
+    if (pmic_irq == ESP_OK) pmic_irq = gpio_intr_enable(AETHER_GPIO_TG29_INT);
+    manager->power_key_irq_enabled = pmic_irq == ESP_OK;
+    init_low_power(manager);
+#endif
     ESP_LOGI(TAG, "screen timeout=%lu s brightness=%u%%",
              (unsigned long)manager->timeout_seconds, manager->brightness);
     return ESP_OK;
@@ -799,6 +907,15 @@ esp_err_t app_power_set_shutdown_hook(app_power_t *manager,
     return ESP_OK;
 }
 
+void app_power_set_screen_hook(app_power_t *manager, void (*hook)(void *, bool), void *context)
+{
+    if (!manager) return;
+    portENTER_CRITICAL(&s_settings_lock);
+    manager->screen_hook = hook;
+    manager->screen_hook_context = context;
+    portEXIT_CRITICAL(&s_settings_lock);
+}
+
 void app_power_set_persistence_guard(app_power_t *manager, bool (*busy)(void *), void *context)
 {
     if (!manager) return;
@@ -812,7 +929,7 @@ void app_power_set_persistence_guard(app_power_t *manager, bool (*busy)(void *),
 bool app_power_is_sleeping(const app_power_t *manager)
 {
     portENTER_CRITICAL(&s_settings_lock);
-    const bool sleeping = manager && (manager->sleeping || manager->sleep_requested);
+    const bool sleeping = manager && (manager->sleeping || manager->sleep_requested || manager->apps_suspended);
     portEXIT_CRITICAL(&s_settings_lock);
     return sleeping;
 }

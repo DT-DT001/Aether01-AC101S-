@@ -13,8 +13,8 @@ extern "C" {
 
 #define AETHER_NES_FRAME_WIDTH  256U
 #define AETHER_NES_FRAME_HEIGHT 224U
-#define AETHER_NES_OUTPUT_WIDTH 480U
-#define AETHER_NES_OUTPUT_HEIGHT 420U
+#define AETHER_NES_OUTPUT_WIDTH 384U
+#define AETHER_NES_OUTPUT_HEIGHT 336U
 
 /* Complete external-controller state, published without touching the core. */
 typedef enum {
@@ -88,6 +88,9 @@ esp_err_t aether_nes_set_external_input(aether_nes_handle_t handle, uint16_t but
 /** Queue an idempotent pause/resume on the emulator owner task. Supports
  * STARTING/RUNNING/PAUSED; status changes after the task applies the request. */
 esp_err_t aether_nes_set_paused(aether_nes_handle_t handle, bool paused);
+/* The screen pause is independent of the in-game pause. The power/UI owner
+ * may set it before ROM loading and must clear it on wake, even when idle. */
+esp_err_t aether_nes_set_screen_paused(aether_nes_handle_t handle, bool paused);
 /* Called on the emulator task for a new touch; return true to consume the
  * entire gesture (for example while requesting a screen wake). */
 esp_err_t aether_nes_set_input_gate(aether_nes_handle_t handle,

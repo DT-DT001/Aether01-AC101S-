@@ -80,6 +80,9 @@ esp_err_t ac101s_codec_set_speaker(i2c_master_dev_handle_t dev, unsigned volume)
     return ESP_OK;
 }
 
+static unsigned clock_enables, clock_disables;
+int i2s_channel_enable(i2s_chan_handle_t channel) { assert(channel); ++clock_enables; return ESP_OK; }
+int i2s_channel_disable(i2s_chan_handle_t channel) { assert(channel); ++clock_disables; return ESP_OK; }
 int i2s_channel_write(i2s_chan_handle_t tx, const void *data, size_t size, size_t *sent, unsigned timeout)
 {
     assert(tx && timeout <= 1000);
@@ -448,5 +451,15 @@ int main(void)
     const unsigned before_muted=alert_writes;
     assert(ac101s_audio_play_alert(&audio,chirp,480)==ESP_OK&&alert_writes==before_muted&&!codec_open);
     puts("PASS alert chunks remain bounded, yield to playback/capture/intercom, preserve USB route, respect mute, and recover a retained codec");
+    const unsigned enables = clock_enables;
+    assert(ac101s_audio_idle_clocks(&audio)==ESP_OK && clock_disables==2);
+    assert(ac101s_audio_idle_clocks(&audio)==ESP_OK && clock_disables==2);
+    assert(ac101s_audio_set_output(&audio,AC101S_OUTPUT_SPEAKER)==ESP_OK);
+    stage=0;
+    assert(ac101s_audio_start(&audio,100,24)==ESP_OK && clock_enables==enables+2);
+    assert(ac101s_audio_idle_clocks(&audio)==ESP_ERR_INVALID_STATE && clock_disables==2);
+    assert(ac101s_audio_stop(&audio)==ESP_OK);
+    assert(ac101s_audio_idle_clocks(&audio)==ESP_OK && clock_disables==4);
+    puts("PASS idle I2S releases clocks, rejects active audio, and wakes with both clocks on");
     return 0;
 }

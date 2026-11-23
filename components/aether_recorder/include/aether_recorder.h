@@ -37,6 +37,8 @@ aether_recorder_handle_t aether_recorder_get_default(void);
 /* Async acceptance. Creates a unique WAV in /sdcard/Recordings, PCM16 mono 48kHz. */
 esp_err_t aether_recorder_start(aether_recorder_handle_t handle);
 esp_err_t aether_recorder_set_paused(aether_recorder_handle_t handle, bool paused);
+/** Park the microphone while preserving the current WAV and manual pause. */
+void aether_recorder_set_screen_paused(aether_recorder_handle_t handle, bool paused);
 esp_err_t aether_recorder_stop(aether_recorder_handle_t handle);
 /* Requests stop; zero only polls. Timeout preserves the active owner/resources. */
 esp_err_t aether_recorder_stop_wait(aether_recorder_handle_t handle, uint32_t timeout_ms);

@@ -5,8 +5,9 @@
 #include "aether_bluetooth.h"
 #include "app_power.h"
 
-#define APP_PC_REMOTE_TEXT_MAX 48U
 #define APP_PC_REMOTE_SCENES 4U
+#define APP_PC_REMOTE_SCENE_CHARACTERS 16U
+#define APP_PC_REMOTE_SCENE_BYTES (APP_PC_REMOTE_SCENE_CHARACTERS * 4U + 1U)
 
 typedef struct {
     bool available, requested, discoverable, connected, reconnecting, confirm_pending;
@@ -25,7 +26,6 @@ void app_pc_remote_get_status(app_pc_remote_status_t *status);
 esp_err_t app_pc_remote_set_enabled(bool enabled);
 esp_err_t app_pc_remote_confirm(bool accept);
 esp_err_t app_pc_remote_key(uint8_t modifiers, uint8_t key);
-esp_err_t app_pc_remote_text(const char *ascii);
 esp_err_t app_pc_remote_click(uint8_t buttons);
 void app_pc_remote_set_air_mode(bool enabled);
 void app_pc_remote_set_motion(bool enabled);
@@ -35,5 +35,7 @@ void app_pc_remote_release_controls(void);
 void app_pc_remote_shutdown(void);
 esp_err_t app_pc_remote_get_shortcut(unsigned slot, app_pc_shortcut_t *shortcut);
 esp_err_t app_pc_remote_set_shortcut(unsigned slot, app_pc_shortcut_t shortcut);
+esp_err_t app_pc_remote_get_scene_name(unsigned slot, char name[APP_PC_REMOTE_SCENE_BYTES]);
+esp_err_t app_pc_remote_set_scene_name(unsigned slot, const char *name);
 esp_err_t app_pc_remote_trigger(unsigned slot);
 bool app_pc_remote_save_pending(void);
