@@ -1,5 +1,7 @@
 #include "app_ui_internal.h"
 #include "app_telemetry.h"
+#include "app_gyro_calibration.h"
+#include "app_ui_modal.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -14,7 +16,28 @@ static int64_t now_us=1000000;
 static app_telemetry_snapshot_t sample;
 static uint32_t interest;
 static unsigned interest_updates,telemetry_reads,dirty_calls;
+static unsigned calibration_cancels;
 static const char *output;
+static app_gyro_calibration_status_t calibration;
+
+esp_err_t app_telemetry_gyro_calibration_begin(void)
+{
+    calibration = (app_gyro_calibration_status_t){
+        .phase = APP_GYRO_CAL_COUNTDOWN, .remaining_ms = 2000,
+    };
+    return ESP_OK;
+}
+esp_err_t app_telemetry_gyro_calibration_cancel(void)
+{
+    if (calibration.phase != APP_GYRO_CAL_COUNTDOWN && calibration.phase != APP_GYRO_CAL_SAMPLING)
+        return ESP_ERR_INVALID_STATE;
+    calibration.phase = APP_GYRO_CAL_CANCELLED;
+    ++calibration_cancels;
+    return ESP_OK;
+}
+void app_telemetry_gyro_calibration_get(app_gyro_calibration_status_t *out) { *out = calibration; }
+esp_err_t app_usb_input_modal_open(lv_obj_t *box, lv_obj_t *preferred)
+{ assert(box && preferred); return ESP_OK; }
 
 int64_t esp_timer_get_time(void) {return now_us;}
 const char *esp_err_to_name(esp_err_t e) {return e==ESP_OK?"ESP_OK":e==ESP_ERR_TIMEOUT?"ESP_ERR_TIMEOUT":"ESP_ERR_NOT_FOUND";}
@@ -71,7 +94,7 @@ static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *bytes)
 static void advance(unsigned ms)
 {for(unsigned i=0;i<ms;++i){++dirty_calls;now_us+=1000;lv_tick_inc(1);lv_timer_handler();}}
 static void input(float ax,float ay,float az,float gx,float gy,float gz)
-{sample=(app_telemetry_snapshot_t){.imu={.accel_mps2={ax,ay,az},.gyro_dps={gx,gy,gz}},.imu_updated_ms=(uint32_t)(now_us/1000)};}
+{sample=(app_telemetry_snapshot_t){.imu={.accel_mps2={ax,ay,az},.gyro_dps={gx,gy,gz},.gyro_bias_valid=true},.imu_updated_ms=(uint32_t)(now_us/1000)};}
 static void feed(float ax,float ay,float az,float gx,float gy,float gz,unsigned count)
 {for(unsigned i=0;i<count;++i){input(ax,ay,az,gx,gy,gz);advance(20);}lv_refr_now(NULL);}
 static void pose(float roll,float pitch,unsigned count)
@@ -83,13 +106,23 @@ static lv_obj_t *find(lv_obj_t *p,const char *s)
 }
 static lv_obj_t *model(app_ui_t *ui)
 {
-    for(unsigned i=0;i<lv_obj_get_child_count(ui->content);++i){lv_obj_t *o=lv_obj_get_child(ui->content,(int32_t)i);if(lv_obj_get_width(o)==252&&lv_obj_get_height(o)==166)return o;}
-    assert(!"model missing");return NULL;
+    lv_obj_t *caption = find(ui->screen, "动态加速度");
+    assert(caption);
+    lv_obj_t *overview = lv_obj_get_parent(caption);
+    for (size_t i = 0; i < lv_obj_get_child_count(overview); ++i) {
+        lv_obj_t *view = lv_obj_get_child(overview, (int32_t)i);
+        if (lv_obj_get_width(view) == 252 && lv_obj_get_height(view) == 166) return view;
+    }
+    assert(!"model missing"); return NULL;
 }
 static float value(app_ui_t *ui,unsigned index)
 {
-    for(unsigned i=0;i<lv_obj_get_child_count(ui->content);++i){lv_obj_t *o=lv_obj_get_child(ui->content,(int32_t)i);if(lv_obj_check_type(o,&lv_label_class)&&lv_obj_get_x(o)==8+(int32_t)index*134&&lv_obj_get_y(o)==228)return strtof(lv_label_get_text(o),NULL);}
-    assert(!"angle value missing");return NAN;
+    static const char *const captions[] = {"横滚", "俯仰", "相对航向"};
+    lv_obj_t *caption = find(ui->screen, captions[index]);
+    assert(caption);
+    lv_obj_t *reading = lv_obj_get_child(lv_obj_get_parent(caption), 1);
+    assert(reading && lv_obj_check_type(reading, &lv_label_class));
+    return strtof(lv_label_get_text(reading), NULL);
 }
 static uint32_t model_hash(app_ui_t *ui)
 {
@@ -121,7 +154,7 @@ static void check_labels(lv_obj_t *p)
 static void layout(app_ui_t *ui)
 {
     lv_obj_update_layout(ui->screen);check_labels(ui->screen);
-    lv_obj_t *caption=find(ui->screen,"姿态归零"),*footer=find(ui->screen,"六轴航向为相对值，长时间使用会漂移");
+    lv_obj_t *caption=find(ui->screen,"姿态归零"),*footer=find(ui->screen,"相对航向可能随时间漂移");
     assert(caption&&footer);lv_area_t a,b;lv_obj_get_coords(lv_obj_get_parent(caption),&a);lv_obj_get_coords(footer,&b);
     assert(a.y2<b.y1);assert(lv_obj_get_scroll_y(ui->content)==0);
 }
@@ -174,6 +207,34 @@ static void test_invalid_and_sleep(app_ui_t *ui)
     pose(0,0,20);assert(find(ui->screen,"静止"));layout(ui);
     puts("PASS duplicate/old timestamps and invalid/stale telemetry never fake motion; sleep releases IMU once and wake restores subscription");
 }
+static void test_calibration(app_ui_t *ui)
+{
+    level(ui);
+    for (unsigned i = 0; i < 70; ++i) {
+        input(0, 0, G, 0, 0, 8);
+        sample.imu.gyro_bias_valid = false;
+        advance(20);
+    }
+    assert(fabsf(value(ui, 2)) < 1);
+    for (unsigned i = 0; i < 80; ++i) {
+        input(0, 0, G, 0, 0, .45f);
+        sample.imu.gyro_stationary = true;
+        advance(20);
+    }
+    assert(fabsf(value(ui, 2)) < 1);
+    lv_obj_t *button = find(ui->screen, "漂移校准");
+    assert(button);
+    lv_obj_send_event(lv_obj_get_parent(button), LV_EVENT_CLICKED, NULL);
+    assert(app_ui_modal_present(ui->screen) && find(ui->screen, "屏幕朝上平放\n2 秒后开始"));
+    calibration.phase = APP_GYRO_CAL_SAMPLING;
+    calibration.remaining_ms = 5000;
+    advance(25);
+    assert(find(ui->screen, "保持静止\n还需 5 秒"));
+    layout(ui);
+    app_ui_begin_page(ui, "主页");
+    assert(calibration_cancels == 1 && !app_ui_modal_present(ui->screen) && !interest);
+    puts("PASS motion page ignores confirmed stationary residual and uncalibrated yaw; calibration modal cancels on exit");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);output=argv[1];setbuf(stdout,NULL);lv_init();
@@ -181,7 +242,7 @@ int main(int argc,char **argv)
     lv_display_set_color_format(display,LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(display,draw_buffer,NULL,sizeof(draw_buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display,flush);app_power_t power={0};app_ui_t ui={.power=&power};
-    test_poses(&ui);test_actions(&ui);test_invalid_and_sleep(&ui);
+    test_poses(&ui);test_actions(&ui);test_invalid_and_sleep(&ui);test_calibration(&ui);
     for(unsigned i=0;i<100;++i){level(&ui);feed(0,0,G,0,0,60,5);app_ui_begin_page(&ui,"主页");assert(!interest&&!ui.timer&&!ui.page_context&&lv_mem_test()==LV_RESULT_OK);}
     lv_obj_delete(ui.screen);lv_display_delete(display);assert(lv_mem_test()==LV_RESULT_OK);lv_deinit();
     printf("PASS 100 actual motion/home rebuilds, real model draws, all labels within 480px, supplied-font glyphs and LVGL allocator integrity (%u scheduler ticks)\n",dirty_calls);

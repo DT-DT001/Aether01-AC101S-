@@ -17,6 +17,6 @@ flags=['gcc','-std=c11','-O1','-g','-Wall','-Wextra','-Werror',
          root/'components/aether_usb_host/include',root/'components/aether_usb_audio/include',
          root/'components/aether_usb_storage/include',lvgl]]]
 subprocess.run(flags+[str(root/'main/apps/app_music.c'),str(root/'tests/music_refresh/smoke.c'),
-               str(root/'main/app_text.c'),
+               str(root/'main/app_text.c'), str(root/'main/app_lyrics.c'),
                *map(str,objects),'-Wl,--gc-sections','-lm','-o',str(binary)],check=True)
 subprocess.run([str(binary)],check=True)

@@ -116,8 +116,9 @@ int main(int argc, char **argv)
     assert(find(ui.screen,"定位服务不可用"));
     lv_obj_t *button=lv_obj_get_parent(find(ui.screen,"开启定位"));
     assert(lv_obj_has_state(button,LV_STATE_DISABLED)); tap(button); assert(starts==0);
-    assert(find(ui.screen,"外部供电直接使用；电池供电自动开启 5V OTG"));
-    lv_area_t warning; lv_obj_get_coords(find(ui.screen,"外部供电直接使用；电池供电自动开启 5V OTG"),&warning);
+    lv_obj_t *power_details = lv_obj_get_parent(find(ui.screen, "可见卫星"));
+    assert(contains(power_details, "电池自动 5V OTG"));
+    lv_area_t warning; lv_obj_get_coords(power_details,&warning);
     assert(warning.y1>=72 && warning.y2<466);
     status.available=true; advance(600); assert(find(ui.screen,"未开启"));
     command_error=ESP_FAIL; tap(button); assert(starts==1 && find(ui.screen,"操作未受理"));
@@ -175,7 +176,7 @@ int main(int argc, char **argv)
     status.navigation.time_valid=false; status.navigation.satellite_count=0;
     advance(600); assert(find(ui.screen,"定位已丢失"));
     assert(!contains(ui.screen,"31.230400") && !contains(ui.screen,"121.473700"));
-    assert(contains(ui.screen,"纬度  --") && contains(ui.screen,"UTC --"));
+    assert(find(lv_obj_get_parent(find(ui.screen, "纬度")), "--") && contains(ui.screen,"UTC --"));
     assert(!lv_obj_has_flag(find(ui.screen,"等待卫星数据"),LV_OBJ_FLAG_HIDDEN));
     status.state=APP_GPS_ERROR; status.last_error=ESP_FAIL; status.active=false; status.requested_enabled=false;
     advance(600); assert(find(ui.screen,"定位启动失败"));

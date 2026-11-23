@@ -7,10 +7,11 @@
 #include "voice-types.inc"
 
 static unsigned starts, stops, radio_stops, radio_audio, captured, written, holes, silent;
+static unsigned capture_starts, radio_starts;
 static unsigned write_tags[32];
 static int64_t write_started[32];
 static int64_t time_us, last_write_finished;
-static bool key_released;
+static bool key_released, screen_held, release_on_capture_start;
 
 #define ESP_LOGI(...) ((void)0)
 #define AETHER_GPIO_BOOT_KEY 1
@@ -29,6 +30,11 @@ esp_err_t aether_intercom_radio_send(aether_intercom_packet_kind_t kind,
         ++radio_audio;
         return ESP_OK;
     }
+    if (kind == AETHER_INTERCOM_PACKET_START) {
+        assert(!data && !size);
+        ++radio_starts;
+        return ESP_OK;
+    }
     assert(kind == AETHER_INTERCOM_PACKET_STOP && !data && !size);
     ++radio_stops;
     return ESP_OK;
@@ -45,8 +51,14 @@ esp_err_t aether_intercom_audio_capture(aether_intercom_audio_handle_t audio,
 esp_err_t aether_intercom_audio_start(aether_intercom_audio_handle_t audio,
                                       aether_intercom_audio_mode_t mode)
 {
-    assert(audio && mode == AETHER_INTERCOM_AUDIO_PLAYBACK);
-    ++starts;
+    assert(audio);
+    if (mode == AETHER_INTERCOM_AUDIO_CAPTURE) {
+        ++capture_starts;
+        if (release_on_capture_start) screen_held = false;
+    } else {
+        assert(mode == AETHER_INTERCOM_AUDIO_PLAYBACK);
+        ++starts;
+    }
     return ESP_OK;
 }
 
@@ -84,6 +96,7 @@ esp_err_t aether_intercom_audio_conceal(aether_intercom_audio_handle_t audio)
 
 static int64_t esp_timer_get_time(void) { return time_us; }
 static bool still_requested(uint32_t generation) { return generation == 1; }
+static bool screen_talk_held(uint32_t generation) { return still_requested(generation) && screen_held; }
 static int gpio_get_level(int pin) { assert(pin == AETHER_GPIO_BOOT_KEY); return key_released; }
 
 #include "voice-production.inc"
@@ -102,6 +115,8 @@ static void send(intercom_voice_t *voice, aether_intercom_packet_kind_t kind,
 static void reset_audio(void)
 {
     starts = stops = radio_stops = radio_audio = captured = written = holes = silent = 0;
+    radio_starts = capture_starts = 0;
+    screen_held = release_on_capture_start = false;
     time_us = last_write_finished = 0;
     key_released = false;
 }
@@ -257,6 +272,37 @@ static void test_capture_recovers_hardware_backlog(void)
     puts("PASS drains already available ADC frames and sends no new audio after release");
 }
 
+static void test_push_to_talk_sources(void)
+{
+    reset_audio();
+    intercom_voice_t voice = {0};
+    begin_capture(&voice, (void *)1, 1, false);
+    assert(voice.mode == VOICE_TX && !voice.screen_talk && radio_starts == 1);
+    screen_held = true;
+    key_released = true;
+    capture_step(&voice, (void *)1, 1, 3000);
+    capture_step(&voice, (void *)1, 1, 3000 + KEY_RELEASE_US);
+    assert(voice.mode == VOICE_IDLE && radio_stops == 1 && !captured);
+
+    begin_capture(&voice, (void *)1, 1, true);
+    assert(voice.mode == VOICE_TX && voice.screen_talk && radio_starts == 2);
+    capture_step(&voice, (void *)1, 1, 4000000);
+    assert(voice.mode == VOICE_TX && captured == 1 && radio_audio == 1);
+    screen_held = false;
+    key_released = false;
+    capture_step(&voice, (void *)1, 1, 4020000);
+    assert(voice.mode == VOICE_IDLE && radio_stops == 2 && captured == 1);
+
+    screen_held = release_on_capture_start = true;
+    begin_capture(&voice, (void *)1, 1, true);
+    assert(capture_starts == 3 && voice.mode == VOICE_IDLE && radio_starts == 2);
+    release_on_capture_start = false;
+    screen_held = true;
+    begin_capture(&voice, (void *)1, 2, true);
+    assert(voice.mode == VOICE_IDLE && radio_starts == 2);
+    puts("PASS physical and screen PTT start while held and stop with their own release; stale/released startup cannot transmit");
+}
+
 int main(void)
 {
     test_arbitration_and_short_burst();
@@ -265,5 +311,6 @@ int main(void)
     test_first_audio_anchors_startup_limit();
     test_receive_rewinds_before_playing();
     test_capture_recovers_hardware_backlog();
+    test_push_to_talk_sources();
     return 0;
 }

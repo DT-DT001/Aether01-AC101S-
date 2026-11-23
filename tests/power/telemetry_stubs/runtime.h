@@ -18,11 +18,19 @@ typedef struct {
     float accel_mps2[3], gyro_dps[3], gyro_raw_dps[3], gyro_bias_dps[3];
     bool gyro_bias_valid, gyro_stationary;
 } qmi8658a_sample_t;
+typedef void *qmi8658a_handle_t;
+typedef struct {
+    float accel_reference[3], bias_dps[3];
+    uint32_t samples;
+} qmi8658a_gyro_zero_t;
 typedef struct { float pressure_pa, temperature_c; } dps368_sample_t;
 typedef struct { unsigned value; } pcf85063_time_t;
 typedef struct { void *imu, *barometer, *rtc, *display_io; bool imu_ready, barometer_ready, rtc_ready; } aether_board_t;
 esp_err_t qmi8658a_read(void *, qmi8658a_sample_t *);
 esp_err_t qmi8658a_read_fresh(void *, qmi8658a_sample_t *);
+bool qmi8658a_gyro_zero_add(qmi8658a_gyro_zero_t *, const qmi8658a_sample_t *);
+void qmi8658a_set_gyro_auto_bias(void *, bool);
+esp_err_t qmi8658a_set_gyro_bias(void *, const float[3]);
 esp_err_t dps368_read(void *, dps368_sample_t *);
 esp_err_t pcf85063_get_time(void *, pcf85063_time_t *);
 TickType_t xTaskGetTickCount(void);

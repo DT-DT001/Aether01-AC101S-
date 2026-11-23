@@ -197,7 +197,7 @@ int main(int argc, char **argv)
     tap(primary);
     assert(starts == 0);
     status.available = true; advance(200);
-    assert(find(ui.screen, "将设备放稳并保持静止，再点开始。"));
+    assert(find(ui.screen, "放稳设备后点开始。"));
     start_error = ESP_FAIL;
     tap(primary);
     assert(starts == 1 && find(ui.screen, "操作未受理 ESP_FAIL"));
@@ -209,11 +209,11 @@ int main(int argc, char **argv)
     assert(!finishes);
     status.state = APP_DISPLACEMENT_READY; advance(200);
     assert(find(ui.screen, "可以移动") && !lv_obj_has_state(primary, LV_STATE_DISABLED));
-    assert(find(ui.screen, "平稳移动，尽量保持朝向，可查看实时位移。"));
+    assert(find(ui.screen, "平稳移动，保持朝向。"));
     defer_finish = true;
     tap(primary);
     assert(finishes == 1 && find(ui.screen, "正在确认终点"));
-    assert(find(ui.screen, "请保持静止，等待终点校准。"));
+    assert(find(ui.screen, "保持静止，校准终点。"));
     assert(lv_obj_has_state(primary, LV_STATE_DISABLED));
     tap(primary);
     assert(finishes == 1 && status.state == APP_DISPLACEMENT_READY);
@@ -245,15 +245,15 @@ int main(int argc, char **argv)
     advance(200);
     assert(lv_display_get_inactive_time(display) < 110);
     assert(find(ui.screen, "正在测量") && !find(ui.screen, "45 cm"));
-    assert(find(ui.screen, "看实时位移，到终点停稳后轻点结束。"));
+    assert(find(ui.screen, "到终点停稳后，轻点结束。"));
     status.result = (app_displacement_result_t){.distance_m=0.45f,.xyz_m={0.36f,-0.27f,0.0f},
         .samples=120,.max_gap_ms=12,.elapsed_ms=1200};
     advance(110);
     assert(find(ui.screen, "距起点（实时估算）") && find(ui.screen, "45 cm"));
     assert(find(ui.screen, "+36 cm") && find(ui.screen, "-27 cm") && find(ui.screen, "≈0 cm"));
-    lv_obj_t *direction_title = find(ui.screen, "净方向");
+    lv_obj_t *direction_title = find(ui.screen, "起点轴方向");
     lv_obj_t *diagonal = find(ui.screen, "+X / -Y");
-    assert(direction_title && diagonal && find(ui.screen, "方向以起点的传感器坐标轴为准。"));
+    assert(direction_title && diagonal);
     lv_obj_update_layout(ui.screen);
     lv_area_t distance_area, direction_area;
     lv_obj_get_coords(find(ui.screen, "45 cm"), &distance_area);

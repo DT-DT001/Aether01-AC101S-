@@ -43,6 +43,7 @@ idf_component_register(
          "app_display_sync.c"
          "app_touch.c"
          "app_text.c"
+         "app_lyrics.c"
          "app_reader_layout.c"
          "app_reader_file.c"
          "app_tools.c"
@@ -50,7 +51,11 @@ idf_component_register(
          "app_motion_filter.c"
          "ui/app_ui.c"
          "ui/app_ui_modal.c"
+         "ui/app_ui_gyro_calibration.c"
          "ui/app_text_input.c"
+         "app_pinyin.c"
+         "app_pinyin_extended.c"
+         "app_pinyin_swipe.c"
          "ui/app_ui_media_control.c"
          "ui/app_home.c"
          "ui/app_battery.c"
@@ -83,7 +88,7 @@ idf_component_register(
              aether_video_player aether_bluetooth aether_wifi aether_intercom_radio aether_intercom_audio aether_nes co5300_display
              aether_usb_camera aether_camera_record aether_image esp_driver_jpeg
              aether_gnss esp_driver_uart esp_lvgl_port esp_psram esp_timer esp_app_format spi_flash lvgl nvs_flash fatfs esp_netif lwip
-             esp_http_client mbedtls)
+             esp_http_client mbedtls esp_partition)
 # Pull the project custom memory provider before the later LVGL archive is read.
 # All nine public allocator entry points live in this single object.
 if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_LV_USE_CUSTOM_MALLOC)

@@ -13,13 +13,17 @@ if not objects or any(not p.exists() for p in objects):
     raise SystemExit('Populate the native reader UI cache first')
 flags = ['gcc', '-std=c11', '-O0', '-g', '-Wall', '-Wextra', '-Werror',
          '-ffunction-sections', '-fdata-sections', '-DLV_CONF_INCLUDE_SIMPLE',
-         '-DLV_CONF_SUPPRESS_DEFINE_CHECK=1', '-DLV_FONT_MONTSERRAT_28=1', '-D_DEFAULT_SOURCE',
+         '-DLV_CONF_SUPPRESS_DEFINE_CHECK=1', '-DLV_FONT_MONTSERRAT_20=1',
+         '-DLV_FONT_MONTSERRAT_48=1', '-D_DEFAULT_SOURCE',
          *['-I'+str(p) for p in [test/'stubs', root/'tests/reader_ui/stubs',
-            root/'tests/reader_ui', root/'main', root/'components/aether_recorder/include', lvgl]]]
-# The shared cache leaves the optional heading size disabled; compile it locally.
-objects = [p for p in objects if not p.name.endswith('lv_font_montserrat_28.c.o')]
-for src in [root/'main/apps/app_recorder.c',
-            lvgl/'src/font/lv_font_montserrat_28.c', test/'smoke.c']:
+            root/'tests/battery_ui/stubs', root/'tests/reader_ui', root/'main', root/'main/ui',
+            root/'components/aether_recorder/include', root/'components/tg29/include',
+            root/'components/pcf85063/include', lvgl]]]
+# Compile production heading and header-icon fonts when the cache disables them.
+objects = [p for p in objects if not p.name.endswith(('lv_font_montserrat_20.c.o',
+    'lv_font_montserrat_48.c.o'))]
+for src in [root/'main/apps/app_recorder.c', root/'main/ui/app_battery.c',
+            lvgl/'src/font/lv_font_montserrat_20.c', lvgl/'src/font/lv_font_montserrat_48.c', test/'smoke.c']:
     obj = out / (src.stem+'.o')
     subprocess.run(flags+['-c',str(src),'-o',str(obj)],check=True)
     objects.append(obj)

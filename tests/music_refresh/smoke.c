@@ -1,20 +1,108 @@
 /* Reuse hardware/service doubles. Supply a controllable async IO queue. */
 #define APP_VOLUME_UI_DOUBLES_ONLY
 #include "../volume_ui/smoke.c"
+#include "app_lyrics.h"
 
 static unsigned io_requests;
+static unsigned lyric_requests;
 static void (*pending_complete)(app_ui_t *, const app_io_result_t *);
+static app_io_operation_t pending_operation;
+static char requested_directory[192];
+static char requested_lyrics[192];
+static bool asynchronous_lyrics;
+static aether_audio_player_status_t saved_music;
+static const app_io_result_t *preparing_catalog;
+static unsigned resume_checks, play_requests;
+static uint32_t play_position;
+static bool restore_busy_once;
+
+esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t h, char *path, size_t size)
+{
+    assert(h && path && size >= sizeof(saved_music.path));
+    if (!saved_music.path[0]) return ESP_ERR_NOT_FOUND;
+    strlcpy(path, saved_music.path, size);
+    return ESP_OK;
+}
+
+esp_err_t aether_audio_player_restore(aether_audio_player_handle_t h)
+{
+    assert(h && preparing_catalog && preparing_catalog->playlist_prepared);
+    ++resume_checks;
+    if (restore_busy_once) {
+        restore_busy_once = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (music.active || music.path[0]) return ESP_ERR_INVALID_STATE;
+    for (size_t i = 0; i < preparing_catalog->count; ++i) {
+        if (strcmp(saved_music.path, preparing_catalog->entries[i].path)) continue;
+        strlcpy(music.path, saved_music.path, sizeof(music.path));
+        music.position_ms = saved_music.position_ms;
+        music.duration_ms = saved_music.duration_ms;
+        music.track_index = i;
+        music.track_count = preparing_catalog->count;
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t aether_audio_player_play(aether_audio_player_handle_t h, const char *path, int volume)
+{
+    assert(h && !music.active && !strcmp(path, music.path) && volume == music.volume);
+    ++play_requests;
+    play_position = music.position_ms;
+    music.active = true;
+    music.state = AETHER_AUDIO_PLAYING;
+    return ESP_OK;
+}
+
 void app_ui_request_io_ex(app_ui_t *ui,const app_io_request_t *q,
                          void (*complete)(app_ui_t *,const app_io_result_t *))
 {
-    assert(ui&&q&&q->operation==APP_IO_CATALOG&&q->filter==APP_IO_MUSIC);
-    assert(!pending_complete);++io_requests;pending_complete=complete;
+    assert(ui&&q&&complete&&!pending_complete);
+    if (q->operation == APP_IO_READ_TEXT) {
+        assert(q->limit == APP_LYRICS_READ_LIMIT && strlen(q->path) >= 4 &&
+               !strcmp(q->path + strlen(q->path) - 4, ".lrc"));
+        if (!asynchronous_lyrics) {
+            const app_io_result_t absent = {.operation=APP_IO_READ_TEXT, .error=ESP_ERR_NOT_FOUND};
+            complete(ui, &absent);
+            return;
+        }
+        strlcpy(requested_lyrics, q->path, sizeof(requested_lyrics));
+        ++lyric_requests;
+    } else {
+        assert(q->operation == APP_IO_CATALOG && q->filter == APP_IO_MUSIC);
+        strlcpy(requested_directory, q->path, sizeof(requested_directory));
+        ++io_requests;
+    }
+    pending_operation = q->operation;
+    pending_complete = complete;
 }
-static void complete_io(app_ui_t *ui,esp_err_t error)
+
+static void complete_catalog(app_ui_t *ui, const app_io_result_t *result)
 {
-    assert(pending_complete);void (*complete)(app_ui_t *,const app_io_result_t *)=pending_complete;
-    pending_complete=NULL;const app_io_result_t result={.operation=APP_IO_CATALOG,.error=error};
-    complete(ui,&result);
+    assert(pending_complete && !preparing_catalog && pending_operation == APP_IO_CATALOG);
+    void (*complete)(app_ui_t *,const app_io_result_t *) = pending_complete;
+    pending_complete = NULL;
+    preparing_catalog = result;
+    complete(ui, result);
+    preparing_catalog = NULL;
+}
+
+static void complete_lyrics(app_ui_t *ui, esp_err_t error, const char *text)
+{
+    assert(pending_complete && pending_operation == APP_IO_READ_TEXT);
+    app_io_result_t result = {.operation=APP_IO_READ_TEXT, .error=error, .text=(char *)text};
+    strlcpy(result.path, requested_lyrics, sizeof(result.path));
+    if (text) result.next_offset = result.file_size = strlen(text);
+    void (*complete)(app_ui_t *, const app_io_result_t *) = pending_complete;
+    pending_complete = NULL;
+    complete(ui, &result);
+}
+
+static void complete_io(app_ui_t *ui, esp_err_t error)
+{
+    const app_io_result_t result = {.operation=APP_IO_CATALOG, .error=error};
+    complete_catalog(ui, &result);
 }
 
 static void test_music_eq(app_ui_t *ui)
@@ -65,8 +153,263 @@ static void test_music_eq(app_ui_t *ui)
     puts("PASS live music EQ controls, bypass, reopen and reset preserve playback");
 }
 
+static void open_music(app_ui_t *ui, const char *path)
+{
+    app_open_music_path(ui, path);
+    assert(pending_complete);
+}
+
+static void click_label(app_ui_t *ui, const char *text)
+{
+    lv_obj_t *label = find(ui->screen, text);
+    assert(label);
+    lv_obj_send_event(lv_obj_get_parent(label), LV_EVENT_CLICKED, NULL);
+}
+
+static void test_resume(app_ui_t *ui)
+{
+    app_io_entry_t library[] = {{.path="/sdcard/Music/first.mp3"}, {.path="/sdcard/Music/second.mp3"}};
+    const app_io_result_t standard = {.operation=APP_IO_CATALOG, .entries=library, .count=2, .total_count=2,
+                                      .playlist_prepared=true};
+    strlcpy(music.path, library[1].path, sizeof(music.path));
+    music.position_ms = 42150;
+    saved_music = music;
+    open_music(ui, NULL);
+    assert(!requested_directory[0] && !music.active && music_page_releases == 1);
+    restore_busy_once = true;
+    complete_catalog(ui, &standard);
+    assert(!music.path[0] && !pending_complete);
+    const unsigned early_selects = ui_playlist_selects;
+    click_label(ui, LV_SYMBOL_PLAY);
+    assert(ui_playlist_selects == early_selects && !play_requests);
+    advance(400);
+    assert(pending_complete && !requested_directory[0]);
+    complete_catalog(ui, &standard);
+    advance(130);
+    assert(find(ui->screen, "second") && find(ui->screen, "00:42") && find(ui->screen, "02:00") && find(ui->screen, "2 / 2"));
+    assert(!music.active && !play_requests && !pending_complete);
+    click_label(ui, LV_SYMBOL_PLAY);
+    assert(music.active && play_requests == 1 && play_position == 42150);
+
+    const unsigned checks = resume_checks, selects = ui_playlist_selects;
+    open_music(ui, library[0].path);
+    assert(!strcmp(requested_directory, "/sdcard/Music"));
+    complete_catalog(ui, &standard);
+    assert(resume_checks == checks && ui_playlist_selects == selects + 1 && ui_playlist_selected_index == 0);
+    puts("PASS music reopens on the saved song and position without autoplay, Play resumes, explicit open stays fresh");
+
+    app_io_entry_t album[] = {{.path="/sdcard/Albums/Electro/saved.m4a"}};
+    const app_io_result_t nested = {.operation=APP_IO_CATALOG, .entries=album, .count=1, .total_count=1,
+                                    .playlist_prepared=true};
+    strlcpy(saved_music.path, album[0].path, sizeof(saved_music.path));
+    open_music(ui, NULL);
+    complete_catalog(ui, &standard);
+    assert(pending_complete && !strcmp(requested_directory, "/sdcard/Albums/Electro"));
+    complete_catalog(ui, &nested);
+    advance(130);
+    assert(!pending_complete && !music.active && find(ui->screen, "saved") &&
+           find(ui->screen, "00:42") && find(ui->screen, "02:00") && find(ui->screen, "1 / 1"));
+
+    open_music(ui, NULL);
+    complete_catalog(ui, &standard);
+    assert(pending_complete && !strcmp(requested_directory, "/sdcard/Albums/Electro"));
+    complete_io(ui, ESP_ERR_NOT_FOUND);
+    assert(pending_complete && !requested_directory[0]);
+    complete_catalog(ui, &standard);
+    advance(130);
+    assert(!pending_complete && !music.active && !music.path[0] && find(ui->screen, "first.mp3") &&
+           !strcmp(saved_music.path, album[0].path));
+    const unsigned fallback_selects = ui_playlist_selects;
+    click_label(ui, LV_SYMBOL_PLAY);
+    assert(ui_playlist_selects == fallback_selects + 1 && ui_playlist_selected_index == 0);
+    puts("PASS saved nested directory restores asynchronously and missing saved directory falls back without erasing the record");
+}
+
+static void test_recording_playlist_scope(app_ui_t *ui)
+{
+    app_io_entry_t recording = {.path = "/sdcard/Recordings/test.wav"};
+    app_io_entry_t song = {.path = "/sdcard/Music/song.mp3"};
+    app_io_result_t catalog = {.operation = APP_IO_CATALOG, .count = 1, .total_count = 1,
+                               .playlist_prepared = true};
+    open_music(ui, recording.path);
+    assert(!strcmp(requested_directory, "/sdcard/Recordings"));
+    catalog.entries = &recording;
+    complete_catalog(ui, &catalog);
+    assert(find(ui->screen, "test.wav") && !find(ui->screen, "song.mp3"));
+
+    strlcpy(saved_music.path, song.path, sizeof(saved_music.path));
+    open_music(ui, NULL);
+    assert(!requested_directory[0]);
+    /* The backend may still be finishing the outgoing recording stream. */
+    strlcpy(music.path, recording.path, sizeof(music.path));
+    music.closing = music.active = true;
+    music.state = AETHER_AUDIO_PLAYING;
+    advance(130);
+    click_label(ui, LV_SYMBOL_PLAY);
+    assert(pending_complete && !find(ui->screen, "test") && music.state == AETHER_AUDIO_PLAYING);
+
+    music.closing = music.active = false;
+    music.state = AETHER_AUDIO_STOPPED;
+    music.path[0] = '\0';
+    catalog.entries = &song;
+    complete_catalog(ui, &catalog);
+    advance(130);
+    assert(!pending_complete && !music.active && !strcmp(music.path, song.path) &&
+           find(ui->screen, "song.mp3") && !find(ui->screen, "test.wav"));
+    puts("PASS recording playlist and standalone music playlist stay isolated across async session release");
+}
+
+static lv_obj_t *progress_slider(app_ui_t *ui)
+{
+    for (uint32_t i = 0; i < lv_obj_get_child_count(ui->content); ++i) {
+        lv_obj_t *child = lv_obj_get_child(ui->content, i);
+        if (lv_obj_check_type(child, &lv_slider_class) && lv_slider_get_max_value(child) == 1000)
+            return child;
+    }
+    return NULL;
+}
+
+static void recordings_cleanup(app_ui_t *ui)
+{
+    ui->page_context = NULL;
+}
+
+static void test_seek_screen_handoff(app_ui_t *ui, lv_indev_t *input)
+{
+    lv_obj_t *old_screen = ui->screen;
+    lv_obj_t *old_slider = progress_slider(ui);
+    assert(old_slider);
+    music.active = true;
+    music.duration_ms = 60000;
+    lv_slider_set_value(old_slider, 250, LV_ANIM_OFF);
+    lv_obj_send_event(old_slider, LV_EVENT_PRESSED, input);
+    lv_obj_send_event(old_slider, LV_EVENT_RELEASED, input);
+    const unsigned requests = music_seek_requests;
+    assert(requests == 1 && music_seek_position == 15000);
+
+    lv_obj_send_event(old_slider, LV_EVENT_PRESSED, input);
+    lv_obj_send_event(old_slider, LV_EVENT_INDEV_RESET, input);
+    lv_obj_send_event(old_slider, LV_EVENT_RELEASED, input);
+    assert(music_seek_requests == requests);
+
+    lv_obj_send_event(old_slider, LV_EVENT_PRESSED, input);
+    char directory[192] = "/sdcard/Recordings";
+    app_ui_begin_page(ui, "录音文件");
+    ui->page_context = directory;
+    ui->page_cleanup = recordings_cleanup;
+    assert(lv_obj_is_valid(old_slider));
+    lv_obj_send_event(old_slider, LV_EVENT_INDEV_RESET, input);
+    advance(20);
+    assert(!lv_obj_is_valid(old_screen) && !lv_obj_is_valid(old_slider));
+    assert(ui->page_context == directory && !strcmp(directory, "/sdcard/Recordings"));
+    assert(music_seek_requests == requests);
+
+    app_io_entry_t track = {.path = "/sdcard/Recordings/test.wav"};
+    const app_io_result_t catalog = {.operation = APP_IO_CATALOG, .entries = &track, .count = 1,
+                                     .total_count = 1, .playlist_prepared = true};
+    open_music(ui, track.path);
+    complete_catalog(ui, &catalog);
+    old_screen = ui->screen;
+    old_slider = progress_slider(ui);
+    assert(old_slider);
+    lv_obj_send_event(old_slider, LV_EVENT_PRESSED, input);
+
+    open_music(ui, track.path);
+    complete_catalog(ui, &catalog);
+    lv_obj_t *current_slider = progress_slider(ui);
+    assert(current_slider && current_slider != old_slider && lv_obj_is_valid(old_slider));
+    music.active = true;
+    music.duration_ms = 60000;
+    lv_slider_set_value(current_slider, 750, LV_ANIM_OFF);
+    lv_obj_send_event(current_slider, LV_EVENT_PRESSED, input);
+    lv_obj_send_event(old_slider, LV_EVENT_INDEV_RESET, input);
+    lv_obj_send_event(old_slider, LV_EVENT_RELEASED, input);
+    assert(music_seek_requests == requests);
+    lv_obj_send_event(current_slider, LV_EVENT_RELEASED, input);
+    assert(music_seek_requests == requests + 1 && music_seek_position == 45000);
+    advance(20);
+    assert(!lv_obj_is_valid(old_screen) && !lv_obj_is_valid(old_slider));
+    assert(lv_obj_is_valid(current_slider) && music_seek_requests == requests + 1);
+    puts("PASS real LVGL deferred player deletion and stale slider reset/release preserve recordings and reopened seek state");
+}
+
+static void test_lrc_parser(void)
+{
+    app_lyrics_t *lyrics = app_lyrics_parse("\xef\xbb\xbf[ti:测试]\r\n[00:04]最终\r\n"
+        "[00:01.2][00:03:00] 前奏 \n[00:01.200]重复\n[00:03.550]\n[00:99]错误\n"
+        "[offset:+240]\n[00:06]不完整", false);
+    assert(lyrics && app_lyrics_count(lyrics) == 4);
+    assert(app_lyrics_at(lyrics, 959) == SIZE_MAX);
+    assert(app_lyrics_at(lyrics, 960) == 0 && !strcmp(app_lyrics_line(lyrics, 0), "前奏"));
+    assert(app_lyrics_at(lyrics, 2760) == 1 && !strcmp(app_lyrics_line(lyrics, 1), "前奏"));
+    assert(app_lyrics_at(lyrics, 3310) == 2 && !*app_lyrics_line(lyrics, 2));
+    assert(app_lyrics_at(lyrics, UINT32_MAX) == 3 && !strcmp(app_lyrics_line(lyrics, 3), "最终"));
+    assert(!*app_lyrics_line(lyrics, SIZE_MAX));
+    free(lyrics);
+
+    lyrics = app_lyrics_parse("[offset:-500]\n[00:00]第一行", true);
+    assert(lyrics && app_lyrics_at(lyrics, 499) == SIZE_MAX && app_lyrics_at(lyrics, 500) == 0);
+    free(lyrics);
+    assert(!app_lyrics_parse("[ti:无时间戳]", true));
+    puts("PASS LRC ordering, repeated and duplicate cues, signed offset, BOM, blank interval and incomplete tail");
+}
+
+static bool highlighted(app_ui_t *ui, const char *text)
+{
+    lv_obj_t *line = find(ui->screen, text);
+    return line && lv_color_eq(lv_obj_get_style_text_color(line, LV_PART_MAIN), lv_color_hex(0x79DBB7));
+}
+
+static void test_synchronized_lyrics(app_ui_t *ui)
+{
+    static const char text[] = "[00:01.00]第一行\n[00:04.00]第二行\n[00:09.00]第三行";
+    app_io_entry_t tracks[] = {{.path="/sdcard/Music/a.song.mp3"}, {.path="/sdcard/Music/b.wav"}};
+    const app_io_result_t catalog = {.operation=APP_IO_CATALOG,.entries=tracks,.count=2,
+                                      .total_count=2,.playlist_prepared=true};
+    asynchronous_lyrics = true;
+    open_music(ui, tracks[0].path);
+    complete_catalog(ui, &catalog);
+    strlcpy(music.path, tracks[0].path, sizeof(music.path));
+    music.active = true;
+    music.position_ms = 1100;
+    advance(140);
+    assert(lyric_requests == 1 && !strcmp(requested_lyrics, "/sdcard/Music/a.song.lrc"));
+    complete_lyrics(ui, ESP_OK, text);
+    assert(highlighted(ui, "第一行") && find(ui->screen, "第二行"));
+    music.position_ms = 4100;
+    advance(140);
+    assert(highlighted(ui, "第二行") && find(ui->screen, "第一行") && find(ui->screen, "第三行"));
+    music.position_ms = 0;
+    advance(140);
+    assert(!highlighted(ui, "第一行") && find(ui->screen, "第一行") && !find(ui->screen, "第二行"));
+    strlcpy(music.path, tracks[1].path, sizeof(music.path));
+    advance(140);
+    assert(lyric_requests == 2 && !strcmp(requested_lyrics, "/sdcard/Music/b.lrc") && !find(ui->screen, "第一行"));
+    complete_lyrics(ui, ESP_ERR_NOT_FOUND, NULL);
+    advance(140);
+    assert(lyric_requests == 3 && !strcmp(requested_lyrics, "/sdcard/Lyrics/b.lrc"));
+    strlcpy(music.path, tracks[0].path, sizeof(music.path));
+    advance(140);
+    complete_lyrics(ui, ESP_OK, "[00:00]旧曲歌词");
+    assert(!find(ui->screen, "旧曲歌词"));
+    advance(140);
+    assert(lyric_requests == 4 && !strcmp(requested_lyrics, "/sdcard/Music/a.song.lrc"));
+
+    const unsigned scans = io_requests;
+    click_label(ui, "刷新");
+    advance(140);
+    assert(io_requests == scans && pending_operation == APP_IO_READ_TEXT);
+    complete_lyrics(ui, ESP_OK, text);
+    advance(140);
+    assert(io_requests == scans + 1 && pending_operation == APP_IO_CATALOG);
+    complete_catalog(ui, &catalog);
+    asynchronous_lyrics = false;
+    puts("PASS music finds adjacent and Lyrics-folder LRC, follows seek, discards stale lyrics and defers a refresh safely");
+}
+
 int main(void)
 {
+    test_lrc_parser();
     lv_init();lv_display_t *d=lv_display_create(480,480);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(d,buffer,NULL,sizeof(buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
     lv_indev_t *input=lv_indev_create();lv_indev_set_type(input,LV_INDEV_TYPE_POINTER);
@@ -83,17 +426,16 @@ int main(void)
     assert(io_requests==2);complete_io(&ui,ESP_OK);
     lv_obj_send_event(refresh,LV_EVENT_CLICKED,NULL);assert(io_requests==3&&pending_complete);
     assert(pending_complete);
-    void(*catalog_complete)(app_ui_t*,const app_io_result_t*)=pending_complete;pending_complete=NULL;
     app_io_entry_t entries[2]={{.path="/sdcard/Music/first.mp3"},{.path="/sdcard/Music/second.mp3"}};
     app_io_result_t prepared={.operation=APP_IO_CATALOG,.entries=entries,.count=2,.total_count=2,.playlist_prepared=true};
-    unsigned copies=ui_playlist_copies;catalog_complete(&ui,&prepared);
+    unsigned copies=ui_playlist_copies;complete_catalog(&ui,&prepared);
     assert(ui_playlist_copies==copies); /* No second backend copy on LVGL. */
     lv_obj_t *old_track=find(ui.screen,"first.mp3");assert(old_track);
     lv_obj_send_event(refresh,LV_EVENT_CLICKED,NULL);assert(pending_complete);
     const unsigned old_selects=ui_playlist_selects;
     lv_obj_send_event(lv_obj_get_parent(old_track),LV_EVENT_CLICKED,NULL);
     assert(ui_playlist_selects==old_selects); /* Old indices disabled while worker replaces list. */
-    catalog_complete=pending_complete;pending_complete=NULL;catalog_complete(&ui,&prepared);
+    complete_catalog(&ui,&prepared);
     assert(ui_playlist_copies==copies);
 
     enum { LONG_CATALOG_COUNT = 96 };
@@ -101,9 +443,8 @@ int main(void)
     for (size_t i=0;i<LONG_CATALOG_COUNT;++i)
         snprintf(long_catalog[i].path,sizeof(long_catalog[i].path),"/sdcard/Music/track-%02u.mp3",(unsigned)i);
     lv_obj_send_event(refresh,LV_EVENT_CLICKED,NULL);assert(pending_complete);
-    catalog_complete=pending_complete;pending_complete=NULL;
     prepared.entries=long_catalog;prepared.count=prepared.total_count=LONG_CATALOG_COUNT;
-    catalog_complete(&ui,&prepared);
+    complete_catalog(&ui,&prepared);
     lv_obj_t *library_button=lv_obj_get_parent(find(ui.screen,"曲库"));
     lv_obj_send_event(library_button,LV_EVENT_CLICKED,NULL);advance(120);
     lv_obj_t *first=find(ui.screen,"track-00.mp3");assert(first&&lv_obj_is_visible(first));
@@ -125,6 +466,10 @@ int main(void)
     puts("PASS music catalog keyboard navigation reaches recycled offscreen rows and pointer selects the actual track index");
     assert(music.active&&music.state==AETHER_AUDIO_PLAYING&&music.volume==100&&!music_updates);
     test_music_eq(&ui);
+    test_resume(&ui);
+    test_recording_playlist_scope(&ui);
+    test_seek_screen_handoff(&ui, input);
+    test_synchronized_lyrics(&ui);
     if(ui.timer)lv_timer_delete(ui.timer);
     const unsigned releases=music_page_releases;
     if(ui.page_cleanup)ui.page_cleanup(&ui);

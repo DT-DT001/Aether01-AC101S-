@@ -19,7 +19,11 @@ typedef enum {
     APP_IO_READER_LOAD,
     APP_IO_READER_SAVE,
     APP_IO_RECORDER,
-    APP_IO_IMAGES, /* Catalog filter for image files and navigable folders. */
+    APP_IO_IMAGES, /* Image-only catalog across currently mounted media. */
+    APP_IO_DELETE_FILE,
+    APP_IO_COPY_FILE,
+    APP_IO_MOVE_FILE,
+    APP_IO_SEARCH_FILES,
 } app_io_operation_t;
 
 typedef enum {
@@ -34,6 +38,7 @@ typedef struct {
     char path[192];
     uint64_t size;
     bool directory;
+    uint32_t modified_s;
 } app_io_entry_t;
 
 typedef struct {
@@ -48,6 +53,12 @@ typedef struct {
     bool source_boundary;
     unsigned encoding_hint;
     app_reader_turn_mode_t turn_mode;
+    uint32_t media_generation;
+    uint32_t destination_generation;
+    union {
+        char destination[192];
+        char query[96];
+    };
 } app_io_request_t;
 
 typedef struct {
@@ -66,6 +77,8 @@ typedef struct {
     size_t total_count;
     bool truncated;
     bool playlist_prepared; /* Music list installed by the IO worker, not LVGL. */
+    bool target_exists;
+    bool source_retained; /* A cross-volume move finished copying only. */
     uint64_t offset;
     uint64_t next_offset;
     uint64_t file_size;

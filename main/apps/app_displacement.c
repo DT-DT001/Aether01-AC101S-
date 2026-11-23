@@ -1,5 +1,6 @@
 #include "app_ui_internal.h"
 #include "app_displacement.h"
+#include "app_instrument_ui.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -38,37 +39,12 @@ static void update_button(lv_obj_t *object, displacement_action_t *shown_action,
     else lv_obj_add_state(object, LV_STATE_DISABLED);
 }
 
-static lv_obj_t *text(lv_obj_t *parent, const char *value, int x, int y, int width,
-                      uint32_t color, const lv_font_t *font)
-{
-    lv_obj_t *label = app_ui_add_text(parent, value, LV_ALIGN_TOP_LEFT, x, y, color, font);
-    lv_obj_set_width(label, width);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-    return label;
-}
-
-static lv_obj_t *card(lv_obj_t *parent, int x, int y, int width, int height)
-{
-    lv_obj_t *box = lv_obj_create(parent);
-    lv_obj_remove_style_all(box);
-    lv_obj_set_pos(box, x, y);
-    lv_obj_set_size(box, width, height);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(box, 14, 0);
-    lv_obj_set_style_bg_color(box, lv_color_hex(0x182B42), 0);
-    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
-    return box;
-}
-
 static lv_obj_t *button(app_ui_t *ui, const char *value, int x, uint32_t color)
 {
     lv_obj_t *object = lv_button_create(ui->content);
-    lv_obj_set_pos(object, x, 270);
-    lv_obj_set_size(object, 196, 46);
-    lv_obj_set_style_radius(object, 14, 0);
-    lv_obj_set_style_bg_color(object, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_color(object, lv_color_hex(0x38699B), LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(object, 0, 0);
+    lv_obj_set_pos(object, x, 292);
+    lv_obj_set_size(object, 198, 46);
+    instrument_button_style(object, color);
     lv_obj_add_event_cb(object, displacement_action, LV_EVENT_CLICKED, ui);
     app_ui_add_text(object, value, LV_ALIGN_CENTER, 0, 0, 0xEAF2FF, app_ui_chinese_font());
     return object;
@@ -169,7 +145,7 @@ static void refresh(displacement_page_t *page)
         isfinite(result->distance_m) && result->distance_m >= 0.0f &&
         isfinite(result->xyz_m[0]) && isfinite(result->xyz_m[1]) && isfinite(result->xyz_m[2]);
     const char *state = "等待测量";
-    const char *instruction = "将设备放稳并保持静止，再点开始。";
+    const char *instruction = "放稳设备后点开始。";
     uint32_t color = 0xAFC6E9;
     if (!status.available) {
         state = "六轴传感器不可用";
@@ -182,19 +158,19 @@ static void refresh(displacement_page_t *page)
         break;
     case APP_DISPLACEMENT_READY:
         state = "可以移动";
-        instruction = "平稳移动，尽量保持朝向，可查看实时位移。";
+        instruction = "平稳移动，保持朝向。";
         color = 0x8FE0BA;
         break;
     case APP_DISPLACEMENT_MOVING:
         state = stationary ? "已停稳 · 读数锁定" : preview_held ? "正在确认停稳" : "正在测量";
         instruction = stationary ? (result->resume_pending ? "放稳片刻，再移动设备继续测量。" :
             "点继续测量后再移动，或结束测量。") : preview_held ? "读数已暂存，请保持设备静止。" :
-            "看实时位移，到终点停稳后轻点结束。";
+            "到终点停稳后，轻点结束。";
         color = 0x8FE0BA;
         break;
     case APP_DISPLACEMENT_SETTLING:
         state = "正在确认终点";
-        instruction = "请保持静止，等待终点校准。";
+        instruction = "保持静止，校准终点。";
         break;
     case APP_DISPLACEMENT_COMPLETE:
         if (result->measurement_limited) {
@@ -203,7 +179,7 @@ static void refresh(displacement_page_t *page)
         } else {
             state = no_motion ? "未检测到明显移动" : usable ? "测量完成" : "结果不可用";
             instruction = no_motion ? "非常缓慢的移动可能无法检出。" : usable ?
-                "位移以起点处的传感器轴为准。" : "结果数据异常，请重新测量。";
+                "" : "结果数据异常，请重新测量。";
         }
         color = usable && !result->low_confidence && !result->measurement_limited ? 0x8FE0BA : 0xFFB38C;
         break;
@@ -241,7 +217,7 @@ static void refresh(displacement_page_t *page)
     }
     if (result->samples) app_ui_label_fmt(page->samples, "采样 %lu  ·  耗时 %.1f s  ·  最大间隔 %lu ms",
         (unsigned long)result->samples, (double)result->elapsed_ms / 1000.0, (unsigned long)result->max_gap_ms);
-    else app_ui_label_text(page->samples, "采样 —  ·  耗时 —  ·  最大间隔 —");
+    else app_ui_label_text(page->samples, "");
     if (page->command_error != ESP_OK)
         app_ui_label_fmt(page->quality, "操作未受理 %s", esp_err_to_name(page->command_error));
     else if (usable && complete && result->measurement_limited)
@@ -253,7 +229,7 @@ static void refresh(displacement_page_t *page)
     else if (usable && live) app_ui_label_text(page->quality, result->low_confidence ?
         "当前估算可信度偏低，可停稳后结束。" : "实时值可能漂移，结束时校准。");
     else if (usable) app_ui_label_text(page->quality, result->low_confidence ?
-        "质量偏低，建议重测" : "已通过静止与采样检查");
+        "质量偏低，建议重测" : "");
     else app_ui_label_text(page->quality, "");
 
     update_button(page->primary, &page->primary_action,
@@ -319,33 +295,26 @@ void app_open_displacement(app_ui_t *ui)
     ui->page_context = page;
     ui->page_cleanup = displacement_cleanup;
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    page->state = text(content, "", 0, 0, 404, 0xAFC6E9, app_ui_chinese_font_size(24));
-    page->instruction = text(content, "", 0, 34, 404, 0xC9DCF8, app_ui_chinese_font());
+    page->state = instrument_text(content, "", 7, 0, 394, INSTRUMENT_BLUE, app_ui_chinese_font_size(24));
+    page->instruction = instrument_text(content, "", 7, 34, 394, INSTRUMENT_MUTED, app_ui_chinese_font());
 
-    lv_obj_t *net = card(content, 0, 65, 404, 81);
-    page->caption = text(net, "距起点（净位移）", 8, 9, 188, 0xAFC6E9, app_ui_chinese_font());
-    lv_obj_set_style_text_align(page->caption, LV_TEXT_ALIGN_CENTER, 0);
-    page->distance = text(net, "--", 8, 34, 188, 0xD4F1F5, &lv_font_montserrat_28);
-    lv_obj_set_style_text_align(page->distance, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *direction_caption = text(net, "净方向", 208, 9, 188, 0xAFC6E9, app_ui_chinese_font());
-    lv_obj_set_style_text_align(direction_caption, LV_TEXT_ALIGN_CENTER, 0);
-    page->direction = text(net, "--", 208, 40, 188, 0xD4F1F5, app_ui_chinese_font_size(24));
-    lv_obj_set_style_text_align(page->direction, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *net = instrument_card(content, 0, 64, 408, 104);
+    page->caption = instrument_text(net, "距起点（净位移）", 14, 11, 206, INSTRUMENT_MUTED, app_ui_chinese_font());
+    page->distance = instrument_text(net, "--", 14, 38, 208, INSTRUMENT_TEAL, &lv_font_montserrat_48);
+    instrument_text(net, "起点轴方向", 238, 17, 160, INSTRUMENT_MUTED, app_ui_chinese_font());
+    page->direction = instrument_text(net, "--", 238, 54, 160, INSTRUMENT_BLUE, app_ui_chinese_font_size(24));
 
     static const char *const axes[] = {"X", "Y", "Z"};
     for (size_t i = 0; i < 3; ++i) {
-        lv_obj_t *axis = card(content, (int)i * 138, 154, 128, 62);
-        lv_obj_t *caption = text(axis, axes[i], 0, 7, 128, 0x82AACF, &lv_font_montserrat_16);
-        lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0);
-        page->axes[i] = text(axis, "--", 0, 30, 128, 0xEAF2FF, app_ui_chinese_font());
-        lv_obj_set_style_text_align(page->axes[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_t *axis = instrument_card(content, (int)i * 138, 177, 132, 66);
+        instrument_text(axis, axes[i], 14, 7, 100, INSTRUMENT_MUTED, &lv_font_montserrat_16);
+        page->axes[i] = instrument_text(axis, "--", 14, 31, 104, INSTRUMENT_TEXT, app_ui_chinese_font_size(24));
     }
 
-    page->samples = text(content, "", 0, 224, 404, 0xAFC6E9, app_ui_chinese_font());
-    page->quality = text(content, "", 0, 245, 404, 0xFFD099, app_ui_chinese_font());
-    page->primary = button(ui, "开始测量", 0, 0x2768D8);
-    page->secondary = button(ui, "清除结果", 208, 0x243955);
-    text(content, "方向以起点的传感器坐标轴为准。", 0, 327, 404, 0x9CB2D2, app_ui_chinese_font());
+    page->samples = instrument_text(content, "", 7, 249, 394, INSTRUMENT_MUTED, app_ui_chinese_font());
+    page->quality = instrument_text(content, "", 7, 270, 394, 0xFFD099, app_ui_chinese_font());
+    page->primary = button(ui, "开始测量", 0, INSTRUMENT_PRIMARY);
+    page->secondary = button(ui, "清除结果", 210, INSTRUMENT_SECONDARY);
     app_ui_set_timer(ui, displacement_timer, 100);
     refresh(page);
 }

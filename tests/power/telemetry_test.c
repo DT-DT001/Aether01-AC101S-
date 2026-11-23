@@ -24,9 +24,14 @@ static esp_err_t quiesce_result;
 static atomic_bool finish_worker;
 static _Thread_local bool is_worker;
 static _Thread_local jmp_buf worker_exit;
+static uint32_t fixture_ms;
+static gyro_calibration_record_t stored_bias, pending_bias;
+static float live_bias[3];
+static bool record_exists, commit_fails, auto_bias_enabled = true;
+static unsigned commit_attempts, bias_updates;
 static int64_t monotonic_us(void)
 { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * INT64_C(1000000) + ts.tv_nsec / 1000; }
-int64_t esp_timer_get_time(void) { return monotonic_us(); }
+int64_t esp_timer_get_time(void) { return fixture_ms ? INT64_C(1000) * fixture_ms : monotonic_us(); }
 TickType_t xTaskGetTickCount(void) { return (TickType_t)(monotonic_us() / 1000); }
 void vTaskDelay(TickType_t ticks)
 { if (is_worker && atomic_load(&finish_worker)) longjmp(worker_exit, 1);
@@ -47,11 +52,66 @@ esp_err_t qmi8658a_read(void *h, qmi8658a_sample_t *s)
     (void)h; atomic_fetch_add(&imu_reads, 1); atomic_store(&imu_inside, true);
     while (atomic_load(&block_imu) && !atomic_load(&unblock)) vTaskDelay(1);
     memset(s, 0, sizeof(*s)); s->accel_mps2[2] = 9.8f;
+    s->gyro_raw_dps[0] = 8.9f;
     atomic_store(&imu_inside, false); return atomic_load(&fail_imu) ? ESP_FAIL : ESP_OK;
 }
 esp_err_t qmi8658a_read_fresh(void *h, qmi8658a_sample_t *s)
 {
     return atomic_load(&no_new_imu_frame) ? ESP_ERR_NOT_FINISHED : qmi8658a_read(h, s);
+}
+bool qmi8658a_gyro_zero_add(qmi8658a_gyro_zero_t *window, const qmi8658a_sample_t *sample)
+{
+    assert(!auto_bias_enabled);
+    if (sample->accel_mps2[2] < 8.5f) return false;
+    window->samples++;
+    memcpy(window->bias_dps, sample->gyro_raw_dps, sizeof(window->bias_dps));
+    return true;
+}
+void qmi8658a_set_gyro_auto_bias(void *h, bool enabled)
+{
+    assert(h);
+    auto_bias_enabled = enabled;
+}
+esp_err_t qmi8658a_set_gyro_bias(void *h, const float bias[3])
+{
+    assert(h);
+    if (!isfinite(bias[0])) return ESP_ERR_INVALID_ARG;
+    memcpy(live_bias, bias, sizeof(live_bias));
+    bias_updates++;
+    return ESP_OK;
+}
+esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *h)
+{
+    assert(!strcmp(ns, "gyro_cal"));
+    if (mode == NVS_READONLY && !record_exists) return ESP_ERR_NVS_NOT_FOUND;
+    *h = mode == NVS_READONLY ? 1 : 2;
+    return ESP_OK;
+}
+void nvs_close(nvs_handle_t h) { assert(h == 1 || h == 2); }
+esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *data, size_t *length)
+{
+    assert(h == 1 && record_exists && !strcmp(key, "bias_v1") && *length == sizeof(stored_bias));
+    memcpy(data, &stored_bias, sizeof(stored_bias));
+    return ESP_OK;
+}
+esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *data, size_t length)
+{
+    assert(h == 2 && !strcmp(key, "bias_v1") && length == sizeof(pending_bias));
+    memcpy(&pending_bias, data, length);
+    return ESP_OK;
+}
+esp_err_t nvs_commit(nvs_handle_t h)
+{
+    assert(h == 2);
+    app_gyro_calibration_status_t status;
+    app_telemetry_gyro_calibration_get(&status);
+    assert(status.phase == APP_GYRO_CAL_SAVING);
+    assert(app_telemetry_gyro_calibration_cancel() == ESP_ERR_INVALID_STATE);
+    commit_attempts++;
+    if (commit_fails) return ESP_FAIL;
+    stored_bias = pending_bias;
+    record_exists = true;
+    return ESP_OK;
 }
 esp_err_t dps368_read(void *h, dps368_sample_t *s)
 {
@@ -135,12 +195,165 @@ static void test_pressure_filter_recovery(void)
     puts("PASS pressure spike median rejection, missing-frame cache retention, fault backoff and clean recovery");
 }
 
+static void assert_calibration(app_gyro_calibration_phase_t phase, uint32_t remaining,
+                               uint32_t samples, esp_err_t error)
+{
+    app_gyro_calibration_status_t status;
+    app_telemetry_gyro_calibration_get(&status);
+    assert(status.phase == phase && status.remaining_ms == remaining && status.samples == samples);
+    assert(status.error == error);
+    app_telemetry_snapshot_t snap;
+    app_telemetry_get(&snap);
+    assert(snap.gyro_calibrating == gyro_calibration_active(phase));
+}
+
+static void test_calibration_worker(void)
+{
+    atomic_store(&fail_imu, false);
+    app_telemetry_set_interest(0);
+    vTaskDelay(50);
+    const unsigned before = atomic_load(&imu_reads);
+    const uint32_t began = uptime_ms();
+    assert(app_telemetry_gyro_calibration_begin() == ESP_OK);
+    vTaskDelay(250);
+    assert(atomic_load(&imu_reads) == before);
+
+    app_gyro_calibration_status_t status;
+    do {
+        vTaskDelay(20);
+        app_telemetry_gyro_calibration_get(&status);
+    } while (gyro_calibration_active(status.phase) && uptime_ms() - began < 8500);
+    assert(status.phase == APP_GYRO_CAL_COMPLETE && status.error == ESP_OK);
+    assert(uptime_ms() - began >= 7000 && status.samples >= 100);
+    assert(commit_attempts == 1 && bias_updates == 1 && live_bias[0] == 8.9f);
+    assert(atomic_load(&imu_reads) - before == status.samples);
+    vTaskDelay(50);
+    const unsigned completed_reads = atomic_load(&imu_reads);
+    vTaskDelay(150);
+    assert(atomic_load(&imu_reads) == completed_reads);
+    puts("PASS real telemetry worker calibrates without an IMU subscription and releases the sampling request");
+}
+
+static void start_fixture_calibration(void *imu, gyro_calibration_job_t *job)
+{
+    bool sampling_started;
+    assert(app_telemetry_gyro_calibration_begin() == ESP_OK);
+    assert(app_telemetry_gyro_calibration_begin() == ESP_ERR_INVALID_STATE);
+    assert_calibration(APP_GYRO_CAL_COUNTDOWN, 2000, 0, ESP_OK);
+    assert(!prepare_gyro_calibration(imu, job, fixture_ms, false, &sampling_started));
+    assert(!sampling_started && !auto_bias_enabled);
+    fixture_ms += 1999;
+    assert(!prepare_gyro_calibration(imu, job, fixture_ms, false, &sampling_started));
+    assert_calibration(APP_GYRO_CAL_COUNTDOWN, 1, 0, ESP_OK);
+    fixture_ms++;
+    assert(prepare_gyro_calibration(imu, job, fixture_ms, false, &sampling_started));
+    assert(sampling_started);
+    assert_calibration(APP_GYRO_CAL_SAMPLING, 5000, 0, ESP_OK);
+}
+
+static void fill_calibration(void *imu, gyro_calibration_job_t *job,
+                             const qmi8658a_sample_t *candidate)
+{
+    for (unsigned i = 0; i < 250; ++i) {
+        assert(!collect_gyro_sample(imu, job, ESP_OK, candidate, fixture_ms));
+        fixture_ms += 20;
+    }
+    assert_calibration(APP_GYRO_CAL_SAMPLING, 0, 250, ESP_OK);
+}
+
+static bool calibration_flash_busy(void *context)
+{
+    return *(bool *)context;
+}
+
+static void test_manual_calibration(void *imu)
+{
+    fixture_ms = 20000;
+    s_quiesce_requested = false;
+    s_imu_available = false;
+    assert(app_telemetry_gyro_calibration_begin() == ESP_ERR_NOT_SUPPORTED);
+    s_imu_available = true;
+    commit_attempts = bias_updates = 0;
+    record_exists = false;
+    gyro_calibration_job_t job = {0};
+    const qmi8658a_sample_t flat = {.accel_mps2 = {0, 0, 8.9f}, .gyro_raw_dps = {8.9f, 2.4f, 0}};
+    const qmi8658a_sample_t moved = {.accel_mps2 = {0, 0, 5.5f}, .gyro_raw_dps = {9, 2.5f, 0}};
+    const qmi8658a_sample_t update = {.accel_mps2 = {0, 0, 8.9f}, .gyro_raw_dps = {9.5f, 2.5f, 0}};
+
+    start_fixture_calibration(imu, &job);
+    assert(!collect_gyro_sample(imu, &job, ESP_ERR_NOT_FINISHED, NULL, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_SAMPLING, 5000, 0, ESP_OK);
+    fixture_ms += 20;
+    fill_calibration(imu, &job, &flat);
+    assert(!commit_attempts && !bias_updates);
+    assert(collect_gyro_sample(imu, &job, ESP_OK, &flat, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_COMPLETE, 0, 251, ESP_OK);
+    assert(commit_attempts == 1 && bias_updates == 1 && live_bias[0] == 8.9f);
+    bool sampling_started;
+    assert(!prepare_gyro_calibration(imu, &job, fixture_ms, false, &sampling_started));
+    assert(auto_bias_enabled);
+    memset(live_bias, 0, sizeof(live_bias));
+    restore_gyro_bias(imu);
+    assert(bias_updates == 2 && live_bias[0] == 8.9f && live_bias[1] == 2.4f);
+    puts("PASS manual calibration exclusive 2s countdown, 5s fresh frame window and per-device reboot restore");
+
+    start_fixture_calibration(imu, &job);
+    fill_calibration(imu, &job, &update);
+    assert(app_telemetry_gyro_calibration_cancel() == ESP_OK);
+    assert(!collect_gyro_sample(imu, &job, ESP_OK, &update, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_CANCELLED, 0, 250, ESP_OK);
+
+    start_fixture_calibration(imu, &job);
+    assert(!collect_gyro_sample(imu, &job, ESP_OK, &moved, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_FAILED, 0, 0, ESP_ERR_INVALID_RESPONSE);
+    start_fixture_calibration(imu, &job);
+    assert(!collect_gyro_sample(imu, &job, ESP_FAIL, NULL, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_FAILED, 0, 0, ESP_FAIL);
+    start_fixture_calibration(imu, &job);
+    fixture_ms += 101;
+    assert(!collect_gyro_sample(imu, &job, ESP_ERR_NOT_FINISHED, NULL, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_FAILED, 0, 0, ESP_ERR_TIMEOUT);
+    start_fixture_calibration(imu, &job);
+    assert(!prepare_gyro_calibration(imu, &job, fixture_ms, true, &sampling_started));
+    assert_calibration(APP_GYRO_CAL_FAILED, 0, 0, ESP_ERR_INVALID_STATE);
+    assert(commit_attempts == 1 && bias_updates == 2 && live_bias[0] == 8.9f);
+
+    bool flash_busy = true;
+    app_telemetry_set_gyro_persistence_guard(calibration_flash_busy, &flash_busy);
+    start_fixture_calibration(imu, &job);
+    fill_calibration(imu, &job, &update);
+    assert(!collect_gyro_sample(imu, &job, ESP_OK, &update, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_FAILED, 0, 251, ESP_ERR_INVALID_STATE);
+    assert(commit_attempts == 1 && bias_updates == 2 && live_bias[0] == 8.9f);
+    flash_busy = false;
+
+    start_fixture_calibration(imu, &job);
+    fill_calibration(imu, &job, &update);
+    commit_fails = true;
+    assert(!collect_gyro_sample(imu, &job, ESP_OK, &update, fixture_ms));
+    assert_calibration(APP_GYRO_CAL_FAILED, 0, 251, ESP_FAIL);
+    assert(commit_attempts == 2 && bias_updates == 2 && live_bias[0] == 8.9f);
+    restore_gyro_bias(imu);
+    assert(bias_updates == 3 && live_bias[0] == 8.9f);
+    stored_bias.version++;
+    restore_gyro_bias(imu);
+    assert(bias_updates == 3);
+    stored_bias.version--;
+    stored_bias.bias_dps[0] = NAN;
+    restore_gyro_bias(imu);
+    assert(bias_updates == 3 && live_bias[0] == 8.9f);
+    app_telemetry_set_gyro_persistence_guard(NULL, NULL);
+    fixture_ms = 0;
+    puts("PASS movement, bus error, stale frames, competing measurement, late cancellation, busy media and bad storage preserve last bias");
+}
+
 int main(void)
 {
     assert(median_pressure((float[]){100001,109000,100000}) == 100001);
     assert(median_pressure((float[]){100001,96000,100000}) == 100000);
     assert(median_pressure((float[]){100001,100001,100001}) == 100001);
-    aether_board_t board = {.imu_ready = true, .barometer_ready = true, .rtc_ready = true, .display_io=(void *)1};
+    aether_board_t board = {.imu_ready = true, .imu = (void *)1, .barometer_ready = true,
+                            .rtc_ready = true, .display_io=(void *)1};
     app_telemetry_set_imu_measurement(request_measurement, consume_measurement);
     assert(app_telemetry_start(&board) == ESP_OK);
     vTaskDelay(120); assert(!atomic_load(&imu_reads) && !atomic_load(&baro_reads) && atomic_load(&rtc_reads));
@@ -229,8 +442,13 @@ int main(void)
     assert(atomic_load(&imu_reads) == after_error);
     app_telemetry_get(&snap); assert(snap.imu_error == ESP_FAIL);
     test_pressure_filter_recovery();
+    test_calibration_worker();
+    assert(app_telemetry_gyro_calibration_begin() == ESP_OK);
     app_telemetry_set_interest(0); assert(app_telemetry_quiesce(500) == ESP_OK);
+    assert_calibration(APP_GYRO_CAL_CANCELLED, 0, 0, ESP_OK);
     atomic_store(&finish_worker, true); assert(!pthread_join(worker, NULL));
     puts("PASS timeout retains the sampling gate, later acknowledgement recovers and I2C failure retains 2s backoff");
+    auto_bias_enabled = true;
+    test_manual_calibration(board.imu);
     return 0;
 }

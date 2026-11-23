@@ -5,6 +5,8 @@ for suite in usb_bus usb_msc usb_host usb_audio usb_storage usb_storage_driver o
     printf '\nRunning %s regression\n' "$suite"
     sh "$tests_root/$suite/run.sh"
 done
+sh "$tests_root/pinyin/run.sh"
+sh "$tests_root/text/run_pinyin_swipe.sh"
 sh "$tests_root/ui_media_control/run.sh"
 sh "$tests_root/../components/cst9220/test_host/run.sh"
 sh "$tests_root/../components/aether_mjpeg_player/test_host/run.sh"

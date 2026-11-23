@@ -29,7 +29,7 @@ void app_telemetry_set_interest(uint32_t mask) { interest = mask; }
 void app_telemetry_set_consumer(void (*consumer)(const app_telemetry_snapshot_t *))
 { consume = consumer; }
 
-esp_err_t nvs_open(const char *ns, int mode, nvs_handle_t *handle)
+esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *handle)
 { assert(!strcmp(ns, "pc_remote")); *handle = mode; return ESP_OK; }
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *data, size_t *size)
 {
@@ -184,6 +184,14 @@ int main(void)
     sample_after(20);
     sample_after(20);
     assert(moves == 2 && motion_queued);
+    imu.gyro_calibrating = true;
+    app_pc_remote_get_status(&status);
+    assert(!status.gyro_calibrated);
+    sample_after(20);
+    assert(moves == 2 && !motion_queued && queued_clicks == 1);
+    imu.gyro_calibrating = false;
+    sample_after(20);
+    assert(moves == 2 && !motion_queued);
     app_pc_remote_leave();
     assert(interest == 0 && !hid.requested && !hid.connected && !queued_clicks && !motion_queued);
     power_status.shutdown_state = APP_POWER_SHUTDOWN_PREPARING;
@@ -205,6 +213,6 @@ int main(void)
     sample_after(20);
     assert(moves == 3 && motion_queued);
     app_pc_remote_leave();
-    puts("PASS air-mouse calibration, hold timeout, exit with active motion, and fresh input after reopening");
+    puts("PASS air-mouse calibration, pending-motion cancellation, hold timeout and fresh input after reopening");
     return 0;
 }

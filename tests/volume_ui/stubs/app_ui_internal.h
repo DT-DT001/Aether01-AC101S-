@@ -31,6 +31,7 @@ void app_ui_set_timer(app_ui_t *,lv_timer_cb_t,uint32_t);
 void app_ui_request_io_ex(app_ui_t *,const app_io_request_t *,void (*)(app_ui_t *,const app_io_result_t *));
 void app_open_settings(app_ui_t *);
 void app_open_music(app_ui_t *);
+void app_open_music_path(app_ui_t *, const char *);
 void app_open_usb(app_ui_t *);
 esp_err_t app_ui_usb_set_enabled(app_ui_t *,bool);
 void app_usb_storage_notice(app_ui_t *);

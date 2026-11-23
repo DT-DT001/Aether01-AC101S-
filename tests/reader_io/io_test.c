@@ -1,4 +1,6 @@
 #define _DEFAULT_SOURCE
+static char gallery_usb_root[] = "/tmp/aether-gallery-usb-XXXXXX";
+#define AETHER_USB_STORAGE_MOUNT_POINT gallery_usb_root
 #include "../../main/app_io.c"
 #include <assert.h>
 
@@ -60,10 +62,53 @@ static unsigned storage_acquires, root_selections;
 static bool switch_root_after_selection;
 const char *aether_media_fs_default_root(aether_storage_handle_t h){(void)h;++root_selections;return switch_root_after_selection&&root_selections>1?"/usb":"/sdcard";}
 
+static bool gallery_usb_ready, gallery_advance_generation_on_release;
+static uint32_t gallery_usb_generation;
+static char file_tf_root[] = "/tmp/aether-files-tf-XXXXXX";
+static char file_usb_root[] = "/tmp/aether-files-usb-XXXXXX";
+static uint32_t file_tf_generation = 3, file_usb_generation = 7;
+
+static const char *test_path_suffix(const char *path, const char *root)
+{
+    const size_t length = strlen(root);
+    return path && !strncmp(path, root, length) && (!path[length] || path[length] == '/') ? path + length : NULL;
+}
+
+bool aether_media_fs_safe_path(const char *path)
+{
+    if (tf_media_safe_path(path)) return true;
+    const char *suffix = test_path_suffix(path, file_tf_root);
+    if (!suffix) suffix = test_path_suffix(path, file_usb_root);
+    if (!suffix) return false;
+    char sandbox_path[192];
+    const int length = snprintf(sandbox_path, sizeof(sandbox_path), "/sdcard%s", suffix);
+    return length > 0 && (size_t)length < sizeof(sandbox_path) && tf_media_safe_path(sandbox_path);
+}
+
+esp_err_t aether_media_fs_acquire(aether_storage_handle_t storage, const char *path, aether_media_fs_lease_t *lease)
+{
+    const esp_err_t error = tf_media_acquire(storage, path, lease);
+    if (error == ESP_OK && test_path_suffix(path, file_usb_root)) lease->tf = NULL;
+    return error;
+}
+
+bool aether_media_fs_path_ready(aether_storage_handle_t storage, const char *path)
+{ return storage != NULL && !strcmp(path, gallery_usb_root) && gallery_usb_ready; }
+uint32_t aether_media_fs_generation(aether_storage_handle_t storage, const char *path)
+{
+    if (test_path_suffix(path, file_tf_root)) return file_tf_generation;
+    if (test_path_suffix(path, file_usb_root)) return file_usb_generation;
+    return storage != NULL && !strcmp(path, gallery_usb_root) ? gallery_usb_generation : 0;
+}
 bool aether_storage_card_inserted(aether_storage_handle_t storage) { (void)storage; return true; }
+bool aether_storage_is_mounted(aether_storage_handle_t storage) { return storage != NULL; }
 esp_err_t aether_storage_acquire(aether_storage_handle_t storage, uint32_t timeout)
 { (void)storage; (void)timeout; if(acquire_requires_drained)assert(atomic_load(&acquire_requires_drained->media_release_requested)==atomic_load(&acquire_requires_drained->media_release_completed)); ++storage_acquires; return ESP_OK; }
-void aether_storage_release(aether_storage_handle_t storage) { (void)storage; }
+void aether_storage_release(aether_storage_handle_t storage)
+{
+    (void)storage;
+    if (gallery_advance_generation_on_release) ++gallery_usb_generation;
+}
 static aether_audio_player_status_t audio_status;
 static aether_video_status_t video_status;
 static aether_nes_status_t nes_status;
@@ -278,6 +323,116 @@ static void test_usb_and_shutdown(app_io_handle_t io, const char *path)
     puts("PASS shutdown save failure retains RAM, one shared stop deadline bounds every media owner, and cancellation cannot stop a later USB session");
 }
 
+#include "gallery_catalog_cases.h"
+
+static app_io_result_t run_file_job(app_io_handle_t io, app_io_request_t *request)
+{
+    request->generation = atomic_load(&io->latest_generation) + 1U;
+    assert(app_io_submit_request(io, request) == ESP_OK);
+    io_request_t queued;
+    assert(xQueueReceive(io->requests, &queued, 0) == pdTRUE);
+    perform_queued_request(io, &queued);
+    app_io_result_t result;
+    assert(app_io_poll(io, &result));
+    assert(result.operation == request->operation && !io->media_lease.held);
+    return result;
+}
+
+static void detach_copy_target(void)
+{
+    ++file_usb_generation;
+    delay_hook = NULL;
+}
+
+static void test_file_operations(app_io_handle_t io)
+{
+    assert(mkdtemp(file_tf_root) && mkdtemp(file_usb_root));
+    char nested[256], original[256], local[256], remote[256];
+    fixture_path(nested, file_tf_root, "旅行");
+    assert(!mkdir(nested, 0700));
+    fixture_path(original, nested, "作业.TXT");
+    fixture_path(local, file_tf_root, "Copy.txt");
+    fixture_path(remote, file_usb_root, "作业.TXT");
+    assert(strlen(original) < 192 && strlen(local) < 192 && strlen(remote) < 192);
+    static const char text[] = "File manager fixture\n";
+    write_photo_fixture(nested, "作业.TXT", text, sizeof(text), 1234);
+
+    app_io_request_t job = {.operation = APP_IO_SEARCH_FILES, .media_generation = file_tf_generation, .limit = 16};
+    strlcpy(job.path, file_tf_root, sizeof(job.path));
+    strlcpy(job.query, "作业.txt", sizeof(job.query));
+    app_io_result_t result = run_file_job(io, &job);
+    assert(result.error == ESP_OK && result.count == 1 && !result.truncated);
+    assert(!strcmp(result.entries[0].path, original) && result.entries[0].size == sizeof(text));
+    assert(result.entries[0].modified_s == 1234);
+    app_io_result_free(&result);
+
+    job.operation = APP_IO_COPY_FILE;
+    job.destination_generation = file_tf_generation;
+    strlcpy(job.path, original, sizeof(job.path));
+    strlcpy(job.destination, local, sizeof(job.destination));
+    result = run_file_job(io, &job);
+    assert(result.error == ESP_OK && !result.target_exists && access(original, F_OK) == 0);
+    FILE *copy = fopen(local, "rb");
+    char contents[sizeof(text)];
+    assert(copy && fread(contents, 1, sizeof(contents), copy) == sizeof(contents) && !fclose(copy));
+    assert(memcmp(contents, text, sizeof(contents)) == 0);
+
+    result = run_file_job(io, &job);
+    assert(result.error == ESP_ERR_INVALID_STATE && result.target_exists && access(original, F_OK) == 0);
+    write_photo_fixture(file_usb_root, "作业.TXT", "existing", 8, 100);
+    job.operation = APP_IO_MOVE_FILE;
+    job.destination_generation = file_usb_generation;
+    strlcpy(job.destination, remote, sizeof(job.destination));
+    result = run_file_job(io, &job);
+    assert(result.target_exists && access(original, F_OK) == 0 && !unlink(remote));
+    result = run_file_job(io, &job);
+    assert(result.error == ESP_OK && access(original, F_OK) == -1 && access(remote, F_OK) == 0);
+
+    job.operation = APP_IO_DELETE_FILE;
+    strlcpy(job.path, nested, sizeof(job.path));
+    result = run_file_job(io, &job);
+    assert(result.error == ESP_ERR_INVALID_ARG && access(nested, F_OK) == 0);
+    snprintf(job.path, sizeof(job.path), "%s/../retained", file_tf_root);
+    assert(app_io_submit_request(io, &job) == ESP_ERR_INVALID_ARG);
+    strlcpy(job.path, remote, sizeof(job.path));
+    job.media_generation = file_usb_generation - 1;
+    result = run_file_job(io, &job);
+    assert(result.error == ESP_ERR_INVALID_STATE && access(remote, F_OK) == 0);
+    job.media_generation = file_usb_generation;
+    usb_status.active = true;
+    assert(app_io_submit_request(io, &job) == ESP_ERR_INVALID_STATE);
+    usb_status.active = false;
+    result = run_file_job(io, &job);
+    assert(result.error == ESP_OK && access(remote, F_OK) == -1);
+    result = run_file_job(io, &job);
+    assert(result.error == ESP_ERR_NOT_FOUND);
+
+    FILE *large = fopen(original, "wb");
+    assert(large);
+    char block[1024] = {0};
+    for (unsigned i = 0; i < 256; ++i) assert(fwrite(block, 1, sizeof(block), large) == sizeof(block));
+    assert(!fclose(large));
+    job.operation = APP_IO_MOVE_FILE;
+    strlcpy(job.path, original, sizeof(job.path));
+    job.media_generation = file_tf_generation;
+    job.destination_generation = file_usb_generation;
+    delay_hook = detach_copy_target;
+    result = run_file_job(io, &job);
+    assert(!delay_hook && result.error == ESP_ERR_INVALID_STATE && access(original, F_OK) == 0 && access(remote, F_OK) == -1);
+    DIR *directory = opendir(file_usb_root);
+    assert(directory);
+    struct dirent *remaining;
+    while ((remaining = readdir(directory)) != NULL) {
+        if (!copy_temporary_name(remaining->d_name)) continue;
+        char part[256];
+        fixture_path(part, file_usb_root, remaining->d_name);
+        assert(!unlink(part));
+    }
+    assert(!closedir(directory));
+    assert(!unlink(original) && !unlink(local) && !rmdir(nested) && !rmdir(file_tf_root) && !rmdir(file_usb_root));
+    puts("PASS Files worker recursive UTF-8/case-insensitive search, details, copy bytes, cross-volume move, collisions, disconnect, invalid paths and gated deletion");
+}
+
 int main(void)
 {
     assert(safe_path("/sdcard") && safe_path("/sdcard/Books/小说.txt"));
@@ -452,6 +607,8 @@ int main(void)
     app_io_result_t drained_result;assert(app_io_poll(io,&drained_result));app_io_result_free(&drained_result);
     puts("PASS a close published while IO queue sleeps is drained again after dequeue; new-page filesystem work cannot bypass cleanup");
     puts("PASS page-exit cleanup retains owner through failure/backoff, releases frames only after drain, and prepares music playlists outside GUI with stale-generation rejection");
+    test_gallery_catalog(io);
+    test_file_operations(io);
     test_usb_and_shutdown(io,path);
     destroy_io(io);
     init_error = ESP_FAIL; assert(app_io_start((void *)1, NULL, NULL, NULL, &io) == ESP_OK);

@@ -11,18 +11,22 @@ cached=root/'build/host_reader_ui'
 out=root/'build/host_motion_ui'
 out.mkdir(parents=True,exist_ok=True)
 lvgl=root/'managed_components/lvgl__lvgl'
-includes=[test/'stubs',root/'components/qmi8658a/include',reader/'stubs',reader,root/'main',lvgl]
+includes=[test/'stubs',root/'components/qmi8658a/include',reader/'stubs',reader,
+          root/'tests/pc_remote_ui/stubs',root/'main',root/'main/ui',lvgl]
 flags=['gcc','-std=c11','-O0','-g','-ffunction-sections','-fdata-sections',
-       '-DLV_CONF_INCLUDE_SIMPLE','-DLV_CONF_SUPPRESS_DEFINE_CHECK=1','-D_DEFAULT_SOURCE',
+       '-DLV_CONF_INCLUDE_SIMPLE','-DLV_CONF_SUPPRESS_DEFINE_CHECK=1','-D_DEFAULT_SOURCE','-DLV_FONT_MONTSERRAT_28=1',
        *['-I'+str(p) for p in includes]]
 objects=[]
 for source in [*sorted((lvgl/'src').rglob('*.c')),root/'main/assets/font_16.c',root/'main/assets/font_24.c']:
     obj=cached/(str(source.relative_to(root)).replace('/','_')+'.o')
-    if not obj.exists() or obj.stat().st_mtime<max(source.stat().st_mtime,(reader/'lv_conf.h').stat().st_mtime):
+    timestamp=max(source.stat().st_mtime,(reader/'lv_conf.h').stat().st_mtime)
+    if source.name == 'lv_font_montserrat_28.c' or not obj.exists() or obj.stat().st_mtime<timestamp:
         obj=out/obj.name
-        subprocess.run(flags+['-c',str(source),'-o',str(obj)],check=True)
+        if not obj.exists() or obj.stat().st_mtime<timestamp:
+            subprocess.run(flags+['-c',str(source),'-o',str(obj)],check=True)
     objects.append(obj)
-for source in [root/'main/apps/app_motion.c',root/'main/app_motion_filter.c',test/'smoke.c']:
+for source in [root/'main/apps/app_motion.c',root/'main/app_motion_filter.c',
+               root/'main/ui/app_ui_gyro_calibration.c',root/'main/ui/app_ui_modal.c',test/'smoke.c']:
     obj=out/(source.stem+'.o')
     subprocess.run(flags+['-Wall','-Wextra','-Werror','-c',str(source),'-o',str(obj)],check=True)
     objects.append(obj)

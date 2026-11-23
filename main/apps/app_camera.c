@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "app_ui_internal.h"
+#include "app_catalog_ui.h"
 #include "app_otg.h"
 #include "aether_usb_camera.h"
 #include "aether_camera_record.h"
@@ -36,7 +37,7 @@ typedef enum {
 
 typedef struct {
     app_ui_t *ui;
-    lv_obj_t *image, *state, *detail, *notice, *modes, *photo, *record, *record_label;
+    lv_obj_t *image, *placeholder, *state, *detail, *notice, *modes, *photo, *record, *record_label;
     SemaphoreHandle_t preview_lock;
     atomic_uint refs;
     atomic_uint preview_generation, mode_epoch;
@@ -591,7 +592,7 @@ static void camera_tick(lv_timer_t *timer)
     else if (app_io_usb_storage_blocked(ui->io)) app_ui_label_text(page->state, "请先退出 USB 文件传输");
     else if (!host.active && power_error != ESP_OK)
         app_ui_label_fmt(page->state, "OTG 启动 · %s", esp_err_to_name(power_error));
-    else if (!host.active) app_ui_label_text(page->state, "等待 CC 检测 · 请接入 USB 摄像头");
+    else if (!host.active) app_ui_label_text(page->state, "请接入 USB 摄像头");
     else if (!camera_session) app_ui_label_text(page->state, "请接入 USB 摄像头");
     else if (!camera_host) app_ui_label_text(page->state, "正在切换摄像头模式…");
     else if (camera.installed && !camera.usb_enumerated && !camera.connected)
@@ -605,10 +606,13 @@ static void camera_tick(lv_timer_t *timer)
     else if (!camera.mode_count) app_ui_label_text(page->state, "摄像头没有可用的 MJPEG / YUY2 模式");
     else if (!ready) app_ui_label_text(page->state, "正在等待预览画面…");
     else if (recording) app_ui_label_text(page->state, "● 正在录像");
-    else if (!tf_ready) app_ui_label_text(page->state, "预览中 · 插入 TF 卡后可拍摄");
-    else app_ui_label_text(page->state, "预览中");
+    else if (!tf_ready) app_ui_label_text(page->state, "插入 TF 卡后可拍摄");
+    else app_ui_label_text(page->state, "");
 
-    if (host.active && camera.error != ESP_OK && camera.failure != AETHER_USB_CAMERA_FAILURE_NONE) {
+    const bool show_detail = host.active && camera.error != ESP_OK && camera.failure != AETHER_USB_CAMERA_FAILURE_NONE;
+    if (ready || show_detail) lv_obj_add_flag(page->placeholder, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(page->placeholder, LV_OBJ_FLAG_HIDDEN);
+    if (show_detail) {
         lv_obj_remove_flag(page->detail, LV_OBJ_FLAG_HIDDEN);
         if (camera.failure == AETHER_USB_CAMERA_FAILURE_FRAMES) {
             const aether_usb_camera_rx_status_t *rx = &camera.rx;
@@ -629,8 +633,8 @@ static void camera_tick(lv_timer_t *timer)
     } else lv_obj_add_flag(page->detail, LV_OBJ_FLAG_HIDDEN);
 
     switch ((capture_notice_t)atomic_exchange(&page->notice_code, CAPTURE_NONE)) {
-    case CAPTURE_PHOTO_SAVED: app_ui_label_text(page->notice, "照片已保存到 TF 卡 /DCIM"); break;
-    case CAPTURE_VIDEO_SAVED: app_ui_label_text(page->notice, "录像已保存到 TF 卡 /DCIM"); break;
+    case CAPTURE_PHOTO_SAVED: app_ui_label_text(page->notice, "照片已保存 · DCIM"); break;
+    case CAPTURE_VIDEO_SAVED: app_ui_label_text(page->notice, "录像已保存 · DCIM"); break;
     case CAPTURE_VIDEO_INTERRUPTED: app_ui_label_text(page->notice, "录像中断，已保存录到的片段"); break;
     case CAPTURE_TF_ERROR: app_ui_label_text(page->notice, "保存失败，请检查 TF 卡"); break;
     case CAPTURE_FRAME_ERROR: app_ui_label_text(page->notice, "拍摄中断，未收到可保存的画面"); break;
@@ -673,9 +677,7 @@ static lv_obj_t *button(camera_page_t *page, lv_obj_t *parent, const char *name,
     lv_obj_t *obj = lv_button_create(parent);
     lv_obj_set_size(obj, 106, 44);
     lv_obj_set_pos(obj, x, 312);
-    lv_obj_set_style_radius(obj, 14, 0);
-    lv_obj_set_style_bg_color(obj, lv_color_hex(color), 0);
-    lv_obj_set_style_shadow_width(obj, 0, 0);
+    app_catalog_control(obj, color);
     lv_obj_add_event_cb(obj, callback, LV_EVENT_CLICKED, page);
     lv_obj_t *text = app_ui_add_text(obj, name, LV_ALIGN_CENTER, 0, 0, 0xf3f7ff, NULL);
     if (label) *label = text;
@@ -718,20 +720,31 @@ void app_open_camera(app_ui_t *ui)
     lv_image_set_inner_align(page->image, LV_IMAGE_ALIGN_CONTAIN);
     lv_obj_add_flag(page->image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_center(page->image);
+    page->placeholder = app_ui_add_text(preview, LV_SYMBOL_VIDEO, LV_ALIGN_CENTER, 0, 0,
+                                       0x467990, &lv_font_montserrat_48);
     page->detail = app_ui_add_text(preview, "", LV_ALIGN_CENTER, 0, 0, 0xbfcee6, NULL);
+    lv_obj_set_width(page->detail, 416);
     lv_obj_set_style_text_align(page->detail, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_flag(page->detail, LV_OBJ_FLAG_HIDDEN);
     page->state = app_ui_add_text(content, "正在准备摄像头…", LV_ALIGN_TOP_MID, 0, 284, 0xbfcee6, NULL);
+    lv_obj_set_size(page->state, 418, 22);
+    lv_label_set_long_mode(page->state, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(page->state, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_ext_click_area(page->state, 8);
     lv_obj_add_event_cb(page->state, mode_changed, LV_EVENT_CLICKED, page);
-    page->notice = app_ui_add_text(content, "照片和录像保存到 TF 卡 /DCIM", LV_ALIGN_TOP_MID, 0, 368, 0x8296b5, NULL);
+    page->notice = app_ui_add_text(content, "", LV_ALIGN_TOP_MID, 0, 368, 0xacbfd7, NULL);
     page->modes = lv_dropdown_create(content);
     lv_dropdown_set_options(page->modes, "分辨率");
     lv_obj_set_size(page->modes, 192, 44);
     lv_obj_set_pos(page->modes, 12, 312);
+    app_catalog_control(page->modes, 0x20344C);
+    lv_obj_set_style_pad_top(page->modes, 11, 0);
+    lv_obj_set_style_text_font(page->modes, app_ui_chinese_font(), 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(page->modes), app_ui_chinese_font(), 0);
     lv_obj_add_event_cb(page->modes, mode_changed, LV_EVENT_VALUE_CHANGED, page);
     enable(page->modes, false);
-    page->photo = button(page, content, "拍照", 212, 0x285471, take_photo, NULL);
-    page->record = button(page, content, "录像", 326, 0x813644, toggle_recording, &page->record_label);
+    page->photo = button(page, content, "拍照", 212, 0x2C576C, take_photo, NULL);
+    page->record = button(page, content, "录像", 326, 0x71394D, toggle_recording, &page->record_label);
     app_ui_set_timer(ui, camera_tick, 33);
     camera_tick(ui->timer);
 }

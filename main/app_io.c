@@ -1,6 +1,8 @@
 #include "aether_media_fs.h"
+#include "aether_image.h"
 #include "aether_usb_bus.h"
 #include "app_io.h"
+#include "app_gallery_format.h"
 #include "app_intercom.h"
 #include "app_text.h"
 #include "app_reader_file.h"
@@ -8,12 +10,15 @@
 #include "aether_usb_msc.h"
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -26,6 +31,13 @@
 
 #define CATALOG_MAX 4096U
 #define CATALOG_PAGE 256U
+#define FILE_COPY_BLOCK 16384U
+#define FILE_COPY_TEMP_PREFIX ".aether-copy-"
+#define GALLERY_MAX_DIRS 512U
+#define GALLERY_MAX_ENTRIES_PER_ROOT 32768U
+#ifndef AETHER_USB_STORAGE_MOUNT_POINT
+#define AETHER_USB_STORAGE_MOUNT_POINT "/usb"
+#endif
 #define TEXT_MAX 32768U
 
 typedef struct { app_io_request_t request; uint32_t id; } io_request_t;
@@ -94,6 +106,37 @@ static int entry_compare(const void *a, const void *b)
     return strcasecmp(l->path, r->path);
 }
 
+static uint32_t modified_seconds(const struct stat *info)
+{
+    if (info->st_mtime <= 0) return 0;
+    return (uint64_t)info->st_mtime > UINT32_MAX ? UINT32_MAX : (uint32_t)info->st_mtime;
+}
+
+static esp_err_t append_catalog_entry(app_io_result_t *r, size_t *capacity, size_t limit,
+                                      const app_io_entry_t *item)
+{
+    ++r->total_count;
+    if (r->count >= limit) {
+        r->truncated = true;
+        return ESP_OK;
+    }
+    if (r->count == *capacity) {
+        size_t next = *capacity ? *capacity * 2 : 32;
+        if (next > limit) next = limit;
+        void *memory = heap_caps_realloc(r->entries, next * sizeof(*item), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!memory) return ESP_ERR_NO_MEM;
+        r->entries = memory;
+        *capacity = next;
+    }
+    r->entries[r->count++] = *item;
+    return ESP_OK;
+}
+
+static bool copy_temporary_name(const char *name)
+{
+    return !strncasecmp(name, FILE_COPY_TEMP_PREFIX, sizeof(FILE_COPY_TEMP_PREFIX) - 1U);
+}
+
 static esp_err_t scan_directory(app_io_handle_t io, const char *directory,
                                 app_io_operation_t filter, app_io_result_t *r, size_t *capacity)
 {
@@ -106,28 +149,228 @@ static esp_err_t scan_directory(app_io_handle_t io, const char *directory,
         if (!request_current(io, r) || app_io_usb_storage_blocked(io) ||
             !aether_media_fs_available(&io->media_lease)) { error = ESP_ERR_INVALID_STATE; break; }
         if ((++scanned & 31U) == 0) vTaskDelay(1);
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") || copy_temporary_name(entry->d_name)) continue;
         app_io_entry_t item = {0};
         int length = snprintf(item.path, sizeof(item.path), "%s/%s", directory, entry->d_name);
         if (length < 0 || (size_t)length >= sizeof(item.path)) { r->truncated = true; continue; }
         struct stat info;
         if (stat(item.path, &info)) continue;
         item.directory = S_ISDIR(info.st_mode);
-        if (item.directory ? filter != APP_IO_FILES && filter != APP_IO_IMAGES : !matches(entry->d_name, filter)) continue;
+        if (item.directory ? filter != APP_IO_FILES : !matches(entry->d_name, filter)) continue;
         item.size = item.directory ? 0 : (uint64_t)info.st_size;
-        ++r->total_count;
-        if (r->count >= CATALOG_MAX) { r->truncated = true; continue; }
-        if (r->count == *capacity) {
-            size_t next = *capacity ? *capacity * 2 : 32;
-            if (next > CATALOG_MAX) next = CATALOG_MAX;
-            void *memory = heap_caps_realloc(r->entries, next * sizeof(item), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!memory) { error = ESP_ERR_NO_MEM; break; }
-            r->entries = memory; *capacity = next;
-        }
-        r->entries[r->count++] = item;
+        item.modified_s = modified_seconds(&info);
+        error = append_catalog_entry(r, capacity, CATALOG_MAX, &item);
+        if (error != ESP_OK) break;
     }
     closedir(dir);
     return error;
+}
+
+static bool jpeg_photo_header(FILE *file, uint64_t length)
+{
+    if (length > AETHER_IMAGE_MAX_JPEG_BYTES || fgetc(file) != 0xff || fgetc(file) != 0xd8) return false;
+    uint64_t remaining = length - 2U;
+    /* Seek over metadata rather than reading it. Bound even malformed streams. */
+    for (unsigned segment = 0; segment < 64 && remaining >= 6; ++segment) {
+        if (fgetc(file) != 0xff) return false;
+        int marker = fgetc(file);
+        remaining -= 2U;
+        for (unsigned fill = 0; marker == 0xff && fill < 16 && remaining > 4U; ++fill) {
+            marker = fgetc(file);
+            --remaining;
+        }
+        if (marker <= 0 || marker == 0xff || marker == 0xd9 || marker == 0xda) return false;
+        const int high = fgetc(file), low = fgetc(file);
+        if (high < 0 || low < 0) return false;
+        const unsigned size = (unsigned)high << 8 | (unsigned)low;
+        if (size < 2 || size > remaining) return false;
+        if (marker == 0xc0) {
+            uint8_t header[9];
+            if (size < 2 + sizeof(header) || remaining < size + 4U ||
+                fread(header, 1, sizeof(header), file) != sizeof(header) || header[0] != 8) return false;
+            const unsigned components = header[5], sampling = header[7];
+            const unsigned height = (unsigned)header[1] << 8 | header[2];
+            const unsigned width = (unsigned)header[3] << 8 | header[4];
+            if ((components != 1 && components != 3) || size != 8U + 3U * components ||
+                (sampling != 0x11 && sampling != 0x21 && sampling != 0x22) ||
+                !width || width > 8192 || !height || height > 8192) return false;
+            const unsigned x = (sampling >> 4) * 8U, y = (sampling & 15U) * 8U;
+            return ((width + x - 1U) & ~(x - 1U)) * ((height + y - 1U) & ~(y - 1U)) <= 8U * 1024U * 1024U;
+        }
+        if (marker == 0xc2 || fseek(file, (long)size - 2L, SEEK_CUR)) return false;
+        remaining -= size;
+    }
+    return false;
+}
+
+static bool gallery_photo(const app_io_entry_t *item, bool *partial)
+{
+    if (item->size < 16) return false;
+    FILE *file = fopen(item->path, "rb");
+    if (!file) { *partial = true; return false; }
+    const char *ext = strrchr(item->path, '.');
+    bool valid;
+    if (ext && !strcasecmp(ext, ".bmp")) {
+        uint8_t header[54];
+        app_gallery_bmp_t bmp;
+        valid = item->size <= LONG_MAX && fread(header, 1, sizeof(header), file) == sizeof(header) &&
+                app_gallery_bmp_header(header, item->size, &bmp) == ESP_OK;
+    } else {
+        valid = jpeg_photo_header(file, item->size);
+    }
+    fclose(file);
+    return valid;
+}
+
+static int newest_photo(const void *a, const void *b)
+{
+    const app_io_entry_t *l = a, *r = b;
+    if (l->modified_s != r->modified_s) return l->modified_s > r->modified_s ? -1 : 1;
+    const int path = strcasecmp(l->path, r->path);
+    return path ? path : strcmp(l->path, r->path);
+}
+
+/* A max heap on the display ordering keeps the newest photos even when the
+ * directory order is unsorted or an additional storage root is scanned last. */
+static esp_err_t keep_gallery_photo(app_io_result_t *r, size_t *capacity, size_t limit,
+                                    const app_io_entry_t *item)
+{
+    ++r->total_count;
+    size_t index;
+    if (r->count < limit) {
+        if (r->count == *capacity) {
+            size_t next = *capacity ? *capacity * 2U : 32U;
+            if (next > limit) next = limit;
+            void *memory = heap_caps_realloc(r->entries, next * sizeof(*item), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!memory) return ESP_ERR_NO_MEM;
+            r->entries = memory;
+            *capacity = next;
+        }
+        index = r->count++;
+        while (index) {
+            const size_t parent = (index - 1U) / 2U;
+            if (newest_photo(item, &r->entries[parent]) <= 0) break;
+            r->entries[index] = r->entries[parent];
+            index = parent;
+        }
+    } else {
+        r->truncated = true;
+        if (newest_photo(item, &r->entries[0]) >= 0) return ESP_OK;
+        index = 0;
+        while (index * 2U + 1U < r->count) {
+            size_t child = index * 2U + 1U;
+            if (child + 1U < r->count && newest_photo(&r->entries[child + 1U], &r->entries[child]) > 0) ++child;
+            if (newest_photo(item, &r->entries[child]) >= 0) break;
+            r->entries[index] = r->entries[child];
+            index = child;
+        }
+    }
+    r->entries[index] = *item;
+    return ESP_OK;
+}
+
+typedef char gallery_path_t[sizeof(((app_io_entry_t *)0)->path)];
+
+static bool gallery_scan_current(app_io_handle_t io, const app_io_result_t *r)
+{
+    return request_current(io, r) && !app_io_usb_storage_blocked(io) && aether_media_fs_available(&io->media_lease);
+}
+
+/* A bounded breadth-first queue needs only one open directory and one open
+ * image file, leaving handle capacity for simultaneous music/recording. */
+static esp_err_t scan_gallery_root(app_io_handle_t io, const char *root, gallery_path_t *directories,
+                                   app_io_result_t *r, size_t *capacity, size_t limit)
+{
+    if (strlcpy(directories[0], root, sizeof(*directories)) >= sizeof(*directories)) return ESP_ERR_INVALID_ARG;
+    size_t queued = 1;
+    unsigned examined = 0;
+    for (size_t next = 0; next < queued; ++next) {
+        if (!gallery_scan_current(io, r)) return ESP_ERR_INVALID_STATE;
+        DIR *dir = opendir(directories[next]);
+        if (!dir) {
+            if (!next) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+            r->truncated = true;
+            continue;
+        }
+        esp_err_t error = ESP_OK;
+        while (gallery_scan_current(io, r)) {
+            errno = 0;
+            struct dirent *entry = readdir(dir);
+            if (!entry) { if (errno) r->truncated = true; break; }
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+#ifdef DT_LNK
+            if (entry->d_type == DT_LNK) continue;
+#endif
+            if (examined == GALLERY_MAX_ENTRIES_PER_ROOT) { r->truncated = true; break; }
+            if ((++examined & 31U) == 0) {
+                vTaskDelay(1);
+                if (!gallery_scan_current(io, r)) break;
+            }
+            app_io_entry_t item = {0};
+            const int length = snprintf(item.path, sizeof(item.path), "%s/%s", directories[next], entry->d_name);
+            if (length < 0 || (size_t)length >= sizeof(item.path) || strchr(entry->d_name, '\\')) {
+                r->truncated = true;
+                continue;
+            }
+            struct stat info;
+            if (stat(item.path, &info)) { r->truncated = true; continue; }
+            if (S_ISDIR(info.st_mode)) {
+                if (queued == GALLERY_MAX_DIRS) r->truncated = true;
+                else strlcpy(directories[queued++], item.path, sizeof(*directories));
+                continue;
+            }
+            if (!S_ISREG(info.st_mode) || info.st_size <= 0 || !matches(entry->d_name, APP_IO_IMAGES)) continue;
+            item.size = (uint64_t)info.st_size;
+            item.modified_s = modified_seconds(&info);
+            if (!gallery_photo(&item, &r->truncated)) continue;
+            error = keep_gallery_photo(r, capacity, limit, &item);
+            if (error != ESP_OK) break;
+        }
+        closedir(dir);
+        if (error != ESP_OK) return error;
+        if (!gallery_scan_current(io, r)) return ESP_ERR_INVALID_STATE;
+        if (examined == GALLERY_MAX_ENTRIES_PER_ROOT) {
+            if (next + 1U < queued) r->truncated = true;
+            break;
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t gallery_catalog(app_io_handle_t io, const app_io_request_t *q, app_io_result_t *r)
+{
+    if (q->path[0] || q->offset) return ESP_ERR_INVALID_ARG;
+    static const char *const roots[] = {AETHER_STORAGE_MOUNT_POINT, AETHER_USB_STORAGE_MOUNT_POINT};
+    const size_t limit = q->limit && q->limit < CATALOG_MAX ? q->limit : CATALOG_MAX;
+    gallery_path_t *directories = heap_caps_malloc(GALLERY_MAX_DIRS * sizeof(*directories), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!directories) return ESP_ERR_NO_MEM;
+    size_t capacity = 0;
+    bool read_root = false;
+    esp_err_t first_error = ESP_OK;
+    for (unsigned i = 0; i < sizeof(roots) / sizeof(roots[0]); ++i) {
+        if (!request_current(io, r) || app_io_usb_storage_blocked(io)) { first_error = ESP_ERR_INVALID_STATE; break; }
+        const char *root = roots[i];
+        if (!aether_media_fs_path_ready(io->storage, root)) continue;
+        const uint32_t generation = aether_media_fs_generation(io->storage, root);
+        esp_err_t error = aether_media_fs_acquire(io->storage, root, &io->media_lease);
+        if (error == ESP_OK) {
+            error = scan_gallery_root(io, root, directories, r, &capacity, limit);
+            aether_media_fs_release(&io->media_lease);
+        }
+        if (aether_media_fs_generation(io->storage, root) != generation) error = ESP_ERR_INVALID_STATE;
+        if (error == ESP_OK) read_root = true;
+        else if (error == ESP_ERR_INVALID_STATE || error == ESP_ERR_NO_MEM) { first_error = error; break; }
+        else {
+            r->truncated = true;
+            if (first_error == ESP_OK) first_error = error;
+        }
+    }
+    free(directories);
+    if (!read_root || first_error == ESP_ERR_INVALID_STATE || first_error == ESP_ERR_NO_MEM)
+        return first_error == ESP_OK ? ESP_ERR_NOT_FOUND : first_error;
+    if (r->count) qsort(r->entries, r->count, sizeof(*r->entries), newest_photo);
+    r->next_offset = r->count;
+    return ESP_OK;
 }
 
 static esp_err_t catalog(app_io_handle_t io, const app_io_request_t *q, app_io_result_t *r, const char *leased_root)
@@ -338,11 +581,217 @@ static esp_err_t prepare_music_playlist(app_io_handle_t io, const app_io_request
     return error;
 }
 
+static bool filename_contains(const char *name, const char *query)
+{
+    const size_t length = strlen(query);
+    for (; *name; ++name) if (!strncasecmp(name, query, length)) return true;
+    return false;
+}
+
+/* Only one directory handle stays open. A broad search returns a partial
+ * result instead of using the entire card as a work queue. */
+static esp_err_t search_filenames(app_io_handle_t io, const app_io_request_t *q, app_io_result_t *r)
+{
+    gallery_path_t *directories = heap_caps_malloc(GALLERY_MAX_DIRS * sizeof(*directories),
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!directories) return ESP_ERR_NO_MEM;
+    strlcpy(directories[0], q->path, sizeof(*directories));
+    const size_t limit = q->limit && q->limit < CATALOG_MAX ? q->limit : CATALOG_MAX;
+    size_t queued = 1, capacity = 0;
+    unsigned examined = 0;
+    esp_err_t error = ESP_OK;
+    for (size_t next = 0; next < queued && error == ESP_OK && examined < GALLERY_MAX_ENTRIES_PER_ROOT; ++next) {
+        if (!gallery_scan_current(io, r)) { error = ESP_ERR_INVALID_STATE; break; }
+        DIR *dir = opendir(directories[next]);
+        if (!dir) {
+            if (!next) { error = errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL; break; }
+            r->truncated = true;
+            continue;
+        }
+        while (gallery_scan_current(io, r)) {
+            errno = 0;
+            struct dirent *entry = readdir(dir);
+            if (!entry) { if (errno) r->truncated = true; break; }
+            const char *name = entry->d_name;
+            if (!strcmp(name, ".") || !strcmp(name, "..") || copy_temporary_name(name)) continue;
+#ifdef DT_LNK
+            if (entry->d_type == DT_LNK) continue;
+#endif
+            if ((++examined & 31U) == 0) vTaskDelay(1);
+            app_io_entry_t item = {0};
+            const int length = snprintf(item.path, sizeof(item.path), "%s/%s", directories[next], name);
+            if (length < 0 || (size_t)length >= sizeof(item.path) || strchr(name, '\\')) r->truncated = true;
+            else {
+                struct stat info;
+                if (!stat(item.path, &info)) {
+                    item.directory = S_ISDIR(info.st_mode);
+                    if (item.directory) {
+                        if (queued == GALLERY_MAX_DIRS) r->truncated = true;
+                        else strlcpy(directories[queued++], item.path, sizeof(*directories));
+                    }
+                    if ((item.directory || S_ISREG(info.st_mode)) && filename_contains(name, q->query)) {
+                        item.size = item.directory ? 0 : (uint64_t)info.st_size;
+                        item.modified_s = modified_seconds(&info);
+                        error = append_catalog_entry(r, &capacity, limit, &item);
+                    }
+                } else r->truncated = true;
+            }
+            if (error != ESP_OK || examined == GALLERY_MAX_ENTRIES_PER_ROOT) break;
+        }
+        closedir(dir);
+        if (!gallery_scan_current(io, r)) error = ESP_ERR_INVALID_STATE;
+    }
+    free(directories);
+    if (examined == GALLERY_MAX_ENTRIES_PER_ROOT) r->truncated = true;
+    if (error == ESP_OK && r->count) qsort(r->entries, r->count, sizeof(*r->entries), entry_compare);
+    r->next_offset = r->count;
+    return error;
+}
+
+static bool file_operation_current(app_io_handle_t io, const app_io_request_t *q,
+                                   const app_io_result_t *r, const aether_media_fs_lease_t *target)
+{
+    return gallery_scan_current(io, r) && aether_media_fs_generation(io->storage, q->path) == q->media_generation &&
+        (!target || (aether_media_fs_available(target) &&
+                     aether_media_fs_generation(io->storage, q->destination) == q->destination_generation));
+}
+
+static esp_err_t file_errno(int error)
+{
+    if (error == ENOENT || error == ENOTDIR) return ESP_ERR_NOT_FOUND;
+    if (error == EACCES || error == EPERM || error == EROFS) return ESP_ERR_NOT_SUPPORTED;
+    return ESP_FAIL;
+}
+
+static esp_err_t destination_available(const char *path, app_io_result_t *r)
+{
+    struct stat existing;
+    if (stat(path, &existing) == 0) {
+        r->target_exists = true;
+        return ESP_ERR_INVALID_STATE;
+    }
+    return errno == ENOENT ? ESP_OK : file_errno(errno);
+}
+
+static esp_err_t publish_file(const char *path, const char *destination, app_io_result_t *r)
+{
+    const esp_err_t error = destination_available(destination, r);
+    if (error != ESP_OK) return error;
+    if (rename(path, destination) == 0) return ESP_OK;
+    /* FAT rename fails with FR_EXIST if another creator won the race. */
+    if (errno == EEXIST) { r->target_exists = true; return ESP_ERR_INVALID_STATE; }
+    return file_errno(errno);
+}
+
+static int open_copy_temporary(const char *destination, uint32_t id, char path[192])
+{
+    const char *slash = strrchr(destination, '/');
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        const int length = snprintf(path, 192, "%.*s/" FILE_COPY_TEMP_PREFIX "%08lx-%x.part",
+                                    (int)(slash - destination), destination, (unsigned long)id, attempt);
+        if (length < 0 || length >= 192) { errno = ENAMETOOLONG; return -1; }
+        const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd >= 0 || errno != EEXIST) return fd;
+    }
+    return -1;
+}
+
+static esp_err_t copy_media_file(app_io_handle_t io, const app_io_request_t *q, app_io_result_t *r,
+                                 const aether_media_fs_lease_t *target, uint64_t expected_bytes)
+{
+    void *buffer = heap_caps_malloc(FILE_COPY_BLOCK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buffer) return ESP_ERR_NO_MEM;
+    char temporary[192];
+    const int input = open(q->path, O_RDONLY);
+    const int output = input < 0 ? -1 : open_copy_temporary(q->destination, r->request_id, temporary);
+    esp_err_t error = output < 0 ? file_errno(errno) : ESP_OK;
+    uint64_t copied = 0;
+    unsigned blocks = 0;
+    while (error == ESP_OK) {
+        if (!file_operation_current(io, q, r, target)) { error = ESP_ERR_INVALID_STATE; break; }
+        const ssize_t bytes = read(input, buffer, FILE_COPY_BLOCK);
+        if (bytes == 0) break;
+        if (bytes < 0) {
+            if (errno == EINTR) continue;
+            error = file_errno(errno);
+            break;
+        }
+        ssize_t written = 0;
+        while (written < bytes) {
+            const ssize_t count = write(output, (const char *)buffer + written, (size_t)(bytes - written));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) { error = count ? file_errno(errno) : ESP_FAIL; break; }
+            written += count;
+        }
+        copied += (uint64_t)written;
+        if ((++blocks & 7U) == 0) vTaskDelay(1);
+    }
+    if (error == ESP_OK && (copied != expected_bytes || fsync(output) != 0)) error = ESP_FAIL;
+    if (output >= 0 && close(output) != 0 && error == ESP_OK) error = ESP_FAIL;
+    if (input >= 0) close(input);
+    free(buffer);
+    if (error == ESP_OK) error = file_operation_current(io, q, r, target) ?
+        publish_file(temporary, q->destination, r) : ESP_ERR_INVALID_STATE;
+    if (error != ESP_OK && output >= 0 && aether_media_fs_available(target) &&
+        aether_media_fs_generation(io->storage, q->destination) == q->destination_generation) unlink(temporary);
+    return error;
+}
+
+static bool file_operation_valid(const app_io_request_t *q)
+{
+    if (!safe_path(q->path)) return false;
+    if (q->operation == APP_IO_SEARCH_FILES) return q->query[0] && memchr(q->query, 0, sizeof(q->query));
+    if (copy_temporary_name(strrchr(q->path, '/') + 1)) return false;
+    if (q->operation == APP_IO_DELETE_FILE) return true;
+    return memchr(q->destination, 0, sizeof(q->destination)) && safe_path(q->destination) &&
+        !copy_temporary_name(strrchr(q->destination, '/') + 1) && strcasecmp(q->path, q->destination) != 0;
+}
+
+static esp_err_t operate_on_files(app_io_handle_t io, const app_io_request_t *q, app_io_result_t *r)
+{
+    if (!file_operation_valid(q)) return ESP_ERR_INVALID_ARG;
+    strlcpy(r->path, q->path, sizeof(r->path));
+    esp_err_t error = aether_media_fs_acquire(io->storage, q->path, &io->media_lease);
+    if (error != ESP_OK) return error;
+    aether_media_fs_lease_t target = {0};
+    if (!file_operation_current(io, q, r, NULL)) error = ESP_ERR_INVALID_STATE;
+    else if (q->operation == APP_IO_SEARCH_FILES) {
+        error = search_filenames(io, q, r);
+        if (error == ESP_OK && !file_operation_current(io, q, r, NULL)) error = ESP_ERR_INVALID_STATE;
+    } else {
+        struct stat info;
+        if (stat(q->path, &info)) error = file_errno(errno);
+        else if (!S_ISREG(info.st_mode)) error = ESP_ERR_INVALID_ARG;
+        else if (q->operation == APP_IO_DELETE_FILE) {
+            if (!file_operation_current(io, q, r, NULL)) error = ESP_ERR_INVALID_STATE;
+            else if (unlink(q->path) != 0) error = file_errno(errno);
+        } else {
+            error = aether_media_fs_acquire(io->storage, q->destination, &target);
+            if (error == ESP_OK && !file_operation_current(io, q, r, &target)) error = ESP_ERR_INVALID_STATE;
+            if (error == ESP_OK && q->operation == APP_IO_MOVE_FILE && target.tf == io->media_lease.tf) {
+                error = publish_file(q->path, q->destination, r);
+            } else if (error == ESP_OK) {
+                error = destination_available(q->destination, r);
+                if (error == ESP_OK) error = copy_media_file(io, q, r, &target, (uint64_t)info.st_size);
+                if (error == ESP_OK && q->operation == APP_IO_MOVE_FILE &&
+                    (!file_operation_current(io, q, r, &target) || unlink(q->path) != 0)) {
+                    r->source_retained = true;
+                    error = ESP_ERR_NOT_FINISHED;
+                }
+            }
+        }
+    }
+    aether_media_fs_release(&target);
+    aether_media_fs_release(&io->media_lease);
+    return error;
+}
+
 static esp_err_t perform_request(app_io_handle_t io, const app_io_request_t *q, app_io_result_t *r)
 {
     if (!request_current(io, r)) return ESP_ERR_INVALID_STATE;
     if (q->operation != APP_IO_READER_LOAD && app_io_usb_storage_blocked(io))
         return ESP_ERR_INVALID_STATE;
+    if (q->operation >= APP_IO_DELETE_FILE && q->operation <= APP_IO_SEARCH_FILES) return operate_on_files(io, q, r);
     if (q->operation == APP_IO_READER_LOAD) {
         if (!safe_path(q->path)) return ESP_ERR_INVALID_ARG;
         /* Closing and immediately reopening a book must observe the save
@@ -379,6 +828,7 @@ static esp_err_t perform_request(app_io_handle_t io, const app_io_request_t *q, 
     }
     if (!request_current(io, r)) return ESP_ERR_INVALID_STATE;
     if (app_io_usb_storage_blocked(io)) return ESP_ERR_INVALID_STATE;
+    if (media == APP_IO_IMAGES) return gallery_catalog(io, q, r);
     const char *source = q->operation == APP_IO_RECORDER ? AETHER_STORAGE_MOUNT_POINT :
         q->path[0] ? q->path : aether_media_fs_default_root(io->storage);
     ESP_RETURN_ON_ERROR(aether_media_fs_acquire(io->storage, source, &io->media_lease), "app_io", "storage unavailable");
@@ -649,8 +1099,9 @@ esp_err_t app_io_start(aether_storage_handle_t storage, aether_audio_player_hand
 
 esp_err_t app_io_submit_request(app_io_handle_t io, const app_io_request_t *q)
 {
-    if (!io || !q || q->operation < APP_IO_MUSIC || q->operation > APP_IO_RECORDER ||
+    if (!io || !q || q->operation < APP_IO_MUSIC || q->operation == APP_IO_IMAGES || q->operation > APP_IO_SEARCH_FILES ||
         !memchr(q->path, 0, sizeof(q->path))) return ESP_ERR_INVALID_ARG;
+    if (q->operation >= APP_IO_DELETE_FILE && !file_operation_valid(q)) return ESP_ERR_INVALID_ARG;
     if (q->operation == APP_IO_READER_SAVE) {
         if (!safe_path(q->path)) return ESP_ERR_INVALID_ARG;
         if (io->bookmark_init_error != ESP_OK) return io->bookmark_init_error;

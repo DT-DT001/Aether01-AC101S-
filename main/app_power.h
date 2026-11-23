@@ -43,7 +43,7 @@ typedef struct {
     uint32_t user_key_irq_tick;
     int64_t user_key_irq_at_us;
     void (*user_key_handler)(void *, int64_t);
-    void (*user_key_tap_handler)(void *, int64_t);
+    void (*user_key_press_handler)(void *, int64_t);
     void *user_key_context;
     uint32_t timeout_seconds;
     uint8_t brightness;
@@ -107,6 +107,7 @@ esp_err_t app_power_wake(app_power_t *manager);
  * original press timestamp so a new page cannot inherit an earlier hold.
  * A sleeping press wakes and is consumed. The TG29 key is independent. */
 esp_err_t app_power_set_user_key_handler(app_power_t *manager, void (*handler)(void *, int64_t), void *context);
-/* Optional release-time short action shares the user-key handler context.
- * A hold, a wake gesture or a blocked gesture suppresses this action. */
-esp_err_t app_power_set_user_key_tap_handler(app_power_t *manager, void (*handler)(void *, int64_t));
+/* Optional down-edge action shares the user-key handler context. An awake,
+ * unblocked press invokes it once while the key is still down. The regular
+ * two-second hold still dispatches independently. */
+esp_err_t app_power_set_user_key_press_handler(app_power_t *manager, void (*handler)(void *, int64_t));

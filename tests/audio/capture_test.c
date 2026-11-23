@@ -74,6 +74,51 @@ static struct read_step reads[8];
 static unsigned read_count, read_index;
 static size_t fill_offset;
 static unsigned board_writes;
+static int32_t mic_peak = 512;
+static int32_t mic_bias;
+static size_t mic_impulse = SIZE_MAX;
+static bool mic_noise;
+
+static int16_t mic_sample(size_t frame)
+{
+    if (frame == mic_impulse) return INT16_MIN;
+    if (mic_noise) {
+        uint32_t bits = UINT32_C(2654435761) * ((uint32_t)frame + 1);
+        bits = (bits ^ (bits >> 13)) * UINT32_C(2246822519);
+        const int32_t phase = (int32_t)((bits ^ (bits >> 16)) & 255) - 128;
+        return (int16_t)(phase * mic_peak / 128);
+    }
+    const int32_t phase = (int32_t)(frame % 128) - 64;
+    return (int16_t)(phase * mic_peak / 64 + mic_bias);
+}
+
+static int16_t pcm_sample(const uint8_t *pcm, size_t index)
+{
+    int16_t sample;
+    memcpy(&sample, pcm + index * sizeof(sample), sizeof(sample));
+    return sample;
+}
+
+static void expect_quiet_mic_gain(const uint8_t *pcm, size_t bytes)
+{
+    for (size_t frame = 0; frame < bytes / 4; ++frame) {
+        assert(pcm_sample(pcm, frame * 2) == 2 * mic_sample(frame));
+        assert(pcm_sample(pcm, frame * 2 + 1) == pcm_sample(pcm, frame * 2));
+    }
+}
+
+static unsigned expect_recording_pcm(const uint8_t *pcm, size_t begin, size_t end, int limit)
+{
+    unsigned sum = 0;
+    for (size_t frame = begin; frame < end; ++frame) {
+        const int output = pcm_sample(pcm, frame * 2);
+        assert(output == pcm_sample(pcm, frame * 2 + 1));
+        assert(abs(output) <= limit);
+        sum += abs(output);
+    }
+    return sum / (end - begin);
+}
+
 static void read_plan(const struct read_step *steps, unsigned n)
 { memcpy(reads,steps,n*sizeof(*steps)); read_count=n; read_index=0; fill_offset=0; }
 int i2s_channel_read(i2s_chan_handle_t rx, void *data, size_t bytes, size_t *received, unsigned timeout)
@@ -81,7 +126,12 @@ int i2s_channel_read(i2s_chan_handle_t rx, void *data, size_t bytes, size_t *rec
     assert(rx==(void*)2 && data && bytes && !pa && mute && codec_open && audio->capture_ready);
     assert(read_index<read_count && timeout==reads[read_index].expected_timeout);
     const struct read_step *s=&reads[read_index++]; ticks+=s->elapsed; *received=s->bytes;
-    for(size_t i=0;i<s->bytes && i<bytes;++i) ((uint8_t*)data)[i]=(uint8_t)(fill_offset+i);
+    for (size_t i = 0; i < s->bytes && i < bytes; ++i) {
+        const size_t offset = fill_offset + i;
+        const uint16_t adc = (uint16_t)mic_sample(offset / 4);
+        const uint8_t slot[] = {(uint8_t)adc, (uint8_t)(adc >> 8), 0x52, 0xa4};
+        ((uint8_t *)data)[i] = slot[offset % 4];
+    }
     fill_offset+=s->bytes; return s->error;
 }
 int i2s_channel_write(i2s_chan_handle_t tx, const void *data, size_t bytes, size_t *sent, unsigned timeout)
@@ -111,6 +161,7 @@ int main(void)
     assert(ac101s_audio_set_external_sink(audio,&sink)==ESP_OK);
     assert(ac101s_audio_set_output(audio,AC101S_OUTPUT_EXTERNAL)==ESP_OK);
     uint8_t pcm[4096];
+    uint8_t starting_pcm[sizeof(pcm)];
     for (unsigned i=0;i<100;++i) {
         reset_setup();
         assert(ac101s_audio_capture_start(audio,24)==ESP_OK);
@@ -130,7 +181,9 @@ int main(void)
         assert(ac101s_audio_stop(audio)==ESP_OK && audio->capture_ready && codec_open && !pa);
         const struct read_step good[]={{ESP_OK,sizeof pcm,22,1000}};
         read_plan(good,1); assert(ac101s_audio_capture_read(audio,pcm,sizeof pcm)==ESP_OK);
-        for(size_t k=0;k<sizeof pcm;++k) assert(pcm[k]==(uint8_t)(k-(k%4>=2?2:0)));
+        assert(expect_recording_pcm(pcm, 0, sizeof(pcm) / 4, MIC_CAPTURE_PEAK) > 450);
+        if (i == 0) memcpy(starting_pcm, pcm, sizeof(pcm));
+        else assert(!memcmp(starting_pcm, pcm, sizeof(pcm)));
         assert(ac101s_audio_capture_stop(audio)==ESP_OK && !audio->capture_active && !audio->capture_ready && !codec_open && !pa);
         assert(ac101s_audio_capture_stop(audio)==ESP_OK);
     }
@@ -153,7 +206,7 @@ int main(void)
     const struct read_step short_ok[]={{ESP_OK,1024,100,800},{ESP_OK,3072,15,700}};
     lock_delay=200; read_plan(short_ok,2);
     assert(ac101s_audio_capture_read(audio,pcm,sizeof pcm)==ESP_OK && read_index==2);
-    for(size_t k=0;k<sizeof pcm;++k) assert(pcm[k]==(uint8_t)(k-(k%4>=2?2:0)));
+    assert(!memcmp(starting_pcm, pcm, sizeof(pcm)));
     const struct read_step partial_timeout[]={{ESP_OK,1024,300,1000},{ESP_ERR_TIMEOUT,512,700,700}};
     read_plan(partial_timeout,2); TickType_t began=ticks;
     assert(ac101s_audio_capture_read(audio,pcm,sizeof pcm)==ESP_ERR_TIMEOUT && ticks-began==1000);
@@ -171,6 +224,87 @@ int main(void)
     assert(ac101s_audio_capture_read(audio,NULL,4)==ESP_ERR_INVALID_ARG);
     assert(ac101s_audio_capture_read(audio,pcm,(size_t)INT_MAX+1)==ESP_ERR_INVALID_ARG);
     puts("PASS exact-length PCM assembly, lock+DMA shared 1s budget, partial timeout, empty/misaligned read and buffer validation");
+
+    const struct read_step signal[] = {{ESP_OK, sizeof(pcm), 22, 1000}};
+    const size_t frames = sizeof(pcm) / 4;
+    assert(ac101s_audio_capture_stop(audio) == ESP_OK);
+    reset_setup();
+    assert(ac101s_audio_capture_start(audio, 24) == ESP_OK);
+    capture_setup = false;
+    mic_peak = 0;
+    read_plan(signal, 1);
+    assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    assert(expect_recording_pcm(pcm, 0, frames, 0) == 0);
+
+    mic_peak = 32;
+    mic_bias = 900;
+    for (unsigned i = 0; i < 5; ++i) {
+        read_plan(signal, 1);
+        assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    }
+    const unsigned faint_level = expect_recording_pcm(pcm, frames / 2, frames, 64);
+    assert(faint_level >= 15 && faint_level <= 24);
+
+    mic_peak = 512;
+    mic_bias = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        read_plan(signal, 1);
+        assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    }
+    const unsigned quiet_level = expect_recording_pcm(pcm, 0, frames, MIC_CAPTURE_PEAK);
+    assert(quiet_level > 1390 && quiet_level < 1650);
+
+    mic_impulse = frames / 2;
+    read_plan(signal, 1);
+    assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    const int loud_transient = pcm_sample(pcm, mic_impulse * 2);
+    assert(loud_transient < -20000 && loud_transient > -MIC_CAPTURE_PEAK);
+    assert(expect_recording_pcm(pcm, 0, mic_impulse, MIC_CAPTURE_PEAK) > quiet_level * 9 / 10);
+    assert(expect_recording_pcm(pcm, mic_impulse + 128, frames, MIC_CAPTURE_PEAK) > quiet_level * 8 / 10);
+    mic_impulse = SIZE_MAX;
+
+    mic_peak = 32768;
+    read_plan(signal, 1);
+    assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    assert(expect_recording_pcm(pcm, 0, frames, MIC_CAPTURE_PEAK - 1) > 4500);
+
+    mic_peak = 512;
+    for (unsigned i = 0; i < 16; ++i) {
+        read_plan(signal, 1);
+        assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+        expect_recording_pcm(pcm, 0, frames, MIC_CAPTURE_PEAK);
+    }
+    assert(expect_recording_pcm(pcm, frames / 2, frames, MIC_CAPTURE_PEAK) > quiet_level * 9 / 10);
+    puts("PASS board recording gain, silence and DC rejection, impulse isolation, soft limiting and loud-to-quiet recovery");
+
+    /* Follow speech with low stationary ADC noise, then resume speaking. */
+    mic_noise = true;
+    mic_peak = 112;
+    read_plan(signal, 1);
+    assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    const unsigned pause_start = expect_recording_pcm(pcm, 0, frames, MIC_CAPTURE_PEAK);
+    for (unsigned i = 0; i < 11; ++i) {
+        read_plan(signal, 1);
+        assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    }
+    const unsigned pause_level = expect_recording_pcm(pcm, 0, frames, 175);
+    assert(pause_level >= 50 && pause_level <= 85 && pause_start > 2 * pause_level);
+
+    mic_noise = false;
+    mic_peak = 512;
+    read_plan(signal, 1);
+    assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    const unsigned voice_start = expect_recording_pcm(pcm, 0, frames / 2, MIC_CAPTURE_PEAK);
+    const unsigned voice_rising = expect_recording_pcm(pcm, frames / 2, frames, MIC_CAPTURE_PEAK);
+    assert(voice_start > 3 * pause_level && voice_rising > voice_start);
+    for (unsigned i = 0; i < 5; ++i) {
+        read_plan(signal, 1);
+        assert(ac101s_audio_capture_read(audio, pcm, sizeof(pcm)) == ESP_OK);
+    }
+    const unsigned voice_level = expect_recording_pcm(pcm, 0, frames, MIC_CAPTURE_PEAK);
+    assert(voice_level > quiet_level * 9 / 10);
+    printf("PASS recorder pause noise settles from %u to %u PCM and speech recovers from %u to %u PCM\n",
+           pause_start, pause_level, voice_start, voice_level);
 
     fail_close=true;
     assert(ac101s_audio_capture_stop(audio)==ESP_FAIL && audio->capture_active && !audio->capture_ready && !pa);
@@ -239,6 +373,7 @@ int main(void)
     const struct read_step bounded[]={{ESP_OK,960,4,30},{ESP_OK,960,4,28}};
     read_plan(bounded,2);
     assert(ac101s_audio_board_pcm(audio,&intercom,pcm,1920,60)==ESP_OK && read_index==2);
+    expect_quiet_mic_gain(pcm, 1920);
     assert(ac101s_audio_board_stop(audio,&intercom)==ESP_OK && !codec_open);
     assert(ac101s_audio_board_start(audio,&intercom,false,100,24)==ESP_OK && pa);
     assert(ac101s_audio_stop(audio)==ESP_OK && pa);

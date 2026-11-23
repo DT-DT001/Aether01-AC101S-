@@ -24,7 +24,11 @@
 /* Conservative application thresholds for the 20ms telemetry sampling path.
  * An IMU alone cannot distinguish arbitrarily slow yaw from a small offset. */
 #define GRAVITY_MPS2                9.80665f
-#define GYRO_STILL_GRAVITY_TOL_MPS2 0.50f
+/* The AC101S bench captures have a stable raw norm around 8.9 m/s².
+ * This is a plausibility bound for gyro bias acquisition. The direction,
+ * angular rate and sample-window checks below still determine stationarity. */
+#define GYRO_STILL_MIN_GRAVITY_MPS2  8.50f
+#define GYRO_STILL_MAX_GRAVITY_MPS2  (GRAVITY_MPS2 + 0.50f)
 #define GYRO_STILL_ACCEL_DELTA_MPS2 0.18f
 #define GYRO_STILL_RAW_LIMIT_DPS   12.00f
 #define GYRO_STILL_INITIAL_YAW_DPS 2.00f
@@ -55,6 +59,7 @@ struct qmi8658a_dev_t {
     uint8_t awake_ctrl7;
     uint32_t fresh_count;
     bool fresh_count_valid;
+    bool gyro_auto_bias_paused;
     gyro_calibration_t gyro_calibration;
 };
 
@@ -143,6 +148,68 @@ static void break_stationary_window(gyro_calibration_t *calibration)
     calibration->stationary = false;
 }
 
+static bool gyro_bias_in_range(const float gyro[3])
+{
+    return dot_product(gyro, gyro) <= GYRO_STILL_RAW_LIMIT_DPS * GYRO_STILL_RAW_LIMIT_DPS;
+}
+
+static bool plausible_gravity(float squared)
+{
+    return squared >= GYRO_STILL_MIN_GRAVITY_MPS2 * GYRO_STILL_MIN_GRAVITY_MPS2 &&
+           squared <= GYRO_STILL_MAX_GRAVITY_MPS2 * GYRO_STILL_MAX_GRAVITY_MPS2;
+}
+
+static bool plausible_initial_yaw(const float accel[3], const float gyro[3], float accel_sq)
+{
+    const float along = dot_product(gyro, accel);
+    return along * along <= GYRO_STILL_INITIAL_YAW_DPS * GYRO_STILL_INITIAL_YAW_DPS * accel_sq;
+}
+
+static bool unchanged_sample(const float accel[3], const float gyro[3],
+                             const float reference[3], const float mean[3])
+{
+    return distance_squared(accel, reference) <= GYRO_STILL_ACCEL_DELTA_MPS2 * GYRO_STILL_ACCEL_DELTA_MPS2 &&
+           distance_squared(gyro, mean) <= GYRO_STILL_VARIATION_DPS * GYRO_STILL_VARIATION_DPS;
+}
+
+bool qmi8658a_gyro_zero_add(qmi8658a_gyro_zero_t *window, const qmi8658a_sample_t *sample)
+{
+    if (!window || !sample) return false;
+    const float *accel = sample->accel_mps2;
+    const float *gyro = sample->gyro_raw_dps;
+    const float accel_sq = dot_product(accel, accel);
+    if (!plausible_gravity(accel_sq) || !gyro_bias_in_range(gyro) ||
+        !plausible_initial_yaw(accel, gyro, accel_sq)) return false;
+    if (!window->samples) {
+        memcpy(window->accel_reference, accel, sizeof(window->accel_reference));
+        memcpy(window->bias_dps, gyro, sizeof(window->bias_dps));
+        window->samples = 1;
+    } else {
+        if (!unchanged_sample(accel, gyro, window->accel_reference, window->bias_dps)) return false;
+        const float weight = 1.0f / (float)++window->samples;
+        for (unsigned axis = 0; axis < 3; ++axis)
+            window->bias_dps[axis] += weight * (gyro[axis] - window->bias_dps[axis]);
+    }
+    return true;
+}
+
+void qmi8658a_set_gyro_auto_bias(qmi8658a_handle_t handle, bool enabled)
+{
+    if (!handle || handle->gyro_auto_bias_paused == !enabled) return;
+    handle->gyro_auto_bias_paused = !enabled;
+    break_stationary_window(&handle->gyro_calibration);
+}
+
+esp_err_t qmi8658a_set_gyro_bias(qmi8658a_handle_t handle, const float bias_dps[3])
+{
+    if (!handle || !bias_dps || !gyro_bias_in_range(bias_dps)) return ESP_ERR_INVALID_ARG;
+    gyro_calibration_t *calibration = &handle->gyro_calibration;
+    memcpy(calibration->bias, bias_dps, sizeof(calibration->bias));
+    calibration->valid = true;
+    break_stationary_window(calibration);
+    return ESP_OK;
+}
+
 static void update_gyro_bias(gyro_calibration_t *calibration, const float accel[3],
                             const float gyro[3], TickType_t now)
 {
@@ -151,10 +218,7 @@ static void update_gyro_bias(gyro_calibration_t *calibration, const float accel[
     if (elapsed > pdMS_TO_TICKS(GYRO_STILL_MAX_GAP_MS)) break_stationary_window(calibration);
 
     const float accel_sq = dot_product(accel, accel);
-    const float min_gravity = GRAVITY_MPS2 - GYRO_STILL_GRAVITY_TOL_MPS2;
-    const float max_gravity = GRAVITY_MPS2 + GYRO_STILL_GRAVITY_TOL_MPS2;
-    if (accel_sq < min_gravity * min_gravity || accel_sq > max_gravity * max_gravity ||
-        dot_product(gyro, gyro) > GYRO_STILL_RAW_LIMIT_DPS * GYRO_STILL_RAW_LIMIT_DPS ||
+    if (!plausible_gravity(accel_sq) || !gyro_bias_in_range(gyro) ||
         (calibration->valid && distance_squared(gyro, calibration->bias) >
          GYRO_STILL_RESIDUAL_DPS * GYRO_STILL_RESIDUAL_DPS)) {
         break_stationary_window(calibration);
@@ -164,19 +228,14 @@ static void update_gyro_bias(gyro_calibration_t *calibration, const float accel[
         /* Rotation around gravity leaves the accelerometer unchanged. Bound
          * that component at first acquisition while allowing a larger offset
          * transverse to gravity when the gravity vector remains stable. */
-        const float gyro_along_gravity = dot_product(gyro, accel);
-        if (gyro_along_gravity * gyro_along_gravity >
-            GYRO_STILL_INITIAL_YAW_DPS * GYRO_STILL_INITIAL_YAW_DPS * accel_sq) {
+        if (!plausible_initial_yaw(accel, gyro, accel_sq)) {
             break_stationary_window(calibration);
             return;
         }
     }
 
     if (calibration->samples &&
-        (distance_squared(accel, calibration->accel_reference) >
-         GYRO_STILL_ACCEL_DELTA_MPS2 * GYRO_STILL_ACCEL_DELTA_MPS2 ||
-         distance_squared(gyro, calibration->gyro_mean) >
-         GYRO_STILL_VARIATION_DPS * GYRO_STILL_VARIATION_DPS)) {
+        !unchanged_sample(accel, gyro, calibration->accel_reference, calibration->gyro_mean)) {
         break_stationary_window(calibration);
     }
     if (!calibration->samples) {
@@ -223,7 +282,8 @@ static void decode_sample(qmi8658a_handle_t handle, const uint8_t raw[QMI8658_SA
         sample->gyro_raw_dps[i] = g * gyro_scale;
     }
     gyro_calibration_t *calibration = &handle->gyro_calibration;
-    update_gyro_bias(calibration, sample->accel_mps2, sample->gyro_raw_dps, xTaskGetTickCount());
+    if (!handle->gyro_auto_bias_paused)
+        update_gyro_bias(calibration, sample->accel_mps2, sample->gyro_raw_dps, xTaskGetTickCount());
     sample->gyro_bias_valid = calibration->valid;
     sample->gyro_stationary = calibration->stationary;
     for (unsigned axis = 0; axis < 3; ++axis) {

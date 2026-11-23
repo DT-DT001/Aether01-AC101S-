@@ -18,6 +18,7 @@
 #include "app_display_metrics.h"
 #include "app_display_sync.h"
 #include "app_tools.h"
+#include "app_pinyin_extended.h"
 #include "app_ui.h"
 #include "app_audio_system.h"
 #include "app_nes_controls.h"
@@ -281,7 +282,7 @@ static bool nes_input_gate(void *context)
     return app_power_is_sleeping(power);
 }
 
-static void intercom_user_key_tap(void *context, int64_t pressed_at_us)
+static void intercom_user_key_press(void *context, int64_t pressed_at_us)
 {
     if (!app_ui_input_blocked(context)) (void)app_intercom_user_key(pressed_at_us);
 }
@@ -509,6 +510,7 @@ void app_main(void)
         return;
     }
     app_telemetry_warm_imu();
+    app_telemetry_set_gyro_persistence_guard(media_flash_busy, NULL);
     ESP_ERROR_CHECK(app_telemetry_start(&s_board));
 
     lv_indev_t *touch_indev = NULL;
@@ -620,7 +622,7 @@ void app_main(void)
         ESP_LOGW(TAG, "boot desktop first refresh incomplete: %s", esp_err_to_name(desktop_refresh));
     }
     ESP_ERROR_CHECK(app_power_set_user_key_handler(&s_power, app_ui_queue_user_key, s_ui));
-    ESP_ERROR_CHECK(app_power_set_user_key_tap_handler(&s_power, intercom_user_key_tap));
+    ESP_ERROR_CHECK(app_power_set_user_key_press_handler(&s_power, intercom_user_key_press));
     ESP_ERROR_CHECK(app_power_set_shutdown_hook(&s_power, prepare_shutdown, &s_shutdown));
     if (wifi_error == ESP_OK) {
         const esp_err_t restore_error = aether_wifi_restore_preference(s_wifi);
@@ -629,6 +631,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Aether01 UI ready: %u apps, TF hot-plug, screen idle power management",
              (unsigned)app_home_app_count());
+    (void)app_pinyin_extended_init();
 #ifdef AETHER_GPS_DIAGNOSTIC
     ESP_LOGI(TAG, "GPS one-shot input-only probe: %s", esp_err_to_name(app_gps_diagnostic_start()));
 #endif

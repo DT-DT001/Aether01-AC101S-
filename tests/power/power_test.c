@@ -622,10 +622,10 @@ static int test_worker_shutdown(void)
     return 0;
 }
 
-static unsigned user_actions, user_taps, user_irq_notifies;
-static int64_t user_pressed_at;
+static unsigned user_actions, user_presses, user_irq_notifies;
+static int64_t user_pressed_at, user_down_at;
 static void user_action(void *context,int64_t at_us){(void)context;user_pressed_at=at_us; ++user_actions;}
-static void user_tap(void *context,int64_t at_us){(void)context;(void)at_us; ++user_taps;}
+static void user_press(void *context,int64_t at_us){(void)context;user_down_at=at_us;++user_presses;}
 TickType_t xTaskGetTickCountFromISR(void){return clock_ms;}
 int64_t esp_timer_get_time(void){return (int64_t)clock_ms*1000;}
 void vTaskNotifyGiveFromISR(TaskHandle_t task,BaseType_t *higher){(void)task;*higher=pdFALSE;++user_irq_notifies;}
@@ -635,36 +635,38 @@ esp_err_t gpio_set_intr_type(int pin,int type){return pin==61&&type==GPIO_INTR_N
 esp_err_t gpio_intr_enable(int pin){return pin==61?ESP_OK:ESP_FAIL;}
 static int test_user_key_dispatch(void)
 {
-    reset();user_actions=user_irq_notifies=0;
+    reset();user_actions=user_presses=user_irq_notifies=0;
     CHECK(app_power_set_user_key_handler(&manager,user_action,&manager)==ESP_OK);
-    CHECK(app_power_set_user_key_tap_handler(&manager,user_tap)==ESP_OK);
+    CHECK(app_power_set_user_key_press_handler(&manager,user_press)==ESP_OK);
     user_key_t key={0};
     clock_ms=100;user_key_interrupt(&manager);clock_ms=105;user_key_interrupt(&manager);
-    dispatch_user_key(&manager,false,&key);CHECK(user_actions==0&&user_taps==1&&user_irq_notifies==1);
-    clock_ms=200;user_key_interrupt(&manager);
+    dispatch_user_key(&manager,false,&key);CHECK(user_actions==0&&user_presses==0&&user_irq_notifies==1);
+    clock_ms=200;user_key_interrupt(&manager);clock_ms=203;
     dispatch_user_key(&manager,true,&key);
-    clock_ms=2199;dispatch_user_key(&manager,true,&key);CHECK(user_actions==0);
+    CHECK(key.down&&user_presses==1&&user_down_at==200000);
+    clock_ms=2199;dispatch_user_key(&manager,true,&key);CHECK(user_actions==0&&user_presses==1);
     clock_ms=2200;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&user_pressed_at==200000);
     clock_ms=3200;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1);
-    dispatch_user_key(&manager,false,&key);
+    dispatch_user_key(&manager,false,&key);CHECK(user_presses==1);
     manager.sleeping=true;clock_ms=4000;user_key_interrupt(&manager);
     dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&manager.wake_requested);
     manager.sleeping=false;manager.wake_requested=false;
-    clock_ms=6500;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1);
+    clock_ms=6500;dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&user_presses==1);
     dispatch_user_key(&manager,false,&key);
     manager.shutdown_cancel_error=ESP_ERR_TIMEOUT;clock_ms=7000;
     dispatch_user_key(&manager,true,&key);
     manager.shutdown_cancel_error=ESP_OK;clock_ms=9500;
-    dispatch_user_key(&manager,true,&key);CHECK(user_actions==1);
+    dispatch_user_key(&manager,true,&key);CHECK(user_actions==1&&user_presses==1);
     dispatch_user_key(&manager,false,&key);
     clock_ms=10000;dispatch_user_key(&manager,true,&key);
-    clock_ms=11999;dispatch_user_key(&manager,false,&key);CHECK(user_actions==1);
+    CHECK(user_presses==2&&user_down_at==10000000);
+    clock_ms=11999;dispatch_user_key(&manager,false,&key);CHECK(user_actions==1&&user_presses==2);
     clock_ms=13000;dispatch_user_key(&manager,true,&key);
     clock_ms=15000;dispatch_user_key(&manager,true,&key);CHECK(user_actions==2&&user_pressed_at==13000000);
     dispatch_user_key(&manager,false,&key);
-    CHECK(user_taps==2);
+    CHECK(user_presses==3&&user_down_at==13000000);
     CHECK(app_power_set_user_key_handler(NULL,user_action,NULL)==ESP_ERR_INVALID_ARG);
-    puts("PASS separate AC101S intercom taps and one-shot two-second exit, with wake and shutdown consumption");
+    puts("PASS live AC101S intercom press edges and one-shot two-second exit, with wake and shutdown consumption");
     return 0;
 }
 int main(void)

@@ -66,6 +66,13 @@ static atomic_bool fail_commit;
 static atomic_uint failed_commits;
 static atomic_bool hold_codec_write, codec_write_entered, fail_codec_stop;
 static atomic_uint codec_stop_calls;
+static atomic_bool capture_first_pcm;
+static atomic_int first_pcm;
+static pthread_mutex_t resume_storage_lock = PTHREAD_MUTEX_INITIALIZER;
+static music_resume_t saved_resume;
+static size_t saved_resume_bytes;
+static _Thread_local music_resume_t staged_resume;
+static _Thread_local bool resume_staged;
 
 void vTaskDelay(TickType_t ms)
 {
@@ -127,6 +134,7 @@ esp_err_t ac101s_audio_write(ac101s_audio_handle_t a, void *data, size_t bytes)
 {
     (void)a; assert(codec_on && bytes && !(bytes % 4));
     int16_t *samples = data;
+    if (atomic_exchange(&capture_first_pcm, false)) first_pcm = samples[0];
     bool any = false;
     for (size_t i = 0; i < bytes / 2; ++i) if (samples[i]) any = true;
     if (any) ++nonsilent;
@@ -143,7 +151,12 @@ esp_err_t ac101s_audio_write(ac101s_audio_handle_t a, void *data, size_t bytes)
     return ESP_OK;
 }
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
-{ (void)mode; assert(!strcmp(name, "music")); *handle = 1; return ESP_OK; }
+{
+    assert(!strcmp(name, "music"));
+    if (mode == NVS_READWRITE) resume_staged = false;
+    *handle = 1;
+    return ESP_OK;
+}
 esp_err_t nvs_get_u8(nvs_handle_t h, const char *key, uint8_t *v)
 { (void)h; *v = !strcmp(key, "volume") ? saved_volume : saved_repeat; return ESP_OK; }
 esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t v)
@@ -162,15 +175,50 @@ esp_err_t nvs_set_u32(nvs_handle_t h, const char *key, uint32_t value)
     have_saved_eq = true;
     return ESP_OK;
 }
+esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *value, size_t *size)
+{
+    assert(h == 1 && !strcmp(key, "resume_v1"));
+    assert(pthread_mutex_lock(&resume_storage_lock) == 0);
+    esp_err_t error = !saved_resume_bytes ? ESP_ERR_NVS_NOT_FOUND :
+                      *size < saved_resume_bytes ? ESP_ERR_INVALID_SIZE : ESP_OK;
+    if (error == ESP_OK) {
+        memcpy(value, &saved_resume, saved_resume_bytes);
+        *size = saved_resume_bytes;
+    }
+    assert(pthread_mutex_unlock(&resume_storage_lock) == 0);
+    return error;
+}
+
+esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *value, size_t size)
+{
+    assert(h == 1 && !strcmp(key, "resume_v1") && size == sizeof(staged_resume));
+    memcpy(&staged_resume, value, size);
+    resume_staged = true;
+    return ESP_OK;
+}
+
 esp_err_t nvs_commit(nvs_handle_t h)
-{ (void)h; if (fail_commit) { ++failed_commits; return ESP_FAIL; } ++commits; return ESP_OK; }
-void nvs_close(nvs_handle_t h) { (void)h; }
+{
+    assert(h == 1);
+    if (fail_commit) { ++failed_commits; return ESP_FAIL; }
+    if (resume_staged) {
+        assert(pthread_mutex_lock(&resume_storage_lock) == 0);
+        saved_resume = staged_resume;
+        saved_resume_bytes = sizeof(saved_resume);
+        assert(pthread_mutex_unlock(&resume_storage_lock) == 0);
+        resume_staged = false;
+    }
+    ++commits;
+    return ESP_OK;
+}
+
+void nvs_close(nvs_handle_t h) { (void)h; resume_staged = false; }
 
 static void put16(FILE *f, uint16_t value)
 { fputc(value & 255, f); fputc(value >> 8, f); }
 static void put32(FILE *f, uint32_t value)
 { put16(f, value & 65535); put16(f, value >> 16); }
-static void wav(FILE *f, unsigned rate, unsigned channels, unsigned frames, bool odd)
+static void wav_header(FILE *f, unsigned rate, unsigned channels, unsigned frames, bool odd)
 {
     rewind(f);
     fwrite("RIFF", 1, 4, f); put32(f, 36 + frames * channels * 2 + (odd ? 10 : 0));
@@ -179,6 +227,11 @@ static void wav(FILE *f, unsigned rate, unsigned channels, unsigned frames, bool
     fwrite("fmt ", 1, 4, f); put32(f, 16); put16(f, 1); put16(f, channels);
     put32(f, rate); put32(f, rate * channels * 2); put16(f, channels * 2); put16(f, 16);
     fwrite("data", 1, 4, f); put32(f, frames * channels * 2);
+}
+
+static void wav(FILE *f, unsigned rate, unsigned channels, unsigned frames, bool odd)
+{
+    wav_header(f, rate, channels, frames, odd);
     for (unsigned i = 0; i < frames; ++i) {
         put16(f, i % 2 ? 32767 : (uint16_t)-32768);
         if (channels == 2) put16(f, i % 2 ? (uint16_t)-32768 : 32767);
@@ -541,7 +594,195 @@ static void test_player(void)
         assert(pthread_join(tasks[i]->thread, NULL) == 0);
         free(tasks[i]);
     }
+    task_count = 0;
     puts("PASS NVS volume/mode restore, file errors and task teardown");
+}
+
+static bool resume_media_busy(void *context)
+{
+    return atomic_load((atomic_bool *)context);
+}
+
+static aether_audio_player_status_t wait_session_closed(aether_audio_player_handle_t h)
+{
+    aether_audio_player_status_t status;
+    for (unsigned i = 0; i < 1500; ++i) {
+        assert(aether_audio_player_get_status(h, &status) == ESP_OK);
+        if (!status.closing && !status.active) break;
+        vTaskDelay(1);
+    }
+    assert(!status.closing && !status.active && !status.track_count && !status.path[0]);
+    assert(!status.position_ms && !status.duration_ms && !leases && !codec_on);
+    return status;
+}
+
+static void write_resume_wav(const char *path, unsigned frames)
+{
+    FILE *file = fopen(path, "wb");
+    assert(file);
+    wav_header(file, 48000, 1, frames, false);
+    for (unsigned i = 0; i < frames; ++i)
+        put16(file, i < 2 * 48000 ? 2048U : (uint16_t)-8192);
+    assert(fclose(file) == 0);
+}
+
+static void check_resumed_first_pcm(aether_audio_player_handle_t h, const char *path, int16_t expected)
+{
+    codec_write_entered = false;
+    capture_first_pcm = true;
+    hold_codec_write = true;
+    assert(aether_audio_player_play(h, path, 100) == ESP_OK);
+    for (unsigned i = 0; i < 1000 && !codec_write_entered; ++i) vTaskDelay(1);
+    assert(codec_write_entered && !capture_first_pcm && first_pcm == expected);
+    assert(aether_audio_player_release_session(h) == ESP_OK);
+    hold_codec_write = false;
+    wait_session_closed(h);
+}
+
+static void test_music_resume(void)
+{
+    char track[] = "/tmp/aether_music_resume_track_XXXXXX";
+    char other[] = "/tmp/aether_music_resume_other_XXXXXX";
+    int fd = mkstemp(track);
+    assert(fd >= 0 && close(fd) == 0);
+    fd = mkstemp(other);
+    assert(fd >= 0 && close(fd) == 0);
+    write_resume_wav(track, 48000 * 6);
+    write_resume_wav(other, 48000 * 6);
+
+    saved_volume = 100;
+    have_saved_eq = false;
+    aether_audio_player_handle_t h;
+    assert(aether_audio_player_new((void *)1, (void *)2, &h) == ESP_OK);
+    atomic_bool media_busy = true;
+    aether_audio_player_set_persistence_guard(h, resume_media_busy, &media_busy);
+    const char *original[] = {other, track};
+    assert(aether_audio_player_set_playlist(h, original, 2) == ESP_OK);
+    assert(aether_audio_player_select(h, 1) == ESP_OK);
+    assert(aether_audio_player_set_paused(h, true) == ESP_OK);
+    wait_state(h, AETHER_AUDIO_PAUSED);
+    assert(aether_audio_player_seek(h, 2300) == ESP_OK);
+    aether_audio_player_status_t status;
+    for (unsigned i = 0; i < 1000; ++i) {
+        assert(aether_audio_player_get_status(h, &status) == ESP_OK);
+        if (status.position_ms == 2300) break;
+        vTaskDelay(1);
+    }
+    assert(status.position_ms == 2300 && status.duration_ms == 6000);
+
+    const unsigned initial_commits = commits, initial_errors = failed_commits;
+    assert(aether_audio_player_release_session(h) == ESP_OK);
+    status = wait_session_closed(h);
+    assert(status.preferences_pending && commits == initial_commits);
+    music_resume_t persisted;
+    size_t bytes = sizeof(persisted);
+    assert(nvs_get_blob(1, "resume_v1", &persisted, &bytes) == ESP_ERR_NVS_NOT_FOUND);
+
+    /* Reopen before the pending commit. Match the file, not the old index. */
+    char remembered[192];
+    assert(aether_audio_player_get_resume_path(h, remembered, sizeof(remembered)) == ESP_OK);
+    assert(!strcmp(remembered, track));
+    const char *reordered[] = {track, other};
+    const unsigned open_count = starts, write_count = writes;
+    assert(aether_audio_player_set_playlist(h, reordered, 2) == ESP_OK);
+    assert(aether_audio_player_restore(h) == ESP_OK);
+    assert(aether_audio_player_get_status(h, &status) == ESP_OK);
+    assert(!status.active && !status.track_index && !strcmp(status.path, track));
+    assert(status.position_ms == 2300 && status.duration_ms == 6000);
+    assert(starts == open_count && writes == write_count && !leases && !codec_on);
+    assert(aether_audio_player_set_playlist(h, original, 1) == ESP_OK);
+    assert(aether_audio_player_restore(h) == ESP_ERR_NOT_FOUND);
+    assert(aether_audio_player_get_status(h, &status) == ESP_OK);
+    assert(!status.path[0] && !status.position_ms && !status.active);
+
+    fail_commit = true;
+    media_busy = false;
+    for (unsigned i = 0; i < 1000; ++i) {
+        assert(aether_audio_player_get_status(h, &status) == ESP_OK);
+        if (status.settings_error == ESP_FAIL) break;
+        vTaskDelay(1);
+    }
+    assert(status.settings_error == ESP_FAIL && status.preferences_pending);
+    assert(failed_commits > initial_errors && commits == initial_commits);
+    assert(nvs_get_blob(1, "resume_v1", &persisted, &bytes) == ESP_ERR_NVS_NOT_FOUND);
+    fail_commit = false;
+    for (unsigned i = 0; i < 1500; ++i) {
+        assert(aether_audio_player_get_status(h, &status) == ESP_OK);
+        if (!status.preferences_pending) break;
+        vTaskDelay(1);
+    }
+    assert(!status.preferences_pending && status.settings_error == ESP_OK && commits == initial_commits + 1);
+    assert(nvs_get_blob(1, "resume_v1", &persisted, &bytes) == ESP_OK && bytes == sizeof(persisted));
+    assert(!strcmp(persisted.path, track) && persisted.position_ms == 2300 && persisted.duration_ms == 6000);
+    assert(aether_audio_player_del(h) == ESP_OK);
+
+    assert(aether_audio_player_new((void *)1, (void *)2, &h) == ESP_OK);
+    assert(aether_audio_player_get_status(h, &status) == ESP_OK);
+    assert(!status.path[0] && !status.active && starts == open_count && writes == write_count);
+    assert(aether_audio_player_set_playlist(h, reordered, 2) == ESP_OK);
+    assert(aether_audio_player_restore(h) == ESP_OK);
+    check_resumed_first_pcm(h, track, -8192);
+
+    /* Replacing a track with a much shorter file must play that file from zero. */
+    write_resume_wav(track, 12000);
+    assert(aether_audio_player_set_playlist(h, reordered, 2) == ESP_OK);
+    assert(aether_audio_player_restore(h) == ESP_OK);
+    check_resumed_first_pcm(h, track, 2048);
+    assert(aether_audio_player_del(h) == ESP_OK);
+    assert(unlink(track) == 0 && unlink(other) == 0);
+    for (size_t i = 0; i < task_count; ++i) {
+        assert(pthread_join(tasks[i]->thread, NULL) == 0);
+        free(tasks[i]);
+    }
+    task_count = 0;
+    puts("PASS music resume matches reordered paths, restores quietly, defers/retries NVS commit and survives simulated reboot");
+    puts("PASS first resumed PCM comes from the saved sample and shorter replacement safely starts from zero");
+}
+
+static void test_recording_resume_isolation(void)
+{
+    static const char *const recordings[] = {
+        "/sdcard/Recordings/recent.wav", "/sdcard/recordings/nested/older.wav", "/usb/RECORDINGS/copy.wav",
+    };
+    struct aether_audio_player_t player = {.state_lock = portMUX_INITIALIZER_UNLOCKED};
+    music_resume_t fixture = {.position_ms = 2300, .duration_ms = 6000};
+    char remembered[192];
+    nvs_handle_t nvs;
+    for (size_t i = 0; i < sizeof(recordings) / sizeof(recordings[0]); ++i) {
+        strcpy(fixture.path, recordings[i]);
+        assert(nvs_open("music", NVS_READWRITE, &nvs) == ESP_OK);
+        assert(nvs_set_blob(nvs, resume_key, &fixture, sizeof(fixture)) == ESP_OK);
+        assert(nvs_commit(nvs) == ESP_OK);
+        nvs_close(nvs);
+        load_preferences(&player);
+        assert(aether_audio_player_get_resume_path(&player, remembered, sizeof(remembered)) == ESP_ERR_NOT_FOUND);
+    }
+
+    /* A real music subdirectory with the same prefix remains eligible. */
+    strcpy(player.status.path, "/sdcard/Recordings Archive/album/song.mp3");
+    player.status.position_ms = fixture.position_ms;
+    player.status.duration_ms = fixture.duration_ms;
+    remember_position_locked(&player);
+    assert(player.resume_dirty);
+    const music_resume_t song = player.resume;
+    save_preferences(&player, true);
+    assert(!player.resume_dirty);
+
+    const unsigned initial_commits = commits;
+    for (size_t i = 0; i < sizeof(recordings) / sizeof(recordings[0]); ++i) {
+        strcpy(player.status.path, recordings[i]);
+        remember_position_locked(&player);
+        assert(!player.resume_dirty);
+        assert(aether_audio_player_get_resume_path(&player, remembered, sizeof(remembered)) == ESP_OK);
+        assert(!strcmp(remembered, song.path));
+    }
+    save_preferences(&player, true);
+    assert(commits == initial_commits);
+    player.resume = (music_resume_t){0};
+    load_preferences(&player);
+    assert(!memcmp(&player.resume, &song, sizeof(song)));
+    assert(pthread_mutex_destroy(&player.state_lock) == 0);
+    puts("PASS recording auditions preserve the song bookmark and saved legacy recordings are ignored");
 }
 
 static bool cancel_mp3(void *context) { return *(bool *)context; }
@@ -613,6 +854,8 @@ int main(void)
     test_playlist_refresh();
     test_persistence_guard();
     test_player();
+    test_music_resume();
+    test_recording_resume_isolation();
     puts("All player host regressions passed.");
     return 0;
 }

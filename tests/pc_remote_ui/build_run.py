@@ -23,6 +23,7 @@ flags = ['gcc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
          '-DLV_CONF_INCLUDE_SIMPLE', '-DLV_CONF_SUPPRESS_DEFINE_CHECK=1',
          '-DLV_FONT_MONTSERRAT_28=1', '-D_DEFAULT_SOURCE', *['-I'+str(path) for path in includes]]
 for source in [root / 'main/apps/app_pc_remote.c', root / 'main/ui/app_ui_modal.c',
+               root / 'main/ui/app_ui_gyro_calibration.c',
                lvgl / 'src/font/lv_font_montserrat_28.c', test / 'smoke.c']:
     obj = out / (source.stem + '.o')
     subprocess.run(flags + ['-c', str(source), '-o', str(obj)], check=True)

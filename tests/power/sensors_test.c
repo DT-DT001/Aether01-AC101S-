@@ -125,6 +125,46 @@ static void test_fresh_imu_burst(void)
     puts("PASS QMI fast reads reject duplicates and crossed bursts, retry at most once, wrap and reset across sleep");
 }
 
+static void test_manual_gyro_zero(void)
+{
+    const int16_t flat[] = {-485, -363, 7408};
+    const int16_t tilted[] = {-285, -363, 7408};
+    const int16_t motion[] = {620, 155, 4};
+    const int16_t over_limit[] = {800, 155, 4};
+    const int16_t yaw[] = {568, 155, 200};
+    const int16_t still[] = {568, 155, 4};
+    qmi8658a_handle_t handle = fresh_imu();
+    const float old_bias[] = {5.0f, 2.0f, 0.0f};
+    assert(qmi8658a_set_gyro_bias(handle, old_bias) == ESP_OK);
+    qmi8658a_set_gyro_auto_bias(handle, false);
+
+    qmi8658a_gyro_zero_t window = {0};
+    qmi8658a_sample_t sample = imu_sample(handle, 20, flat, yaw);
+    assert(!qmi8658a_gyro_zero_add(&window, &sample) && window.samples == 0);
+    sample = imu_sample(handle, 20, flat, over_limit);
+    assert(!qmi8658a_gyro_zero_add(&window, &sample) && window.samples == 0);
+    for (unsigned i = 0; i < 251; ++i) {
+        int16_t raw[3] = {still[0] + (int16_t)(i & 1), still[1], still[2]};
+        sample = imu_sample(handle, 20, flat, raw);
+        assert(sample.gyro_bias_valid && sample.gyro_bias_dps[0] == old_bias[0]);
+        assert(qmi8658a_gyro_zero_add(&window, &sample));
+    }
+    assert(window.samples == 251 && fabsf(window.bias_dps[0] - 8.8828f) < 0.001f);
+    sample = imu_sample(handle, 20, tilted, still);
+    assert(!qmi8658a_gyro_zero_add(&window, &sample) && window.samples == 251);
+    sample = imu_sample(handle, 20, flat, motion);
+    assert(!qmi8658a_gyro_zero_add(&window, &sample) && window.samples == 251);
+    assert(qmi8658a_set_gyro_bias(handle, window.bias_dps) == ESP_OK);
+    assert(qmi8658a_set_gyro_bias(handle, (float[]){NAN, 0, 0}) == ESP_ERR_INVALID_ARG);
+    assert(qmi8658a_set_gyro_bias(handle, (float[]){13.0f, 0, 0}) == ESP_ERR_INVALID_ARG);
+    qmi8658a_set_gyro_auto_bias(handle, true);
+    sample = imu_sample(handle, 20, flat, still);
+    assert(sample.gyro_bias_valid && fabsf(sample.gyro_dps[0]) < 0.01f);
+    assert(sample.gyro_dps[1] == 0.0f && sample.gyro_dps[2] == 0.0f);
+    assert(qmi8658a_del(handle) == ESP_OK);
+    puts("PASS measured AC101S zero-rate mean, movement rejection, durable bias validation and corrected axes");
+}
+
 static void test_large_gyro_bias(void)
 {
     const int16_t bench_accel[3] = {301, 541, 7934};
@@ -174,6 +214,61 @@ static void test_large_gyro_bias(void)
     }
     assert(qmi8658a_del(handle) == ESP_OK);
     puts("PASS QMI measured cold bias, reorientation, sustained tilt rotation, large yaw and raw bias ceiling");
+}
+
+static void test_ac101s_gravity_magnitude(void)
+{
+    /* COM40 edge-touch diagnostic. The flat board reported accel
+     * -580/-435/8868 mm/s², mean magnitude 8896 mm/s², and gyro near
+     * 8873/2413/-6 mdps. Reconstruct register counts and replay slight jitter
+     * within the observed range for a full calibration window. */
+    const int16_t measured_accel[3] = {-485, -363, 7408};
+    const int16_t measured_gyro[3] = {568, 154, 0};
+    qmi8658a_handle_t handle = fresh_imu();
+    qmi8658a_sample_t sample;
+    for (unsigned i = 0; i <= 60; ++i) {
+        const int jitter = (int)(i % 7) - 3;
+        ticks += 20;
+        set_imu_counter(i * 5U);
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            set_axis(0x35 + axis * 2, measured_accel[axis]);
+            set_axis(0x3B + axis * 2, (int16_t)(measured_gyro[axis] + jitter));
+        }
+        assert(qmi8658a_read_fresh(handle, &sample) == ESP_OK);
+        assert(sample.gyro_bias_valid == (i == 60));
+        assert(sample.gyro_stationary == (i == 60));
+    }
+    const float a = hypotf(hypotf(sample.accel_mps2[0], sample.accel_mps2[1]), sample.accel_mps2[2]);
+    assert(a > 8.88f && a < 8.91f);
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        assert(fabsf(sample.gyro_bias_dps[axis] - measured_gyro[axis] / 64.0f) < 0.005f);
+        assert(fabsf(sample.gyro_dps[axis]) < 0.05f);
+    }
+    assert(qmi8658a_del(handle) == ESP_OK);
+
+    handle = fresh_imu();
+    const int16_t too_low[3] = {0, 0, 7059}; /* 8.45 m/s² */
+    const int16_t too_high[3] = {0, 0, 8900};
+    const int16_t moving_accel[3] = {-245, -363, 7408};
+    const int16_t yaw[3] = {0, 0, 192};
+    for (unsigned i = 0; i < 90; ++i) {
+        sample = imu_sample(handle, 20, too_low, measured_gyro);
+        assert(!sample.gyro_bias_valid && !sample.gyro_stationary);
+    }
+    for (unsigned i = 0; i < 90; ++i) {
+        sample = imu_sample(handle, 20, too_high, measured_gyro);
+        assert(!sample.gyro_bias_valid && !sample.gyro_stationary);
+    }
+    for (unsigned i = 0; i < 90; ++i) {
+        sample = imu_sample(handle, 20, measured_accel, yaw);
+        assert(!sample.gyro_bias_valid && !sample.gyro_stationary);
+    }
+    for (unsigned i = 0; i < 90; ++i) {
+        sample = imu_sample(handle, 20, (i & 1U) ? measured_accel : moving_accel, measured_gyro);
+        assert(!sample.gyro_bias_valid && !sample.gyro_stationary);
+    }
+    assert(qmi8658a_del(handle) == ESP_OK);
+    puts("PASS QMI COM40 8.9 m/s² cold calibration after 1.2s; low/high acceleration, yaw and direction-change guards");
 }
 
 static void test_gyro_calibration(void)
@@ -314,6 +409,8 @@ int main(void)
     puts("PASS real DPS standby/restore masks only MEAS_CTRL and retains recoverability after every failure class");
     test_gyro_calibration();
     test_large_gyro_bias();
+    test_ac101s_gravity_magnitude();
+    test_manual_gyro_zero();
     test_fresh_imu_burst();
     return 0;
 }

@@ -21,8 +21,15 @@
 #include "nvs.h"
 
 #define MUSIC_TASK_PRIORITY 7
+#define MUSIC_SAVE_DELAY_MS 800U
 
 static const char *TAG = "audio_player";
+static const char *const resume_key = "resume_v1";
+
+typedef struct {
+    uint32_t position_ms, duration_ms;
+    char path[192];
+} music_resume_t;
 
 struct aether_audio_player_t {
     ac101s_audio_handle_t audio;
@@ -40,6 +47,9 @@ struct aether_audio_player_t {
     bool preferences_dirty;
     uint32_t preference_revision;
     TickType_t preference_changed;
+    music_resume_t resume;
+    bool resume_dirty, resume_selected;
+    TickType_t resume_changed;
     uint32_t seek_revision;
     uint32_t seek_ms;
     char (*playlist)[192];
@@ -108,6 +118,19 @@ static bool valid_eq(const aether_audio_eq_t *eq)
     return true;
 }
 
+static bool music_resume_path(const char *path)
+{
+    if (!aether_media_fs_safe_path(path)) return false;
+    /* Recorder previews use the same player. Keep the music bookmark separate
+     * from the top-level Recordings directory on either storage volume. */
+    static const char recordings[] = "/Recordings";
+    const size_t length = sizeof(recordings) - 1;
+    const char *directory = strchr(path + 1, '/');
+    if (directory && !strncasecmp(directory, recordings, length))
+        return directory[length] && directory[length] != '/';
+    return true;
+}
+
 static void load_preferences(aether_audio_player_handle_t h)
 {
     nvs_handle_t nvs;
@@ -127,46 +150,75 @@ static void load_preferences(aether_audio_player_handle_t h)
         }
         if (valid_eq(&eq)) h->status.eq = eq;
     }
+    music_resume_t resume;
+    size_t bytes = sizeof(resume);
+    if (nvs_get_blob(nvs, resume_key, &resume, &bytes) == ESP_OK && bytes == sizeof(resume) &&
+        resume.position_ms < resume.duration_ms && memchr(resume.path, '\0', sizeof(resume.path)) &&
+        music_resume_path(resume.path)) h->resume = resume;
     nvs_close(nvs);
 }
 
 static void save_preferences(aether_audio_player_handle_t h, bool force)
 {
+    const TickType_t delay = pdMS_TO_TICKS(MUSIC_SAVE_DELAY_MS);
     portENTER_CRITICAL(&h->state_lock);
-    const bool dirty = h->preferences_dirty;
+    const TickType_t now = xTaskGetTickCount();
+    const bool save_settings = h->preferences_dirty && (force || now - h->preference_changed >= delay);
+    const bool save_resume = h->resume_dirty && (force || now - h->resume_changed >= delay);
     const uint8_t volume = h->status.volume, repeat = h->status.repeat;
     const aether_audio_eq_t eq = h->status.eq;
     const uint32_t revision = h->preference_revision;
-    const TickType_t changed = h->preference_changed;
     const bool active = h->status.active && h->status.state != AETHER_AUDIO_PAUSED;
     bool (*busy)(void *) = h->persistence_busy;
     void *busy_context = h->persistence_context;
     portEXIT_CRITICAL(&h->state_lock);
-    if (!dirty) return;
+    if (!save_settings && !save_resume) return;
     /* A next track may already be queued when the previous stream ends.
      * The idle music worker can also overlap video/NES after a page change.
      * Keep preferences pending until the active media allows Flash writes.
      * Explicit player teardown still flushes its final preferences. */
     if (!force && (active || (busy && busy(busy_context)))) return;
-    if (!force && xTaskGetTickCount() - changed < pdMS_TO_TICKS(800)) return;
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("music", NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        err = nvs_set_u8(nvs, "volume", volume);
-        if (err == ESP_OK) err = nvs_set_u8(nvs, "repeat", repeat);
-        if (err == ESP_OK) err = nvs_set_u32(nvs, "eq_v1", pack_eq(&eq));
+        if (save_settings) {
+            err = nvs_set_u8(nvs, "volume", volume);
+            if (err == ESP_OK) err = nvs_set_u8(nvs, "repeat", repeat);
+            if (err == ESP_OK) err = nvs_set_u32(nvs, "eq_v1", pack_eq(&eq));
+        }
+        /* Only the player worker updates the cached record after startup. */
+        if (err == ESP_OK && save_resume) err = nvs_set_blob(nvs, resume_key, &h->resume, sizeof(h->resume));
         if (err == ESP_OK) err = nvs_commit(nvs);
         nvs_close(nvs);
     }
     portENTER_CRITICAL(&h->state_lock);
     h->status.settings_error = err;
-    if (revision == h->preference_revision) {
+    if (save_settings && revision == h->preference_revision) {
         h->preferences_dirty = err != ESP_OK;
         /* Retry a failed transaction with the same bounded debounce, rather
          * than losing the preference or spinning on flash every 20ms. */
         if (err != ESP_OK) h->preference_changed = xTaskGetTickCount();
     }
+    if (save_resume) {
+        h->resume_dirty = err != ESP_OK;
+        if (err != ESP_OK) h->resume_changed = xTaskGetTickCount();
+    }
     portEXIT_CRITICAL(&h->state_lock);
+}
+
+static void remember_position_locked(aether_audio_player_handle_t h)
+{
+    const uint32_t duration = h->status.duration_ms;
+    if (!duration || !music_resume_path(h->status.path)) return;
+    const uint32_t position = h->status.position_ms < duration ? h->status.position_ms : 0;
+    if (h->resume.position_ms == position && h->resume.duration_ms == duration &&
+        !strcmp(h->resume.path, h->status.path)) return;
+
+    h->resume = (music_resume_t){.position_ms = position, .duration_ms = duration};
+    strcpy(h->resume.path, h->status.path);
+    h->resume_dirty = true;
+    /* First commit is due immediately after release. Failures back off. */
+    h->resume_changed = xTaskGetTickCount() - pdMS_TO_TICKS(MUSIC_SAVE_DELAY_MS);
 }
 
 static bool mp3_canceled(void *context)
@@ -261,6 +313,11 @@ static esp_err_t play_stream(aether_audio_player_handle_t h, const char *path, b
     h->status.channels = aac ? aac_info.channels : mp3 ? aether_mp3_channels(mp3) : stream->info.channels;
     h->status.duration_ms = aac ? aac_info.duration_ms : mp3 ? aether_mp3_duration_ms(mp3) :
         (uint32_t)((uint64_t)stream->info.frames * 1000 / stream->info.sample_rate);
+    /* A restored position is a startup seek. Wait for the actual duration
+     * and let a newer user seek take precedence. A replaced, shorter file
+     * starts from the beginning instead of immediately advancing at EOF. */
+    if (!h->seek_revision && h->seek_ms && h->seek_ms < h->status.duration_ms)
+        h->seek_revision = 1;
     h->status.mp3 = mp3 != NULL;
     h->status.aac = aac != NULL;
     h->status.detail[0] = 0;
@@ -417,6 +474,7 @@ static void finish_session_release(aether_audio_player_handle_t h)
         h->status.path[0] = 0; h->status.mp3 = h->status.aac = false;
         h->status.state = AETHER_AUDIO_STOPPED;
         h->status.closing = false;
+        h->resume_selected = false;
     }
     portEXIT_CRITICAL(&h->state_lock);
     free(old);
@@ -440,6 +498,8 @@ static void player_task(void *argument)
             const bool inserted = aether_media_fs_path_ready(h->storage, path);
             const uint32_t shuffle = esp_random();
             portENTER_CRITICAL(&h->state_lock);
+            const bool position_known = h->status.position_ms || (err == ESP_OK &&
+                (finished || h->status.state == AETHER_AUDIO_PLAYING || h->status.state == AETHER_AUDIO_PAUSED));
             h->status.last_error = h->stop_requested ? ESP_OK : err;
             h->status.state = h->stop_requested ? AETHER_AUDIO_STOPPED :
                 err != ESP_OK ? AETHER_AUDIO_ERROR :
@@ -447,6 +507,7 @@ static void player_task(void *argument)
             h->status.active = false; /* Codec/file/lease cleanup is complete. */
             bool next = h->advance_requested || (finished && h->autoplay && err == ESP_OK);
             if (h->terminate || !inserted || !h->playlist || !h->status.track_count) next = false;
+            if (!next && position_known) remember_position_locked(h);
             if (next) {
                 uint16_t index = h->requested_track;
                 if (!h->advance_requested) {
@@ -478,7 +539,7 @@ static void player_task(void *argument)
         save_preferences(h, false);
         portENTER_CRITICAL(&h->state_lock);
         const bool again = h->status.active;
-        const bool closing = h->status.closing, dirty = h->preferences_dirty;
+        const bool closing = h->status.closing, dirty = h->preferences_dirty || h->resume_dirty;
         portEXIT_CRITICAL(&h->state_lock);
         if (again) continue;
         /* Idle management owns no media hardware and need not wake five times
@@ -535,6 +596,8 @@ esp_err_t aether_audio_player_play(aether_audio_player_handle_t h, const char *p
         xSemaphoreGive(h->command_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    const uint32_t position = h->resume_selected && !strcmp(path, h->status.path) ? h->status.position_ms : 0;
+    h->resume_selected = false;
     strcpy(h->status.path, path);
     h->status.mp3 = h->status.aac = false;
     h->status.detail[0] = 0;
@@ -554,7 +617,8 @@ esp_err_t aether_audio_player_play(aether_audio_player_handle_t h, const char *p
     h->advance_requested = false;
     h->status.track_index = track_index;
     h->stop_requested = h->pause_requested = false;
-    h->seek_ms = h->seek_revision = 0;
+    h->seek_ms = position;
+    h->seek_revision = 0;
     portEXIT_CRITICAL(&h->state_lock);
     xTaskNotifyGive(h->task);
     xSemaphoreGive(h->command_lock);
@@ -689,8 +753,13 @@ esp_err_t aether_audio_player_set_playlist(aether_audio_player_handle_t h,
     memcpy(current_path, h->status.path, sizeof(current_path));
     portEXIT_CRITICAL(&h->state_lock);
     uint16_t track_index = 0;
+    bool selected_found = false;
     for (size_t i = 0; i < count; ++i) {
-        if (!strcmp(current_path, copy[i])) { track_index = (uint16_t)i; break; }
+        if (!strcmp(current_path, copy[i])) {
+            track_index = (uint16_t)i;
+            selected_found = true;
+            break;
+        }
     }
     portENTER_CRITICAL(&h->state_lock);
     /* A queued selection refers to the existing list. Replacing it here would
@@ -706,6 +775,11 @@ esp_err_t aether_audio_player_set_playlist(aether_audio_player_handle_t h,
     h->playlist = copy;
     h->status.track_count = (uint16_t)count;
     h->status.track_index = track_index;
+    if (h->resume_selected && !selected_found) {
+        h->resume_selected = false;
+        h->status.path[0] = 0;
+        h->status.position_ms = h->status.duration_ms = 0;
+    }
     portEXIT_CRITICAL(&h->state_lock);
     free(old);
     xSemaphoreGive(h->command_lock);
@@ -716,6 +790,7 @@ static void select_locked(aether_audio_player_handle_t h, uint16_t index)
 {
     h->requested_track = index;
     h->autoplay = true;
+    h->resume_selected = false;
     if (h->status.active) {
         h->advance_requested = true;
         h->stop_requested = true;
@@ -771,12 +846,56 @@ esp_err_t aether_audio_player_next(aether_audio_player_handle_t h, int direction
     return ESP_OK;
 }
 
+esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t h, char *path, size_t size)
+{
+    if (!h || !path || !size) return ESP_ERR_INVALID_ARG;
+    path[0] = '\0';
+    portENTER_CRITICAL(&h->state_lock);
+    const size_t length = strlen(h->resume.path);
+    if (length && length < size) memcpy(path, h->resume.path, length + 1);
+    portEXIT_CRITICAL(&h->state_lock);
+    if (!length) return ESP_ERR_NOT_FOUND;
+    return length < size ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+esp_err_t aether_audio_player_restore(aether_audio_player_handle_t h)
+{
+    if (!h) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(h->command_lock, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+    portENTER_CRITICAL(&h->state_lock);
+    const bool idle = !h->status.active && !h->status.closing && !h->status.path[0] && !h->terminate;
+    const music_resume_t resume = h->resume;
+    const size_t count = h->status.track_count;
+    portEXIT_CRITICAL(&h->state_lock);
+
+    esp_err_t error = idle ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_STATE;
+    if (idle && resume.path[0]) {
+        for (size_t index = 0; index < count; ++index) {
+            if (strcasecmp(resume.path, h->playlist[index])) continue;
+            portENTER_CRITICAL(&h->state_lock);
+            if (h->status.closing || h->terminate) error = ESP_ERR_INVALID_STATE;
+            else {
+                memcpy(h->status.path, h->playlist[index], sizeof(h->status.path));
+                h->status.track_index = (uint16_t)index;
+                h->status.position_ms = resume.position_ms;
+                h->status.duration_ms = resume.duration_ms;
+                h->resume_selected = true;
+                error = ESP_OK;
+            }
+            portEXIT_CRITICAL(&h->state_lock);
+            break;
+        }
+    }
+    xSemaphoreGive(h->command_lock);
+    return error;
+}
+
 esp_err_t aether_audio_player_get_status(aether_audio_player_handle_t h, aether_audio_player_status_t *status)
 {
     if (!h || !status) return ESP_ERR_INVALID_ARG;
     portENTER_CRITICAL(&h->state_lock);
     *status = h->status;
-    status->preferences_pending = h->preferences_dirty;
+    status->preferences_pending = h->preferences_dirty || h->resume_dirty;
     portEXIT_CRITICAL(&h->state_lock);
     return ESP_OK;
 }

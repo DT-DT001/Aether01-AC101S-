@@ -8,6 +8,13 @@
 #include "freertos/queue.h"
 #include <stdatomic.h>
 
+typedef struct {
+    char directory[192];
+    int32_t scroll_y;
+    uint32_t media_generation;
+    void (*parent)(app_ui_t *ui);
+} app_files_return_t;
+
 struct app_ui {
     aether_board_t *board;
     aether_storage_handle_t storage;
@@ -31,6 +38,7 @@ struct app_ui {
     bool (*page_can_exit)(app_ui_t *ui, void (*destination)(app_ui_t *));
     void (*page_back)(app_ui_t *ui);
     void *page_context;
+    app_files_return_t files_return;
     app_io_handle_t io;
     uint32_t page_generation;
     void (*io_complete)(app_ui_t *ui, const app_io_result_t *result);

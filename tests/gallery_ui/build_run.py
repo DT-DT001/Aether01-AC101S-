@@ -15,7 +15,7 @@ if not objects:
     raise SystemExit("Build native LVGL with tests/reader_ui/build_run.py first")
 objects += [cache / f"main_assets_font_{size}.c.o" for size in (16, 24)]
 lvgl = root / "managed_components/lvgl__lvgl"
-includes = [test / "stubs", root / "tests/files_ui/stubs", root / "tests/reader_ui/stubs",
+includes = [test / "stubs", root / "tests/reader_ui/stubs",
             root / "tests/player/stubs", root / "components/aether_image/include",
             root / "components/aether_storage/include",
             root / "tests/reader_ui", root / "main", root / "main/ui", lvgl]
@@ -33,4 +33,7 @@ pixels = bytes([0, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0])
 header = struct.pack("<2sIHHI", b"BM", 54 + len(pixels), 0, 0, 54)
 dib = struct.pack("<IiiHHIIiiII", 40, 2, 2, 1, 24, 0, len(pixels), 0, 0, 0, 0)
 (photo_dir / "tail.bmp").write_bytes(header + dib + pixels)
+usb_dir = out / "usbphotos/DCIM/Camera"
+usb_dir.mkdir(parents=True, exist_ok=True)
+(usb_dir / "tail.bmp").write_bytes(header + dib + pixels)
 subprocess.run([str(binary)], check=True, cwd=out)

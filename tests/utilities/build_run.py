@@ -25,7 +25,7 @@ flags = [
     "-DLV_FONT_MONTSERRAT_20=1", "-DLV_FONT_MONTSERRAT_28=1", "-DLV_FONT_MONTSERRAT_48=1",
     *["-I" + str(path) for path in [
         test / "ui_stubs", out, root / "tests/player/stubs", root / "tests/reader_ui",
-        root / "main/ui", root / "main", root / "components/aether_wifi/include", lvgl,
+        root / "main/ui", root / "main", root / "main/apps", root / "components/aether_wifi/include", lvgl,
     ]],
 ]
 work = []
@@ -54,7 +54,8 @@ for source in [root / "main/apps/app_utilities.c", root / "main/apps/app_wifi.c"
     shutil.copyfile(source, copy)
     schedule(copy, copy.stem + ".o", True)
 for source in [root / "main/app_weather_data.c", root / "main/app_tools_math.c",
-               root / "main/app_text.c", test / "ui_smoke.c"]:
+               root / "main/app_text.c", root / "main/app_pinyin.c", root / "main/app_pinyin_swipe.c",
+               test / "ui_smoke.c"]:
     schedule(source, source.stem + ".o", True)
 
 def compile_one(job):

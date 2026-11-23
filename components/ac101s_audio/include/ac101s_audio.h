@@ -99,7 +99,8 @@ esp_err_t ac101s_audio_read(ac101s_audio_handle_t handle, void *data, size_t byt
  * playback setting. A failed start rolls back; call capture_stop to retry any
  * failed codec close before starting another session. */
 esp_err_t ac101s_audio_capture_start(ac101s_audio_handle_t handle, float gain_db);
-/** Read packed 48kHz PCM16 stereo; the board mono ADC is duplicated to both slots.
+/** Read packed 48kHz PCM16 stereo. The board mono ADC uses bounded voice gain
+ * and is duplicated to both slots. USB microphone PCM keeps its original gain.
  * ESP_OK means all bytes are valid; bytes must be a nonzero multiple of four.
  * The mutex + read budget is 1s (plus RTOS tick scheduling). Discard the entire
  * buffer on error: partial reads are never reported as a successful block.
@@ -116,6 +117,7 @@ esp_err_t ac101s_audio_capture_stop(ac101s_audio_handle_t handle);
 esp_err_t ac101s_audio_board_start(ac101s_audio_handle_t handle, const void *owner,
                                   bool capture, int volume, float gain_db);
 /** Transfer a whole packed stereo 48 kHz PCM16 block in the active direction.
+ * Capture applies a bounded gain suitable for real-time voice.
  * A timeout covers mutex acquisition plus DMA. Discard capture data on error. */
 esp_err_t ac101s_audio_board_pcm(ac101s_audio_handle_t handle, const void *owner,
                                 void *pcm, size_t bytes, uint32_t timeout_ms);

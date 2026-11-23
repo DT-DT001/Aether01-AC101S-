@@ -1,4 +1,4 @@
-#include "app_ui_internal.h"
+#include "app_connection_style.h"
 #include "app_nes_controls.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,14 +28,14 @@ static void controls_refresh(app_ui_t *ui)
         p->revision=open?0:view.revision;
     }
     if(p->submit_error!=ESP_OK&&p->conflict_action<APP_NES_CONTROL_COUNT)
-        app_ui_label_fmt(p->status,"此键已用于“%s”。请先将原位置设为 None，再重新分配。",app_nes_controls_action_name(p->conflict_action));
+        app_ui_label_fmt(p->status,"此键已用于%s。先将原键位设为 None。",app_nes_controls_action_name(p->conflict_action));
     else if(p->submit_error!=ESP_OK)app_ui_label_fmt(p->status,"映射未应用：%s",esp_err_to_name(p->submit_error));
-    else if(!view.ready)app_ui_label_text(p->status,"键位服务未就绪；游戏使用默认键位。");
-    else if(view.pending&&view.deferred)app_ui_label_text(p->status,"键位已生效；退出媒体后自动保存，避免写 Flash 影响流畅度。");
-    else if(view.pending&&view.error!=ESP_OK)app_ui_label_fmt(p->status,"键位已生效，保存失败：%s；后台重试。",esp_err_to_name(view.error));
-    else if(view.pending)app_ui_label_text(p->status,"键位已生效，正在后台保存…");
-    else if(view.error!=ESP_OK)app_ui_label_fmt(p->status,"读取配置失败：%s；已使用默认，可点“恢复默认”修复。",esp_err_to_name(view.error));
-    else app_ui_label_text(p->status,"已保存；重启后保留。USB 手柄键位保持默认。");
+    else if(!view.ready)app_ui_label_text(p->status,"键位服务未就绪，使用默认配置");
+    else if(view.pending&&view.deferred)app_ui_label_text(p->status,"退出媒体后自动保存");
+    else if(view.pending&&view.error!=ESP_OK)app_ui_label_fmt(p->status,"保存失败，后台重试：%s",esp_err_to_name(view.error));
+    else if(view.pending)app_ui_label_text(p->status,"正在保存…");
+    else if(view.error!=ESP_OK)app_ui_label_fmt(p->status,"读取失败：%s。可恢复默认。",esp_err_to_name(view.error));
+    else app_ui_label_text(p->status,"已保存");
 }
 static void key_changed(lv_event_t *event)
 {
@@ -68,15 +68,23 @@ void app_open_nes_controls(app_ui_t *ui)
     controls_page_t *p=calloc(1,sizeof(*p));
     if(!p){app_ui_add_text(content,"内存不足",LV_ALIGN_CENTER,0,0,0xFF8888,NULL);return;}
     ui->page_context=p;ui->page_cleanup=controls_cleanup;p->conflict_action=APP_NES_CONTROL_COUNT;
-    lv_obj_t *intro=app_ui_add_text(content,"每个功能可设置主键和副键；None 为不绑定。一个键只对应一个功能。",LV_ALIGN_TOP_LEFT,2,0,0xAFC6E9,app_ui_chinese_font());
-    lv_obj_set_width(intro,400);lv_label_set_long_mode(intro,LV_LABEL_LONG_WRAP);
-    lv_obj_t *reset=lv_button_create(content);lv_obj_set_pos(reset,230,68);lv_obj_set_size(reset,170,40);
-    lv_obj_set_style_bg_color(reset,lv_color_hex(0x274769),0);lv_obj_set_style_radius(reset,12,0);
+    lv_obj_remove_flag(content,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *header=lv_obj_create(content);lv_obj_set_size(header,404,58);
+    app_connection_card_style(header);
+    app_ui_add_text(header,"默认 Esc 退出游戏",LV_ALIGN_TOP_LEFT,10,7,CONNECTION_TEXT,app_ui_chinese_font());
+    app_ui_add_text(header,"长按用户键 2 秒回桌面",LV_ALIGN_TOP_LEFT,10,31,CONNECTION_DETAIL,app_ui_chinese_font());
+    lv_obj_t *reset=lv_button_create(header);lv_obj_set_pos(reset,260,6);lv_obj_set_size(reset,132,44);
+    app_connection_button_style(reset,false);
     app_ui_add_text(reset,"恢复默认",LV_ALIGN_CENTER,0,0,0xEAF2FF,app_ui_chinese_font());
     lv_obj_add_event_cb(reset,controls_reset,LV_EVENT_CLICKED,ui);
-    app_ui_add_text(content,"操作",LV_ALIGN_TOP_LEFT,2,120,0x91A8C7,NULL);
-    app_ui_add_text(content,"主键",LV_ALIGN_TOP_LEFT,84,120,0x91A8C7,NULL);
-    app_ui_add_text(content,"副键",LV_ALIGN_TOP_LEFT,250,120,0x91A8C7,NULL);
+    app_ui_add_text(content,"操作",LV_ALIGN_TOP_LEFT,9,69,CONNECTION_DETAIL,app_ui_chinese_font());
+    app_ui_add_text(content,"主键",LV_ALIGN_TOP_LEFT,85,69,CONNECTION_DETAIL,app_ui_chinese_font());
+    app_ui_add_text(content,"副键",LV_ALIGN_TOP_LEFT,244,69,CONNECTION_DETAIL,app_ui_chinese_font());
+    lv_obj_t *viewport=lv_obj_create(content);
+    lv_obj_set_pos(viewport,0,93);lv_obj_set_size(viewport,404,197);
+    lv_obj_set_style_bg_opa(viewport,LV_OPA_TRANSP,0);
+    lv_obj_set_style_border_width(viewport,0,0);lv_obj_set_style_pad_all(viewport,0,0);
+    lv_obj_set_scroll_dir(viewport,LV_DIR_VER);
     char options[1536]={0};size_t used=0;
     for(unsigned i=0;i<app_nes_controls_key_count();++i){
         const int n=snprintf(options+used,sizeof(options)-used,"%s%s",i?"\n":"",app_nes_controls_key_name(i));
@@ -84,24 +92,27 @@ void app_open_nes_controls(app_ui_t *ui)
         used+=(size_t)n;
     }
     for(unsigned a=0;a<APP_NES_CONTROL_COUNT;++a){
-        const int y=152+(int)a*64;
-        app_ui_add_text(content,app_nes_controls_action_name(a),LV_ALIGN_TOP_LEFT,2,y+12,0xD9E8FF,NULL);
+        lv_obj_t *row=lv_obj_create(viewport);
+        lv_obj_set_pos(row,0,(int)a*59);lv_obj_set_size(row,400,54);
+        app_connection_card_style(row);
+        app_ui_add_text(row,app_nes_controls_action_name(a),LV_ALIGN_LEFT_MID,8,0,
+                        CONNECTION_TEXT,app_ui_chinese_font());
         for(unsigned k=0;k<APP_NES_CONTROL_SLOTS;++k){
-            lv_obj_t *d=lv_dropdown_create(content);p->keys[a][k]=d;
-            lv_obj_set_pos(d,k?248:82,y);lv_obj_set_size(d,152,42);
+            lv_obj_t *d=lv_dropdown_create(row);p->keys[a][k]=d;
+            lv_obj_set_pos(d,k?238:78,4);lv_obj_set_size(d,148,44);
             lv_obj_set_style_text_font(d,&lv_font_montserrat_16,0);
-            lv_obj_set_style_bg_color(d,lv_color_hex(0x20334F),0);lv_obj_set_style_text_color(d,lv_color_hex(0xEAF2FF),0);
+            lv_obj_set_style_text_font(d,&lv_font_montserrat_16,LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(d,lv_color_hex(CONNECTION_CONTROL),0);lv_obj_set_style_text_color(d,lv_color_hex(CONNECTION_TEXT),0);
             lv_obj_set_style_border_width(d,0,0);lv_obj_set_style_radius(d,10,0);
             lv_obj_t *list=lv_dropdown_get_list(d);
             lv_obj_set_style_text_font(list,&lv_font_montserrat_16,0);
-            lv_obj_set_style_bg_color(list,lv_color_hex(0x18243A),0);lv_obj_set_style_text_color(list,lv_color_hex(0xEAF2FF),0);
+            lv_obj_set_style_bg_color(list,lv_color_hex(CONNECTION_PANEL),0);lv_obj_set_style_text_color(list,lv_color_hex(CONNECTION_TEXT),0);
             lv_dropdown_set_options(d,options);lv_obj_set_user_data(d,(void*)(uintptr_t)(a*APP_NES_CONTROL_SLOTS+k));
             lv_obj_add_event_cb(d,key_changed,LV_EVENT_VALUE_CHANGED,ui);
         }
     }
-    p->status=app_ui_add_text(content,"",LV_ALIGN_TOP_LEFT,2,864,0x9CCFBE,app_ui_chinese_font());
-    lv_obj_set_width(p->status,398);lv_label_set_long_mode(p->status,LV_LABEL_LONG_WRAP);
-    lv_obj_t *help=app_ui_add_text(content,"默认：方向键/WASD、Z=A、X=B、Shift=选择、Enter=开始、P=暂停、R=复位、Esc=退出。游戏中短按用户键（GPIO61）退出 NES。",LV_ALIGN_TOP_LEFT,2,970,0x8FA9AD,app_ui_chinese_font());
-    lv_obj_set_width(help,398);lv_label_set_long_mode(help,LV_LABEL_LONG_WRAP);
+    p->status=app_ui_add_text(content,"",LV_ALIGN_TOP_LEFT,5,296,CONNECTION_ACCENT,app_ui_chinese_font());
+    lv_obj_set_size(p->status,396,40);lv_label_set_long_mode(p->status,LV_LABEL_LONG_DOT);
+    app_ui_add_text(content,"None 取消绑定",LV_ALIGN_TOP_LEFT,5,335,CONNECTION_DETAIL,app_ui_chinese_font());
     app_ui_set_timer(ui,controls_timer,250);controls_refresh(ui);
 }

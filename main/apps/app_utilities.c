@@ -15,11 +15,43 @@ static lv_obj_t *utility_button(lv_obj_t *parent, const char *label,
     lv_obj_t *button = lv_button_create(parent);
     lv_obj_set_pos(button, x, y);
     lv_obj_set_size(button, width, 44);
-    lv_obj_set_style_radius(button, 12, 0);
-    lv_obj_set_style_bg_color(button, lv_color_hex(0x29486F), 0);
+    lv_obj_set_style_radius(button, 14, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x273852), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x385679), LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(button, 0, 0);
     lv_obj_add_event_cb(button, event, LV_EVENT_CLICKED, context);
-    app_ui_add_text(button, label, LV_ALIGN_CENTER, 0, 0, 0xF0F5FF, app_ui_chinese_font());
+    const bool icon = (unsigned char)label[0] == 0xEF && (unsigned char)label[1] < 0xA0;
+    app_ui_add_text(button, label, LV_ALIGN_CENTER, 0, 0, 0xF0F5FF,
+                    icon ? &lv_font_montserrat_20 : app_ui_chinese_font());
     return button;
+}
+
+static void utility_dropdown_style(lv_obj_t *dropdown, const lv_font_t *font)
+{
+    lv_obj_set_style_radius(dropdown, 13, 0);
+    lv_obj_set_style_bg_color(dropdown, lv_color_hex(0x293550), 0);
+    lv_obj_set_style_border_width(dropdown, 0, 0);
+    lv_obj_set_style_text_font(dropdown, font, 0);
+    lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_16, LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(dropdown, lv_color_hex(0xEAF2FF), 0);
+    lv_obj_t *list = lv_dropdown_get_list(dropdown);
+    lv_obj_set_style_bg_color(list, lv_color_hex(0x222D44), 0);
+    lv_obj_set_style_text_font(list, font, 0);
+    lv_obj_set_style_text_color(list, lv_color_hex(0xEAF2FF), 0);
+}
+
+static lv_obj_t *utility_panel(lv_obj_t *parent, int x, int y, int width, int height, uint32_t color)
+{
+    lv_obj_t *panel = lv_obj_create(parent);
+    lv_obj_set_pos(panel, x, y);
+    lv_obj_set_size(panel, width, height);
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(color), 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0x34435E), 0);
+    lv_obj_set_style_radius(panel, 18, 0);
+    return panel;
 }
 
 static void page_free(app_ui_t *ui)
@@ -266,8 +298,7 @@ static lv_obj_t *alarm_dropdown(lv_obj_t *parent, int x, int y, int width, const
     lv_obj_t *dropdown = lv_dropdown_create(parent);
     lv_obj_set_pos(dropdown, x, y);
     lv_obj_set_size(dropdown, width, 50);
-    lv_obj_set_style_text_font(dropdown, font, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(dropdown), font, 0);
+    utility_dropdown_style(dropdown, font);
     return dropdown;
 }
 
@@ -286,6 +317,7 @@ static void alarm_build_list(alarm_page_t *page, lv_obj_t *content)
     page->list_view = view;
     app_ui_add_text(view, "每日闹钟", LV_ALIGN_TOP_LEFT, 8, 10, 0xE4EFFF, app_ui_chinese_font_size(24));
     page->add = utility_button(view, "添加", 300, 1, 96, alarm_add, page);
+    lv_obj_set_style_bg_color(page->add, lv_color_hex(0x246261), 0);
     lv_obj_t *list = alarm_surface(view, 402, 265);
     lv_obj_set_pos(list, 2, 55);
     lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
@@ -302,15 +334,16 @@ static void alarm_build_list(alarm_page_t *page, lv_obj_t *content)
         row->body = alarm_surface(list, 394, 58);
         lv_obj_set_style_bg_color(row->body, lv_color_hex(0x1D2A42), 0);
         lv_obj_set_style_bg_opa(row->body, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(row->body, 12, 0);
+        lv_obj_set_style_radius(row->body, 16, 0);
         lv_obj_t *edit = lv_button_create(row->body);
         lv_obj_set_size(edit, 295, 58);
         lv_obj_set_pos(edit, 0, 0);
-        lv_obj_set_style_radius(edit, 12, 0);
-        lv_obj_set_style_bg_color(edit, lv_color_hex(0x253650), 0);
+        lv_obj_set_style_radius(edit, 16, 0);
+        lv_obj_set_style_bg_color(edit, lv_color_hex(0x22344E), 0);
+        lv_obj_set_style_bg_color(edit, lv_color_hex(0x304D67), LV_STATE_PRESSED);
         lv_obj_set_style_shadow_width(edit, 0, 0);
         lv_obj_add_event_cb(edit, alarm_open_row, LV_EVENT_CLICKED, row);
-        row->time = app_ui_add_text(edit, "", LV_ALIGN_LEFT_MID, 10, 0, 0xF0F4FF, &lv_font_montserrat_28);
+        row->time = app_ui_add_text(edit, "", LV_ALIGN_LEFT_MID, 12, 0, 0x91E5D0, &lv_font_montserrat_28);
         row->tone = app_ui_add_text(edit, "", LV_ALIGN_LEFT_MID, 121, 0, 0xB6C8E5, app_ui_chinese_font());
         app_ui_add_text(edit, LV_SYMBOL_EDIT, LV_ALIGN_RIGHT_MID, -5, 0, 0xB6C8E5, &lv_font_montserrat_20);
         row->enabled = lv_switch_create(row->body);
@@ -350,7 +383,8 @@ static void alarm_build_editor(alarm_page_t *page, lv_obj_t *content)
     utility_button(view, "试听", 286, 178, 110, alarm_preview, page);
     page->remove = utility_button(view, "删除", 8, 255, 105, alarm_delete_request, page);
     lv_obj_set_style_bg_color(page->remove, lv_color_hex(0x673A4D), 0);
-    utility_button(view, "保存", 251, 255, 145, alarm_save, page);
+    lv_obj_t *save = utility_button(view, "保存", 251, 255, 145, alarm_save, page);
+    lv_obj_set_style_bg_color(save, lv_color_hex(0x246261), 0);
     page->edit_status = app_ui_add_text(view, "", LV_ALIGN_TOP_MID, 0, 316,
                                         0xA6BDDA, app_ui_chinese_font());
     alarm_show(view, false);
@@ -455,7 +489,17 @@ typedef struct {
 static void note_layout(void *context, bool keyboard_visible)
 {
     notes_page_t *page = context;
-    lv_obj_set_height(page->field, keyboard_visible ? 117 : 287);
+    int32_t height = 287;
+    lv_obj_set_y(page->field, keyboard_visible ? 48 : 56);
+    lv_obj_set_style_pad_ver(page->field, keyboard_visible ? 7 : 12, 0);
+    if (keyboard_visible) {
+        lv_obj_update_layout(page->keyboard);
+        lv_area_t field, keyboard;
+        lv_obj_get_coords(page->field, &field);
+        lv_obj_get_coords(page->keyboard, &keyboard);
+        height = LV_CLAMP(0, keyboard.y1 - field.y1 - 6, height);
+    }
+    lv_obj_set_height(page->field, height);
 }
 
 static bool note_submit(notes_page_t *page)
@@ -557,17 +601,25 @@ void app_open_notes(app_ui_t *ui)
     ui->page_cleanup = notes_cleanup;
     page->selector = lv_dropdown_create(content);
     lv_obj_set_size(page->selector, 148, 44);
-    lv_obj_set_style_text_font(page->selector, app_ui_chinese_font(), 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(page->selector), app_ui_chinese_font(), 0);
+    utility_dropdown_style(page->selector, app_ui_chinese_font());
     lv_dropdown_set_options_static(page->selector, "便签 1\n便签 2\n便签 3\n便签 4");
     lv_obj_add_event_cb(page->selector, select_note, LV_EVENT_VALUE_CHANGED, page);
     page->status = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 165, 14, 0xA6BDDA, app_ui_chinese_font());
     lv_obj_set_width(page->status, 237);
     lv_label_set_long_mode(page->status, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(page->status, LV_TEXT_ALIGN_RIGHT, 0);
     page->field = lv_textarea_create(content);
     lv_obj_set_pos(page->field, 0, 56);
     lv_obj_set_size(page->field, 405, 287);
     lv_obj_set_style_text_font(page->field, app_ui_chinese_font_size(24), 0);
+    lv_obj_set_style_bg_color(page->field, lv_color_hex(0x1B2337), 0);
+    lv_obj_set_style_border_color(page->field, lv_color_hex(0x34435E), 0);
+    lv_obj_set_style_border_color(page->field, lv_color_hex(0x579896), LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(page->field, 1, 0);
+    lv_obj_set_style_radius(page->field, 18, 0);
+    lv_obj_set_style_text_color(page->field, lv_color_hex(0xEEF5FF), 0);
+    app_text_input_style_cursor(page->field, 0x92E7F1);
+    lv_obj_set_style_text_color(page->field, lv_color_hex(0x8C9CB4), LV_PART_TEXTAREA_PLACEHOLDER);
     lv_obj_set_style_text_line_space(page->field, 5, 0);
     lv_obj_set_style_pad_all(page->field, 12, 0);
     lv_obj_add_state(page->field, LV_STATE_DISABLED);
@@ -645,7 +697,16 @@ void app_open_calendar(app_ui_t *ui)
     lv_obj_set_size(page->calendar, 405, 269);
     lv_calendar_set_day_names(page->calendar, week);
     lv_obj_t *grid = lv_calendar_get_btnmatrix(page->calendar);
+    lv_obj_set_style_bg_color(page->calendar, lv_color_hex(0x1B2337), 0);
+    lv_obj_set_style_radius(page->calendar, 18, 0);
+    lv_obj_set_style_border_color(page->calendar, lv_color_hex(0x34435E), 0);
+    lv_obj_set_style_border_width(page->calendar, 1, 0);
     lv_obj_set_style_text_font(grid, app_ui_chinese_font(), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(grid, lv_color_hex(0x273852), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(grid, lv_color_hex(0x266867), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(grid, lv_color_hex(0x395F80), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(grid, lv_color_hex(0xDFEBFF), LV_PART_ITEMS);
+    lv_obj_set_style_text_color(grid, lv_color_hex(0x8394AD), LV_PART_ITEMS | LV_STATE_DISABLED);
     lv_obj_set_style_text_line_space(grid, 0, LV_PART_ITEMS);
     lv_obj_set_style_pad_gap(grid, 2, LV_PART_MAIN);
     lv_obj_set_style_pad_all(grid, 3, LV_PART_MAIN);
@@ -665,9 +726,23 @@ void app_open_calendar(app_ui_t *ui)
 }
 
 typedef struct {
-    lv_obj_t *city, *temperature, *condition, *status;
-    lv_obj_t *days[APP_WEATHER_DAYS];
+    lv_obj_t *city, *temperature, *condition, *humidity, *status;
+    lv_obj_t *sun, *cloud, *rain;
+    lv_obj_t *dates[APP_WEATHER_DAYS], *conditions[APP_WEATHER_DAYS], *ranges[APP_WEATHER_DAYS];
 } weather_page_t;
+
+static lv_obj_t *weather_shape(lv_obj_t *parent, int x, int y, int width, int height, uint32_t color)
+{
+    lv_obj_t *part = lv_obj_create(parent);
+    lv_obj_remove_style_all(part);
+    lv_obj_remove_flag(part, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(part, x, y);
+    lv_obj_set_size(part, width, height);
+    lv_obj_set_style_radius(part, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(part, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(part, LV_OPA_COVER, 0);
+    return part;
+}
 
 static void weather_update(lv_timer_t *timer)
 {
@@ -678,19 +753,26 @@ static void weather_update(lv_timer_t *timer)
     app_weather_get(&weather);
     if (lv_dropdown_get_selected(page->city) != weather.city)
         lv_dropdown_set_selected(page->city, weather.city);
+    alarm_show(page->sun, weather.valid && weather.weather_code <= 2);
+    alarm_show(page->cloud, !weather.valid || weather.weather_code != 0);
+    alarm_show(page->rain, weather.valid && weather.weather_code >= 51);
+    for (unsigned day = 0; day < APP_WEATHER_DAYS; ++day)
+        alarm_show(lv_obj_get_parent(page->dates[day]), weather.valid);
+    lv_obj_set_y(page->status, weather.valid ? 327 : 190);
     if (weather.valid) {
         app_ui_label_fmt(page->temperature, "%d °C", weather.temperature_c);
-        app_ui_label_fmt(page->condition, "%s  %u%%", app_weather_condition(weather.weather_code),
-                         weather.humidity);
+        app_ui_label_text(page->condition, app_weather_condition(weather.weather_code));
+        app_ui_label_fmt(page->humidity, LV_SYMBOL_TINT "  %u%%", weather.humidity);
         for (unsigned day = 0; day < APP_WEATHER_DAYS; ++day) {
             const app_weather_day_t *item = &weather.daily[day];
-            app_ui_label_fmt(page->days[day], "%s     %s     %d°  /  %d°",
-                item->date + 5, app_weather_condition(item->weather_code), item->min_c, item->max_c);
+            app_ui_label_text(page->dates[day], item->date + 5);
+            app_ui_label_text(page->conditions[day], app_weather_condition(item->weather_code));
+            app_ui_label_fmt(page->ranges[day], "%d°  /  %d°", item->min_c, item->max_c);
         }
     } else {
         app_ui_label_text(page->temperature, "—");
         app_ui_label_text(page->condition, "");
-        for (unsigned day = 0; day < APP_WEATHER_DAYS; ++day) app_ui_label_text(page->days[day], "");
+        app_ui_label_text(page->humidity, "");
     }
     aether_wifi_status_t wifi;
     const bool connected = aether_wifi_get_status(aether_wifi_get_default(), &wifi) == ESP_OK && wifi.connected;
@@ -733,25 +815,34 @@ void app_open_weather(app_ui_t *ui)
     }
     page->city = lv_dropdown_create(content);
     lv_obj_set_size(page->city, 164, 44);
-    lv_obj_set_style_text_font(page->city, app_ui_chinese_font(), 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(page->city), app_ui_chinese_font(), 0);
+    utility_dropdown_style(page->city, app_ui_chinese_font());
     lv_dropdown_set_options(page->city, cities);
     lv_obj_add_event_cb(page->city, city_changed, LV_EVENT_VALUE_CHANGED, page);
     utility_button(content, LV_SYMBOL_REFRESH, 350, 0, 54, weather_refresh_event, NULL);
-    page->temperature = app_ui_add_text(content, "—", LV_ALIGN_TOP_MID, 0, 66,
-                                          0xEDF5FF, &lv_font_montserrat_48);
-    page->condition = app_ui_add_text(content, "", LV_ALIGN_TOP_MID, 0, 129,
-                                        0xC9DDF7, app_ui_chinese_font_size(24));
+    lv_obj_t *now = utility_panel(content, 0, 54, 405, 116, 0x222D49);
+    page->sun = weather_shape(now, 32, 20, 42, 42, 0xFFCF84);
+    page->cloud = weather_shape(now, 22, 37, 76, 53, 0x222D49);
+    lv_obj_set_style_bg_opa(page->cloud, LV_OPA_TRANSP, 0);
+    weather_shape(page->cloud, 2, 24, 68, 21, 0xCBDCF5);
+    weather_shape(page->cloud, 13, 14, 29, 29, 0xCBDCF5);
+    weather_shape(page->cloud, 33, 4, 32, 32, 0xCBDCF5);
+    page->rain = app_ui_add_text(now, LV_SYMBOL_TINT " " LV_SYMBOL_TINT,
+                                 LV_ALIGN_TOP_LEFT, 45, 83, 0x8FD7FF, &lv_font_montserrat_16);
+    page->temperature = app_ui_add_text(now, "—", LV_ALIGN_TOP_RIGHT, -17, 10,
+                                         0xEFF5FF, &lv_font_montserrat_48);
+    page->condition = app_ui_add_text(now, "", LV_ALIGN_BOTTOM_LEFT, 112, -17,
+                                      0xDBE7F9, app_ui_chinese_font_size(24));
+    page->humidity = app_ui_add_text(now, "", LV_ALIGN_BOTTOM_RIGHT, -20, -18,
+                                     0x8FD7FF, &lv_font_montserrat_20);
     for (unsigned day = 0; day < APP_WEATHER_DAYS; ++day) {
-        lv_obj_t *row = lv_obj_create(content);
-        lv_obj_set_pos(row, 0, 176 + 48 * day);
-        lv_obj_set_size(row, 405, 42);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_bg_color(row, lv_color_hex(0x1D304D), 0);
-        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_t *row = utility_panel(content, 0, 180 + 46 * day, 405, 40, 0x1B2337);
         lv_obj_set_style_radius(row, 12, 0);
-        page->days[day] = app_ui_add_text(row, "", LV_ALIGN_CENTER, 0, 0,
-                                            0xEAF2FE, app_ui_chinese_font());
+        page->dates[day] = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 15, 0,
+                                          0xBDCEE9, &lv_font_montserrat_16);
+        page->conditions[day] = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 103, 0,
+                                               0xDFEAFE, app_ui_chinese_font());
+        page->ranges[day] = app_ui_add_text(row, "", LV_ALIGN_RIGHT_MID, -15, 0,
+                                           0x97DCCD, &lv_font_montserrat_16);
     }
     page->status = app_ui_add_text(content, "", LV_ALIGN_TOP_MID, 0, 327,
                                      0xADBCD2, app_ui_chinese_font());

@@ -1,4 +1,5 @@
 #include "app_gps.h"
+#include "app_instrument_ui.h"
 #include <app_ui_internal.h>
 
 #include <math.h>
@@ -11,7 +12,8 @@
 #define GPS_SIGNAL_BARS 16
 
 typedef struct {
-    lv_obj_t *state, *button, *button_text, *metrics, *position, *details, *help;
+    lv_obj_t *state, *status_dot, *button, *button_text, *metrics;
+    lv_obj_t *visible, *used, *latitude, *longitude, *position, *details, *help;
     lv_obj_t *sky_empty, *signal_empty;
     lv_obj_t *satellite[GNSS_MAX_SATELLITES], *satellite_text[GNSS_MAX_SATELLITES];
     lv_obj_t *bar[GPS_SIGNAL_BARS], *bar_text[GPS_SIGNAL_BARS], *bar_value[GPS_SIGNAL_BARS];
@@ -93,9 +95,12 @@ static void update_gps(app_ui_t *ui)
     if (!status.available) state = "定位服务不可用";
     if (page->submit_error != ESP_OK) state = "操作未受理";
     app_ui_label_text(page->state, state);
-    const uint32_t state_color = fixed ? 0x69E4AD : 0xE8F1FF;
+    uint32_t state_color = running ? INSTRUMENT_BLUE : INSTRUMENT_MUTED;
+    if (fixed) state_color = INSTRUMENT_TEAL;
+    if (page->submit_error != ESP_OK || status.state == APP_GPS_ERROR) state_color = 0xFFB7A5;
     if (page->state_color != state_color) {
         lv_obj_set_style_text_color(page->state, lv_color_hex(state_color), 0);
+        lv_obj_set_style_bg_color(page->status_dot, lv_color_hex(state_color), 0);
         page->state_color = state_color;
     }
     const bool stop = status.requested_enabled || status.active || status.state == APP_GPS_POWERING;
@@ -110,11 +115,11 @@ static void update_gps(app_ui_t *ui)
     else snprintf(supply, sizeof(supply), "--");
     if (running && status.pps_seen && status.pps_age_ms < 2500) snprintf(pps, sizeof(pps), "%lu", (unsigned long)status.pps_count);
     else snprintf(pps, sizeof(pps), "--");
-    app_ui_label_fmt(page->metrics,
-        "可见卫星    %u\n参与定位    %u\n定位模式    %s\nHDOP        %s\nPPS 脉冲    %s\n供电        %s\n电源来源    %s",
-        running ? nav->satellite_count : 0, fixed ? nav->satellites_used : 0,
-        fixed ? nav->fix_dimension == 3 ? "3D" : nav->fix_dimension == 2 ? "2D" : "有效" : "--", hdop, pps, supply,
-        status.external_power ? "USB 输入" : status.supply_valid ? "OTG 输出" : "--");
+    app_ui_label_fmt(page->visible, "%u", running ? nav->satellite_count : 0);
+    app_ui_label_fmt(page->used, "%u", fixed ? nav->satellites_used : 0);
+    app_ui_label_fmt(page->metrics, "%s    HDOP %s\nPPS %s\n%s\n%s",
+        fixed ? nav->fix_dimension == 3 ? "3D" : nav->fix_dimension == 2 ? "2D" : "有效" : "--",
+        hdop, pps, supply, status.external_power ? "USB 输入" : status.supply_valid ? "OTG 输出" : "电池自动 5V OTG");
 
     char latitude[48], longitude[48], altitude[24], speed[24], utc[48];
     if (fixed) {
@@ -128,7 +133,9 @@ static void update_gps(app_ui_t *ui)
     if (running && nav->date_valid && nav->time_valid)
         snprintf(utc, sizeof(utc), "%04u-%02u-%02u %02u:%02u:%02u UTC", nav->year, nav->month, nav->day, nav->hour, nav->minute, nav->second);
     else snprintf(utc, sizeof(utc), "UTC --");
-    app_ui_label_fmt(page->position, "纬度  %s\n经度  %s\n海拔  %s     速度  %s\n%s", latitude, longitude, altitude, speed, utc);
+    app_ui_label_text(page->latitude, latitude);
+    app_ui_label_text(page->longitude, longitude);
+    app_ui_label_fmt(page->position, "海拔 %s    速度 %s\n%s", altitude, speed, utc);
 
     const unsigned count = running && nav->satellite_count <= GNSS_MAX_SATELLITES ? nav->satellite_count : 0;
     const bool satellites_changed = !page->satellites_published || page->last_satellite_count != count ||
@@ -182,16 +189,15 @@ static void update_gps(app_ui_t *ui)
     page->last_satellite_count = count;
     page->satellites_published = true;
     }
-    app_ui_label_fmt(page->details, "NMEA %lu   校验失败 %lu   运行 %lu s\nG GPS / B 北斗 / R GLONASS / E Galileo",
+    app_ui_label_fmt(page->details, "NMEA %lu   校验失败 %lu   %lu s\nG GPS / B 北斗 / R GLONASS / E Galileo",
         (unsigned long)nav->accepted_sentences, (unsigned long)nav->bad_checksums, (unsigned long)(status.session_ms / 1000));
     const esp_err_t error = page->submit_error != ESP_OK ? page->submit_error : status.last_error;
-    if (error != ESP_OK) app_ui_label_fmt(page->help, "供电或串口未就绪：%s\n请检查输入电源 / OTG 状态后重试。", esp_err_to_name(error));
-    else if (!stop) app_ui_label_text(page->help, "外部供电无需 OTG；电池模式自动输出 5V。\n退出本页停止定位；不会自动改写 RTC。");
+    if (error != ESP_OK) app_ui_label_fmt(page->help, "供电或串口未就绪  %s", esp_err_to_name(error));
+    else if (!stop) app_ui_label_text(page->help, "外部供电免 OTG，电池自动输出 5V。");
     else if (!status.uart_receiving && status.state != APP_GPS_POWERING)
-        app_ui_label_text(page->help, "等待 9600 波特率数据，请检查 TX/RX 交叉。\n移到开阔户外，陶瓷天线朝向天空。");
-    else if (status.external_power) app_ui_label_text(page->help,
-        "USB 输入供电，不启用 OTG；可保持电脑调试。\n请在开阔户外等待定位，首次搜星可能较慢。\nHDOP 为无量纲几何因子，不是米级精度。");
-    else app_ui_label_text(page->help, "电池模式使用 OTG 输出，请避免供电冲突。\n请在开阔户外等待定位，首次搜星可能较慢。\nHDOP 为无量纲几何因子，不是米级精度。");
+        app_ui_label_text(page->help, "检查 TX/RX 交叉连接与 9600 波特率。");
+    else if (!fixed) app_ui_label_text(page->help, "移到开阔户外，天线朝向天空。");
+    else app_ui_label_text(page->help, status.external_power ? "USB 输入供电，不启用 OTG。" : "");
 }
 
 static void gps_timer(lv_timer_t *timer) { update_gps(lv_timer_get_user_data(timer)); }
@@ -223,17 +229,19 @@ void app_open_gps(app_ui_t *ui)
     ui->page_cleanup = gps_cleanup;
     lv_obj_set_style_pad_all(content, 12, 0);
     lv_obj_set_scroll_dir(content, LV_DIR_VER);
-    page->state = text(content, "未开启", 4, 5, 270, 0xE8F1FF, app_ui_chinese_font_size(24));
-    page->button = lv_button_create(content);
-    lv_obj_set_pos(page->button, 286, 0); lv_obj_set_size(page->button, 132, 38);
-    lv_obj_set_style_radius(page->button, 15, 0);
-    lv_obj_set_style_bg_color(page->button, lv_color_hex(0x235C55), 0);
+    const lv_font_t *small = app_ui_chinese_font();
+    lv_obj_t *header = instrument_card(content, 0, 0, 424, 52);
+    page->status_dot = shape(header, 12, 21, 10, 10, INSTRUMENT_MUTED);
+    lv_obj_set_style_radius(page->status_dot, LV_RADIUS_CIRCLE, 0);
+    page->state = instrument_text(header, "未开启", 32, 13, 230, INSTRUMENT_MUTED, app_ui_chinese_font_size(24));
+    page->button = lv_button_create(header);
+    lv_obj_set_pos(page->button, 274, 5);
+    lv_obj_set_size(page->button, 144, 42);
+    instrument_button_style(page->button, INSTRUMENT_PRIMARY);
     page->button_text = app_ui_add_text(page->button, "开启定位", LV_ALIGN_CENTER, 0, 0, 0xC6FFE4, app_ui_chinese_font());
     lv_obj_add_event_cb(page->button, gps_command, LV_EVENT_CLICKED, ui);
 
-    text(content, "外部供电直接使用；电池供电自动开启 5V OTG", 4, 44, 418, 0x9CCEB9, app_ui_chinese_font());
-    lv_obj_t *sky = shape(content, 0, 70, GPS_SKY_SIZE, GPS_SKY_SIZE, 0x0A1424);
-    lv_obj_set_style_radius(sky, 20, 0);
+    lv_obj_t *sky = instrument_card(content, 0, 62, GPS_SKY_SIZE, GPS_SKY_SIZE);
     for (unsigned ring_index = 1; ring_index <= 3; ++ring_index) {
         const unsigned r = GPS_SKY_RADIUS * ring_index / 3;
         lv_obj_t *ring = shape(sky, 100 - (int)r, 100 - (int)r, (int)r * 2, (int)r * 2, 0);
@@ -256,18 +264,28 @@ void app_open_gps(app_ui_t *ui)
         page->satellite_text[i] = app_ui_add_text(page->satellite[i], "", LV_ALIGN_CENTER, 0, 0, 0x071421, &lv_font_montserrat_14);
         hide(page->satellite[i], true);
     }
-    page->metrics = text(content, "", 212, 74, 210, 0xCCDCEF, app_ui_chinese_font());
-    lv_obj_set_style_text_line_space(page->metrics, 9, 0);
-    text(content, "绿色：参与定位   蓝色：已跟踪", 4, 276, 414, 0x86A6BE, app_ui_chinese_font());
-    page->position = text(content, "", 4, 304, 418, 0xE3EDF9, app_ui_chinese_font());
-    lv_obj_set_style_text_line_space(page->position, 6, 0);
-    text(content, "信号强度 C/N0 (dB-Hz)  ·  最强 16 颗", 4, 410, 418, 0xA9C3DF, app_ui_chinese_font());
-    lv_obj_t *signals = shape(content, 0, 436, 424, 140, 0x0A1424);
+    lv_obj_t *metrics = instrument_card(content, 210, 62, 214, 200);
+    instrument_text(metrics, "可见卫星", 13, 13, 95, INSTRUMENT_MUTED, small);
+    instrument_text(metrics, "参与定位", 111, 13, 96, INSTRUMENT_MUTED, small);
+    page->visible = instrument_text(metrics, "0", 13, 38, 87, INSTRUMENT_BLUE, &lv_font_montserrat_28);
+    page->used = instrument_text(metrics, "0", 111, 38, 90, INSTRUMENT_TEAL, &lv_font_montserrat_28);
+    shape(metrics, 13, 83, 187, 1, INSTRUMENT_BORDER);
+    page->metrics = text(metrics, "", 13, 95, 187, INSTRUMENT_TEXT, small);
+    lv_obj_set_style_text_line_space(page->metrics, 6, 0);
+
+    lv_obj_t *position = instrument_card(content, 0, 272, 424, 104);
+    instrument_text(position, "纬度", 13, 9, 170, INSTRUMENT_MUTED, small);
+    instrument_text(position, "经度", 216, 9, 180, INSTRUMENT_MUTED, small);
+    page->latitude = instrument_text(position, "--", 13, 29, 188, INSTRUMENT_BLUE, &lv_font_montserrat_24);
+    page->longitude = instrument_text(position, "--", 216, 29, 195, INSTRUMENT_TEAL, &lv_font_montserrat_24);
+    page->position = text(position, "", 13, 61, 398, INSTRUMENT_TEXT, small);
+    text(content, "信号强度 C/N0 (dB-Hz)", 4, 386, 414, INSTRUMENT_MUTED, small);
+    lv_obj_t *signals = instrument_card(content, 0, 412, 424, 140);
     lv_obj_add_flag(signals, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(signals, LV_DIR_HOR);
     lv_obj_set_scrollbar_mode(signals, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_style_radius(signals, 12, 0);
-    page->signal_empty = text(signals, "尚无可用的卫星信号数据", 20, 60, 380, 0x7186A2, app_ui_chinese_font());
+    page->signal_empty = text(signals, "尚无可用的卫星信号数据", 20, 60, 380, INSTRUMENT_MUTED, small);
     for (unsigned i = 0; i < GPS_SIGNAL_BARS; ++i) {
         lv_obj_t *column = shape(signals, 8 + (int)i * 34, 4, 32, 126, 0x0A1424);
         page->bar[i] = shape(column, 7, 105, 18, 1, 0x75BFFF);
@@ -278,8 +296,14 @@ void app_open_gps(app_ui_t *ui)
         lv_obj_set_style_text_align(page->bar_text[i], LV_TEXT_ALIGN_CENTER, 0);
         hide(column, true);
     }
-    page->details = text(content, "", 4, 588, 418, 0x8198B5, app_ui_chinese_font());
-    page->help = text(content, "", 4, 636, 418, 0xA4BCD6, app_ui_chinese_font());
+    lv_obj_t *legend_fixed = shape(content, 4, 565, 10, 10, 0x69E4AD);
+    lv_obj_t *legend_tracking = shape(content, 139, 565, 10, 10, 0x75BFFF);
+    lv_obj_set_style_radius(legend_fixed, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(legend_tracking, LV_RADIUS_CIRCLE, 0);
+    text(content, "参与定位", 22, 562, 103, INSTRUMENT_MUTED, small);
+    text(content, "已跟踪", 157, 562, 115, INSTRUMENT_MUTED, small);
+    page->details = text(content, "", 4, 592, 418, INSTRUMENT_MUTED, small);
+    page->help = text(content, "", 4, 643, 418, INSTRUMENT_BLUE, small);
     app_ui_set_timer(ui, gps_timer, 500);
     update_gps(ui);
 }

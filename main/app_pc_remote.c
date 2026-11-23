@@ -44,7 +44,8 @@ static bool power_allows_input(void)
 
 static bool fresh_gyro(const app_telemetry_snapshot_t *sample, uint32_t now)
 {
-    return sample && sample->imu_error == ESP_OK && sample->imu.gyro_bias_valid &&
+    return sample && !sample->gyro_calibrating &&
+           sample->imu_error == ESP_OK && sample->imu.gyro_bias_valid &&
            now - sample->imu_updated_ms <= IMU_MAX_AGE_MS;
 }
 
@@ -90,7 +91,8 @@ static void service_remote(const app_telemetry_snapshot_t *sample)
 {
     const int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_lock);
-    if (s_motion_until && s_motion_until <= now) stop_motion_locked();
+    if (s_motion_until && (s_motion_until <= now || (sample && sample->gyro_calibrating)))
+        stop_motion_locked();
     const bool moving = s_air_mode && s_motion_until > now;
     const uint32_t epoch = s_motion_epoch;
     portEXIT_CRITICAL(&s_lock);

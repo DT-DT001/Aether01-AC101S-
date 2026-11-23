@@ -18,6 +18,7 @@ typedef struct {
     uint32_t imu_updated_ms;
     uint32_t barometer_updated_ms;
     uint32_t rtc_updated_ms;
+    bool gyro_calibrating;
 } app_telemetry_snapshot_t;
 
 /** Start the sole periodic sensor/RTC reader. No I2C runs in the UI task. */
@@ -35,6 +36,8 @@ void app_telemetry_set_imu_measurement(bool (*requested)(void),
                                       void (*consume)(const app_telemetry_snapshot_t *));
 /* Optional cached-state diagnostic on this background task, never LVGL. */
 void app_telemetry_set_media_probe(void (*probe)(void *), void *context);
+/* Optional cache-only guard against flash contention with active media. */
+void app_telemetry_set_gyro_persistence_guard(bool (*busy)(void *), void *context);
 /** Stop all periodic I2C sampling and wait for the current read batch to exit.
  * Timeout leaves sampling gated; call resume after any aborted shutdown. */
 esp_err_t app_telemetry_quiesce(uint32_t timeout_ms);

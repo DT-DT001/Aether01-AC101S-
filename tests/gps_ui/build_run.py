@@ -15,6 +15,7 @@ lvgl = root / 'managed_components/lvgl__lvgl'
 objects = sorted(cached.glob('managed_components_lvgl__lvgl_src_*.c.o'))
 if not objects:
     raise SystemExit('Run tests/home_ui/build_run.py first to populate the native LVGL cache')
+objects = [path for path in objects if not path.name.endswith('lv_font_montserrat_28.c.o')]
 objects += [cached / 'main_assets_font_16.c.o', cached / 'main_assets_font_24.c.o']
 includes = [root / 'tests/pc_remote_ui/stubs', root / 'tests/reader_ui/stubs',
             root / 'tests/reader_ui', root / 'main',
@@ -22,8 +23,8 @@ includes = [root / 'tests/pc_remote_ui/stubs', root / 'tests/reader_ui/stubs',
 flags = ['gcc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
          '-fsanitize=address,undefined', '-ffunction-sections', '-fdata-sections',
          '-DLV_CONF_INCLUDE_SIMPLE', '-DLV_CONF_SUPPRESS_DEFINE_CHECK=1',
-         '-D_DEFAULT_SOURCE', *['-I'+str(path) for path in includes]]
-for source in [root / 'main/apps/app_gps.c', test / 'smoke.c']:
+         '-DLV_FONT_MONTSERRAT_28=1', '-D_DEFAULT_SOURCE', *['-I'+str(path) for path in includes]]
+for source in [root / 'main/apps/app_gps.c', lvgl / 'src/font/lv_font_montserrat_28.c', test / 'smoke.c']:
     obj = out / (source.stem + '.o')
     subprocess.run(flags + ['-c', str(source), '-o', str(obj)], check=True)
     objects.append(obj)

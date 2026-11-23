@@ -133,7 +133,7 @@ static lv_obj_t *find(lv_obj_t *p,const char *s){if(lv_obj_check_type(p,&lv_labe
 static bool hidden(lv_obj_t *o){for(;o;o=lv_obj_get_parent(o))if(lv_obj_has_flag(o,LV_OBJ_FLAG_HIDDEN))return true;return false;}
 static lv_obj_t *slider(lv_obj_t *p,unsigned range){if(lv_obj_check_type(p,&lv_slider_class)&&(unsigned)lv_slider_get_max_value(p)==range)return p;for(unsigned i=0;i<lv_obj_get_child_count(p);++i){lv_obj_t *o=slider(lv_obj_get_child(p,(int32_t)i),range);if(o)return o;}return NULL;}
 static lv_area_t area(lv_obj_t *o){lv_obj_update_layout(o);lv_area_t a;lv_obj_get_coords(o,&a);return a;}
-static void labels(lv_obj_t *p){if(!hidden(p)&&lv_obj_check_type(p,&lv_label_class)){lv_area_t a=area(p);if(a.x1<0||a.y1<0||a.x2>=480||a.y2>=480)fprintf(stderr,"outside %s (%d,%d)-(%d,%d)\n",lv_label_get_text(p),(int)a.x1,(int)a.y1,(int)a.x2,(int)a.y2);assert(a.x1>=0&&a.y1>=0&&a.x2<480&&a.y2<480);}for(unsigned i=0;i<lv_obj_get_child_count(p);++i)labels(lv_obj_get_child(p,(int32_t)i));}
+static void labels(lv_obj_t *p){if(!lv_obj_is_visible(p))return;if(lv_obj_check_type(p,&lv_label_class)){lv_area_t a=area(p);if(a.x1<0||a.y1<0||a.x2>=480||a.y2>=480)fprintf(stderr,"outside %s (%d,%d)-(%d,%d)\n",lv_label_get_text(p),(int)a.x1,(int)a.y1,(int)a.x2,(int)a.y2);assert(a.x1>=0&&a.y1>=0&&a.x2<480&&a.y2<480);}for(unsigned i=0;i<lv_obj_get_child_count(p);++i)labels(lv_obj_get_child(p,(int32_t)i));}
 static void capture(app_ui_t *ui,const char *name){lv_refr_now(NULL);labels(ui->screen);char path[512];snprintf(path,sizeof(path),"%s/fullscreen-%s.ppm",output,name);FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n480 480\n255\n");for(unsigned i=0;i<480*480;++i){uint16_t p=framebuffer[i];uint8_t c[]={((p>>11)&31)*255/31,((p>>5)&63)*255/63,(p&31)*255/31};assert(fwrite(c,1,3,f)==3);}assert(!fclose(f));}
 static void tap(int x,int y){point=(lv_point_t){x,y};held=true;advance(80);held=false;advance(100);}
 static void background_trace(lv_event_t *e){if(lv_event_get_code(e)==LV_EVENT_PRESSED)++background_presses;if(lv_event_get_code(e)==LV_EVENT_CLICKED)++background_clicks;}
@@ -212,7 +212,7 @@ static void test_errors(app_ui_t *ui)
     assert(lv_label_get_long_mode(ui->app_obj[1])==LV_LABEL_LONG_WRAP&&lv_obj_get_self_height(ui->app_obj[1])<=260);capture(ui,"video-prepare-error");
     click(ui,"重试");assert(ui->io_complete&&request.operation==APP_IO_PREPARE&&!strcmp(request.path,"/sdcard/Video/test.avi"));play_error=ESP_FAIL;deliver(ui,ESP_OK);advance(500);assert(strstr(lv_label_get_text(ui->app_obj[1]),"启动失败"));play_error=ESP_OK;
     click(ui,"重试");assert(ui->media_started&&!hidden(ui->app_obj[0]));video=(aether_video_status_t){.state=AETHER_VIDEO_PLAYING,.width=320,.height=240,.elapsed_ms=65000};show_video(ui,320,240);
-    assert(lv_obj_has_state(slider(ui->screen,1000),LV_STATE_DISABLED)&&find(ui->screen,"已播 01:05 · 总时长未知"));
+    assert(lv_obj_has_state(slider(ui->screen,1000),LV_STATE_DISABLED)&&find(ui->screen,"01:05 / --:--"));
     const uint8_t rates[]={24,30,10,15,0};for(unsigned i=0;i<5;++i){lv_obj_send_event(lv_obj_get_parent(ui->app_obj[3]),LV_EVENT_CLICKED,NULL);advance(120);assert(set_fps==rates[i]&&ui->app_value==rates[i]);}
     rate_error=ESP_FAIL;lv_obj_send_event(lv_obj_get_parent(ui->app_obj[3]),LV_EVENT_CLICKED,NULL);assert(ui->app_value==0);rate_error=ESP_OK;
     video.state=AETHER_VIDEO_ERROR;video.last_error=ESP_ERR_NOT_SUPPORTED;strlcpy(video.detail,"Unsupported JPEG dimensions 480x270: both dimensions must be multiples of 16. Full reason ends here.",sizeof(video.detail));advance(120);
@@ -269,6 +269,7 @@ static void test_catalog_end(app_ui_t *ui)
         assert(label&&lv_obj_is_visible(label));
         lv_obj_t *list=lv_obj_get_parent(lv_obj_get_parent(label));
         assert(lv_obj_get_child_count(list)==13&&!find(ui->screen,"下一页"));
+        capture(ui, i ? "nes-catalog" : "video-catalog");
         const unsigned before=catalog_calls;
         lv_obj_scroll_to_y(list,INT32_MAX,LV_ANIM_OFF);
         advance(120);

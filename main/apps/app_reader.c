@@ -1,4 +1,5 @@
 #include "app_ui_internal.h"
+#include "app_catalog_ui.h"
 #include "app_reader_layout.h"
 #include "aether_media_fs.h"
 #include "ui/app_scroll_list.h"
@@ -107,12 +108,10 @@ static lv_obj_t *reader_button(reader_t *reader, lv_obj_t *parent,
 {
     lv_obj_t *button = lv_button_create(parent);
     lv_obj_set_pos(button, x, y);
-    lv_obj_set_size(button, width, 38);
-    lv_obj_set_style_radius(button, 12, 0);
-    lv_obj_set_style_bg_color(button, lv_color_hex(0x215C50), 0);
+    lv_obj_set_size(button, width, 44);
+    app_catalog_control(button, 0x20344C);
     lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, reader->ui);
-    app_ui_add_text(button, caption, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF,
-                    app_ui_chinese_font_size(16));
+    app_ui_add_text(button, caption, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, app_ui_chinese_font_size(16));
     return button;
 }
 
@@ -186,9 +185,13 @@ static void update_position(reader_t *reader)
     const uint64_t progress = reader->file_size ?
         (reader->next_offset >= reader->file_size ? 1000U :
          reader->offset * 1000U / reader->file_size) : 0;
-    app_ui_label_fmt(reader->position, "%" PRIu64 ".%" PRIu64 "%% · %s · 缺字%u/坏码%u%s",
+    char diagnostics[48] = "";
+    if (reader->missing_count || reader->invalid_count)
+        snprintf(diagnostics, sizeof(diagnostics), " · 缺字%u/坏码%u",
+                 (unsigned)reader->missing_count, (unsigned)reader->invalid_count);
+    app_ui_label_fmt(reader->position, "%" PRIu64 ".%" PRIu64 "%% · %s%s%s",
                       progress / 10U, progress % 10U,
-                      app_reader_encoding_name(reader->encoding), (unsigned)reader->missing_count, (unsigned)reader->invalid_count,
+                      app_reader_encoding_name(reader->encoding), diagnostics,
                       app_io_bookmark_pending(reader->ui->io) ? "  待保存" :
                       reader->next_offset >= reader->file_size && reader->file_size ? "  完" : "");
     lv_slider_set_value(reader->seek, (int32_t)progress, LV_ANIM_OFF);
@@ -463,6 +466,7 @@ static void build_reader(reader_t *reader)
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_flag(content, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
     lv_obj_set_style_pad_all(content, 0, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_radius(content, 0, 0);
     lv_obj_set_style_bg_opa(content, LV_OPA_COVER, 0);
     lv_obj_set_size(content, LV_PCT(100), LV_PCT(100));
@@ -489,37 +493,38 @@ static void build_reader(reader_t *reader)
 
     lv_obj_t *toolbar = lv_obj_create(content);
     reader->toolbar = toolbar;
-    lv_obj_set_size(toolbar, 472, 142);
-    lv_obj_align(toolbar, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_size(toolbar, 448, 150);
+    lv_obj_align(toolbar, LV_ALIGN_BOTTOM_MID, 0, -10);
+    app_catalog_panel(toolbar);
     lv_obj_set_style_pad_all(toolbar, 12, 0);
-    lv_obj_set_style_border_width(toolbar, 0, 0);
     lv_obj_set_style_radius(toolbar, 18, 0);
-    lv_obj_set_style_bg_color(toolbar, lv_color_hex(0x14282D), 0);
     lv_obj_set_style_bg_opa(toolbar, LV_OPA_COVER, 0);
     lv_obj_remove_flag(toolbar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_t *title = app_ui_add_text(toolbar, file_name(reader->path),
                                       LV_ALIGN_TOP_LEFT, 0, 0, 0xE6EDF8,
                                       app_ui_chinese_font_size(16));
-    lv_obj_set_width(title, READER_WIDTH);
+    lv_obj_set_width(title, 422);
     lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
     reader->position = app_ui_add_text(toolbar, "", LV_ALIGN_TOP_LEFT, 0, 23,
                                         0xABC6CC, app_ui_chinese_font_size(16));
-    lv_obj_set_width(reader->position, READER_WIDTH);
+    lv_obj_set_width(reader->position, 422);
+    lv_label_set_long_mode(reader->position, LV_LABEL_LONG_DOT);
     reader->seek = lv_slider_create(toolbar);
     lv_obj_set_pos(reader->seek, 8, 58);
-    lv_obj_set_size(reader->seek, READER_WIDTH - 16U, 8);
+    lv_obj_set_size(reader->seek, 406, 8);
+    lv_obj_set_style_bg_color(reader->seek, lv_color_hex(0x66C6D6), LV_PART_INDICATOR);
     lv_obj_set_ext_click_area(reader->seek, 10);
     lv_slider_set_range(reader->seek, 0, 1000);
     lv_obj_add_event_cb(reader->seek, seek_event, LV_EVENT_RELEASED, reader->ui);
     lv_obj_t *button = reader_button(reader, toolbar, "24号字", 0, 80, 72, font_event);
     reader->font_label = lv_obj_get_child(button, 0);
-    button = reader_button(reader, toolbar, "日间", 80, 80, 68, theme_event);
+    button = reader_button(reader, toolbar, "日间", 80, 80, 64, theme_event);
     reader->theme_label = lv_obj_get_child(button, 0);
-    button = reader_button(reader, toolbar, "自动编码", 156, 80, 98, encoding_event);
+    button = reader_button(reader, toolbar, "自动编码", 152, 80, 94, encoding_event);
     reader->encoding_label = lv_obj_get_child(button, 0);
-    button = reader_button(reader, toolbar, "左右滑动", 262, 80, 102, turn_mode_event);
+    button = reader_button(reader, toolbar, "左右滑动", 254, 80, 96, turn_mode_event);
     reader->turn_label = lv_obj_get_child(button, 0);
-    reader_button(reader, toolbar, "书架", 372, 80, 76, bookshelf_event);
+    reader_button(reader, toolbar, "书架", 358, 80, 64, bookshelf_event);
     lv_obj_add_flag(toolbar, LV_OBJ_FLAG_HIDDEN);
     apply_theme(reader);
 }
@@ -598,16 +603,17 @@ static lv_obj_t *create_shelf_row(lv_obj_t *parent, void *context)
 {
     reader_t *reader = context;
     lv_obj_t *row = lv_button_create(parent);
-    lv_obj_set_size(row, SHELF_WIDTH - 8, 44);
-    lv_obj_set_style_radius(row, 10, 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x172E39), 0);
-    lv_obj_set_style_pad_all(row, 8, 0);
+    lv_obj_set_size(row, SHELF_WIDTH, 52);
+    app_catalog_row(row);
+    lv_obj_set_style_pad_all(row, 9, 0);
     lv_obj_add_event_cb(row, book_event, LV_EVENT_CLICKED, reader->ui);
-    lv_obj_t *name = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 0, 0, 0xE6EDF8,
+    lv_obj_t *name = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 46, 0, 0xE6EDF8,
                                      app_ui_chinese_font_size(16));
-    lv_obj_set_width(name, 310);
+    lv_obj_set_width(name, 258);
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
     app_ui_add_text(row, "", LV_ALIGN_RIGHT_MID, 0, 0, 0x8FA9CD, app_ui_chinese_font_size(16));
+    app_catalog_badge(app_ui_add_text(row, LV_SYMBOL_FILE, LV_ALIGN_LEFT_MID, 0, 0,
+                                      0x8DE0E1, &lv_font_montserrat_16));
     return row;
 }
 
@@ -627,22 +633,26 @@ static void show_shelf(reader_t *reader)
     lv_obj_t *content = reader->ui->content;
     app_scroll_list_deinit(&reader->shelf);
     lv_obj_clean(content);
-    lv_obj_set_style_pad_all(content, 12, 0);
+    app_catalog_panel(content);
+    lv_obj_set_style_pad_all(content, 11, 0);
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    reader->position = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 0, 9,
+    app_ui_add_text(content, "书架", LV_ALIGN_TOP_LEFT, 0, 2, 0xE9F2FF, app_ui_chinese_font_size(24));
+    reader->position = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 1, 32,
                                         0xABC6CC, app_ui_chinese_font_size(16));
+    lv_obj_set_width(reader->position, 350);
     if (reader->book_count)
         app_ui_label_fmt(reader->position, "%u 本%s", (unsigned)reader->book_count,
                           reader->truncated ? " · 索引已达上限" : "");
-    else app_ui_label_text(reader->position, "Books 文件夹和根目录没有 TXT");
-    reader_button(reader, content, "刷新", 344, 0, 72, bookshelf_event);
+    else app_ui_label_text(reader->position, "没有 TXT 小说");
+    lv_obj_t *refresh = reader_button(reader, content, LV_SYMBOL_REFRESH, 370, 4, 54, bookshelf_event);
+    lv_obj_set_style_text_font(lv_obj_get_child(refresh, 0), &lv_font_montserrat_24, 0);
     lv_obj_t *viewport = lv_obj_create(content);
-    lv_obj_set_pos(viewport, 0, 48);
-    lv_obj_set_size(viewport, SHELF_WIDTH, 322);
+    lv_obj_set_pos(viewport, 0, 59);
+    lv_obj_set_size(viewport, SHELF_WIDTH, 310);
     lv_obj_set_style_pad_all(viewport, 0, 0);
     lv_obj_set_style_border_width(viewport, 0, 0);
     lv_obj_set_style_bg_opa(viewport, LV_OPA_TRANSP, 0);
-    app_scroll_list_init(&reader->shelf, viewport, 50, create_shelf_row, bind_shelf_row, reader);
+    app_scroll_list_init(&reader->shelf, viewport, 59, create_shelf_row, bind_shelf_row, reader);
     app_scroll_list_set_count(&reader->shelf, reader->book_count);
 }
 

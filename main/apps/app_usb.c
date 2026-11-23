@@ -1,12 +1,12 @@
 #include "app_otg_control.h"
 #include "app_ui_modal.h"
-#include "app_ui_internal.h"
+#include "app_connection_style.h"
 
 #include <stdlib.h>
 #include <stdio.h>
 
 typedef struct {
-    lv_obj_t *state, *card, *help, *enter, *leave;
+    lv_obj_t *state, *details, *enter, *leave;
     esp_err_t submit_error;
 } usb_page_t;
 
@@ -79,6 +79,8 @@ static esp_err_t confirm_ejected_on_pc(app_ui_t *ui, uint32_t request_id,
         "请先在电脑安全弹出 U 盘。\n电脑已提示可以移除后，确认退出。\n尚未弹出就退出可能损坏文件。");
     lv_obj_t *cancel = lv_msgbox_add_footer_button(dialog->box, "返回");
     lv_obj_t *confirm = lv_msgbox_add_footer_button(dialog->box, "已安全弹出，退出");
+    lv_obj_set_height(cancel, 44);
+    lv_obj_set_height(confirm, 44);
     lv_obj_add_event_cb(cancel, eject_dialog_cancel, LV_EVENT_CLICKED, dialog);
     lv_obj_add_event_cb(confirm, eject_dialog_confirm, LV_EVENT_CLICKED, dialog);
     app_ui_modal_focus(dialog->box, cancel);
@@ -121,6 +123,7 @@ void app_usb_storage_notice(app_ui_t *ui)
     lv_msgbox_add_text(notice, shutdown ? "系统正在保存并准备关机，请稍候。" :
         "电脑正在使用 TF 卡，本地文件和媒体暂不可用。\n请先在电脑安全弹出，再到设置里的 USB 文件传输页退出。");
     lv_obj_t *close = lv_msgbox_add_footer_button(notice, "知道了");
+    lv_obj_set_height(close, 44);
     lv_obj_add_event_cb(close, notice_close, LV_EVENT_CLICKED, notice);
     app_ui_modal_focus(notice, close);
 }
@@ -177,7 +180,7 @@ static void update_usb(app_ui_t *ui)
             (unsigned long)(status.usb_clock_khz % 1000 / 100),
             status.usb_high_speed_fallback ? " 已降频" : "");
     else snprintf(clock, sizeof(clock), "%s", status.active ? "时钟待确认" : "本地模式");
-    app_ui_label_fmt(page->card, "USB：%s / %s\nTF：%s / %s\n容量：%llu MiB",
+    app_ui_label_fmt(page->details, "USB：%s / %s\nTF：%s / %s\n容量：%llu MiB",
         status.host_ejected ? "电脑已弹出" : status.host_connected ? "电脑已连接" : "等待数据连接", link,
         status.media_present ? "已就绪" : "未就绪", clock,
         (unsigned long long)(status.capacity_bytes / (1024ULL * 1024ULL)));
@@ -189,9 +192,6 @@ static void update_usb(app_ui_t *ui)
     if (host_busy && !status.blocked) app_ui_label_text(page->state, "请先关闭 OTG 并等待外设释放，再开启电脑传输");
     enabled(page->leave, read_error == ESP_OK && !status.pending && status.blocked &&
                          !app_io_is_quiescing(ui->io));
-    app_ui_label_fmt(page->help, "阶段 %u / 路径 %u\n%s",
-        status.diagnostic_stage, status.selected_route,
-        status.blocked ? "传输中；本地文件暂不可用。" : "关闭后恢复本地 TF 和下载串口。");
 }
 
 static void usb_timer(lv_timer_t *timer)
@@ -208,22 +208,21 @@ static void usb_command(lv_event_t *event)
     update_usb(ui);
 }
 
-static lv_obj_t *text(app_ui_t *ui, int y, int height, uint32_t color)
+static lv_obj_t *text(lv_obj_t *parent, const char *value, int x, int y,
+                      int width, int height, uint32_t color)
 {
-    lv_obj_t *label = app_ui_add_text(ui->content, "", LV_ALIGN_TOP_LEFT, 0, y,
-                                     color, app_ui_chinese_font());
-    lv_obj_set_size(label, 408, height);
+    lv_obj_t *label = app_ui_add_text(parent, value, LV_ALIGN_TOP_LEFT, x, y, color, app_ui_chinese_font());
+    lv_obj_set_size(label, width, height);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     return label;
 }
 
-static lv_obj_t *button(app_ui_t *ui, const char *name, int x)
+static lv_obj_t *button(app_ui_t *ui, const char *name, int x, bool primary)
 {
     lv_obj_t *object = lv_button_create(ui->content);
-    lv_obj_set_pos(object, x, 254);
-    lv_obj_set_size(object, 188, 48);
-    lv_obj_set_style_radius(object, 14, 0);
-    lv_obj_set_style_bg_color(object, lv_color_hex(0x2768D8), 0);
+    lv_obj_set_pos(object, x, 270);
+    lv_obj_set_size(object, 196, 48);
+    app_connection_button_style(object, primary);
     lv_obj_add_event_cb(object, usb_command, LV_EVENT_CLICKED, ui);
     app_ui_add_text(object, name, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, app_ui_chinese_font());
     return object;
@@ -231,7 +230,7 @@ static lv_obj_t *button(app_ui_t *ui, const char *name, int x)
 
 void app_open_usb(app_ui_t *ui)
 {
-    app_ui_begin_page(ui, "USB 文件传输");
+    lv_obj_t *content = app_ui_begin_page(ui, "USB 文件传输");
     usb_page_t *page = calloc(1, sizeof(*page));
     if (!page) {
         app_ui_add_text(ui->content, "内存不足，请返回后重试", LV_ALIGN_CENTER, 0, 0,
@@ -241,14 +240,26 @@ void app_open_usb(app_ui_t *ui)
     ui->page_context = page;
     ui->page_cleanup = usb_cleanup;
     ui->page_can_exit = usb_can_exit;
-    page->state = text(ui, 0, 44, 0xC9E8FF);
-    page->card = text(ui, 56, 66, 0xB5C8DF);
-    lv_obj_t *notes = text(ui, 130, 112, 0x91A8C6);
-    app_ui_label_text(notes,
-        "开启后，电脑可直接读写 TF 卡。\n设备会停止播放并保存录音。\n请先在电脑安全弹出，再点退出。\n连接后串口可能暂时消失。");
-    page->enter = button(ui, "开启传输", 0);
-    page->leave = button(ui, "退出并恢复", 220);
-    page->help = text(ui, 314, 40, 0x91A8C6);
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *status_card = lv_obj_create(content);
+    lv_obj_set_pos(status_card, 0, 0);
+    lv_obj_set_size(status_card, 404, 144);
+    app_connection_card_style(status_card);
+    app_ui_add_text(status_card, LV_SYMBOL_USB, LV_ALIGN_TOP_LEFT, 16, 16,
+                    CONNECTION_ACCENT, &lv_font_montserrat_16);
+    page->state = text(status_card, "", 46, 14, 338, 44, CONNECTION_TEXT);
+    page->details = text(status_card, "", 46, 65, 338, 66, CONNECTION_DETAIL);
+
+    lv_obj_t *notice = lv_obj_create(content);
+    lv_obj_set_pos(notice, 0, 155);
+    lv_obj_set_size(notice, 404, 100);
+    app_connection_card_style(notice);
+    app_ui_add_text(notice, LV_SYMBOL_WARNING, LV_ALIGN_TOP_LEFT, 16, 15,
+                    CONNECTION_WARNING, &lv_font_montserrat_16);
+    text(notice, "退出前请在电脑安全弹出。", 46, 13, 342, 22, CONNECTION_WARNING);
+    text(notice, "传输时电脑独占 TF 卡。\n连接后下载串口可能暂不可用。", 46, 43, 342, 44, CONNECTION_DETAIL);
+    page->enter = button(ui, "开启传输", 0, true);
+    page->leave = button(ui, "退出并恢复", 208, false);
     app_ui_set_timer(ui, usb_timer, 300);
     update_usb(ui);
 }

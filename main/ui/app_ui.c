@@ -197,6 +197,7 @@ lv_obj_t *app_ui_new_screen(app_ui_t *ui)
     ui->page_context = NULL;
     ui->page_can_exit = NULL;
     ui->page_back = NULL;
+    ui->files_return = (app_files_return_t){0};
     for (size_t i = 0; i < sizeof(ui->app_obj) / sizeof(ui->app_obj[0]); ++i) {
         ui->app_obj[i] = NULL;
     }

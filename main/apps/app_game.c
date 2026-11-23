@@ -1,4 +1,4 @@
-#include "app_ui_internal.h"
+#include "app_connection_style.h"
 #include "app_arcade.h"
 #include "app_motion_filter.h"
 #include "app_telemetry.h"
@@ -962,7 +962,7 @@ static void select_jump(lv_event_t *event) { open_game(lv_event_get_user_data(ev
 
 static void game_preview(lv_obj_t *card, game_kind_t kind)
 {
-    lv_obj_t *art = block(card, 10, 10, 168, 93, 13, 0x19253E);
+    lv_obj_t *art = block(card, 10, 10, 174, 97, 12, 0x102034);
     switch (kind) {
     case GAME_TILES: {
         static const char *const values[] = {"2", "4", "16", "64"};
@@ -979,7 +979,7 @@ static void game_preview(lv_obj_t *card, game_kind_t kind)
         block(art, 67, 29, 22, 4, 2, 0xAA7046);
         block(art, 67, 43, 22, 4, 2, 0xAA7046);
         block(art, 112, 30, 22, 22, 11, 0x5FDFBE);
-        block(art, 117, 35, 12, 12, 6, 0x19253E);
+        block(art, 117, 35, 12, 12, 6, 0x102034);
         break;
     case GAME_SNAKE:
         block(art, 40, 54, 59, 16, 8, 0x41BB9B);
@@ -1007,10 +1007,16 @@ void app_open_game(app_ui_t *ui)
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     const lv_event_cb_t callbacks[] = {select_tiles, select_crates, select_snake, select_jump};
     for (unsigned i = 0; i < GAME_COUNT; ++i) {
-        lv_obj_t *card = button(content, 6 + (i % 2) * 203, 8 + (i / 2) * 170, 188, 151,
+        lv_obj_t *card = button(content, 4 + (i % 2) * 203, 5 + (i / 2) * 174, 194, 161,
                                 NULL, NULL, callbacks[i], ui);
+        app_connection_button_style(card, false);
+        lv_obj_set_style_bg_color(card, lv_color_hex(CONNECTION_PANEL), 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(CONNECTION_BORDER), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
         game_preview(card, (game_kind_t)i);
-        app_ui_add_text(card, game_titles[i], LV_ALIGN_BOTTOM_MID, 0, -11,
+        app_ui_add_text(card, game_titles[i], LV_ALIGN_BOTTOM_LEFT, 14, -13,
                         TEXT_BRIGHT, app_ui_chinese_font_size(24));
+        app_ui_add_text(card, LV_SYMBOL_RIGHT, LV_ALIGN_BOTTOM_RIGHT, -14, -17,
+                        CONNECTION_ACCENT, &lv_font_montserrat_16);
     }
 }

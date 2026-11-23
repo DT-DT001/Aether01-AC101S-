@@ -1,4 +1,5 @@
 #include "app_pc_remote.h"
+#include "app_gyro_calibration.h"
 #include "app_ui_internal.h"
 #include "app_ui_modal.h"
 #include <assert.h>
@@ -13,10 +14,31 @@ static app_pc_shortcut_t shortcuts[] = {{5,0x42},{5,0x43},{5,0x44},{5,0x45}};
 static bool pressed, air_mode, moving, confirm_value;
 static lv_point_t pointer;
 static unsigned confirmations, leaves, motion_on, motion_off, recenters;
+static unsigned calibration_cancels;
+static app_gyro_calibration_status_t calibration;
 static unsigned keys, clicks, text_requests, triggers, saves, last_slot;
 static uint8_t last_key, last_click;
 static esp_err_t text_error;
 static char sent[APP_PC_REMOTE_TEXT_MAX + 1];
+
+esp_err_t app_telemetry_gyro_calibration_begin(void)
+{
+    calibration = (app_gyro_calibration_status_t){
+        .phase = APP_GYRO_CAL_COUNTDOWN, .remaining_ms = 2000,
+    };
+    return ESP_OK;
+}
+
+esp_err_t app_telemetry_gyro_calibration_cancel(void)
+{
+    if (calibration.phase != APP_GYRO_CAL_COUNTDOWN && calibration.phase != APP_GYRO_CAL_SAMPLING)
+        return ESP_ERR_INVALID_STATE;
+    calibration.phase = APP_GYRO_CAL_CANCELLED;
+    ++calibration_cancels;
+    return ESP_OK;
+}
+
+void app_telemetry_gyro_calibration_get(app_gyro_calibration_status_t *out) { *out = calibration; }
 
 void app_pc_remote_get_status(app_pc_remote_status_t *out) { *out = status; }
 esp_err_t app_pc_remote_set_enabled(bool enabled)
@@ -95,7 +117,8 @@ const char *esp_err_to_name(esp_err_t error) { return error ? "ESP_FAIL" : "ESP_
 esp_err_t app_usb_input_modal_open(lv_obj_t *modal, lv_obj_t *preferred)
 {
     assert(modal && preferred);
-    assert(!strcmp(lv_label_get_text(lv_obj_get_child(preferred, 0)), "拒绝配对"));
+    const char *label = lv_label_get_text(lv_obj_get_child(preferred, 0));
+    assert(!strcmp(label, "拒绝配对") || !strcmp(label, "取消"));
     return ESP_OK;
 }
 const lv_font_t *app_ui_chinese_font_size(unsigned px)
@@ -226,6 +249,43 @@ static void touch(lv_obj_t *object)
 static void lift(void) { pressed = false; advance(90); }
 static void tap(lv_obj_t *object) { touch(object); lift(); }
 
+static bool text_caret_drawn(lv_display_t *display, lv_obj_t *field)
+{
+    lv_refr_now(display);
+    lv_obj_t *label = lv_textarea_get_label(field);
+    lv_area_t area;
+    lv_obj_get_coords(label, &area);
+    lv_point_t glyph;
+    lv_label_get_letter_pos(label, lv_textarea_get_cursor_pos(field), &glyph);
+    const uint16_t color = lv_color_to_u16(lv_color_hex(0x92E7F1));
+    const int x = area.x1 + glyph.x;
+    const int y = area.y1 + glyph.y;
+    assert(x >= 5 && x + 5 < 480 && y >= 0 && y + 14 < 480);
+    unsigned columns = 0;
+    for (int dx = -5; dx <= 5; ++dx) {
+        unsigned matches = 0;
+        for (int dy = 4; dy <= 14; ++dy)
+            matches += frame[(y + dy) * 480 + x + dx] == color;
+        if (matches >= 8) ++columns;
+    }
+    assert(columns == 0 || columns == 3);
+    return columns == 3;
+}
+
+static void assert_text_caret_blinks(lv_display_t *display, lv_obj_t *field)
+{
+    bool shown = false, hidden = false;
+    /* Keystrokes can reposition or restart the caret during either phase. */
+    for (unsigned elapsed = 0; elapsed <= 1100; elapsed += 100) {
+        assert(lv_obj_has_state(field, LV_STATE_FOCUSED));
+        if (text_caret_drawn(display, field)) shown = true;
+        else hidden = true;
+        if (shown && hidden) return;
+        advance(100);
+    }
+    assert(shown && hidden);
+}
+
 static void keyboard_key(lv_obj_t *keyboard, const char *name)
 {
     for (uint32_t i = 0;; ++i) {
@@ -294,13 +354,30 @@ int main(int argc, char **argv)
     lv_obj_get_coords(keyboard, &keyboard_area);
     lv_obj_get_coords(control(ui.screen, "回车"), &key_area);
     assert(field_area.y2 < keyboard_area.y1 && keyboard_area.y2 < key_area.y1);
-    keyboard_key(keyboard, "q");
+    tap(text);
+    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && text_caret_drawn(display, text));
+    assert(lv_obj_get_style_anim_duration(text, LV_PART_CURSOR) == 500);
+    advance(450);
+    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && !text_caret_drawn(display, text));
+    advance(500);
+    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && text_caret_drawn(display, text));
+    /* The first row's 52 units place q at unit 7, after the 5-unit mode key. */
+    pointer = (lv_point_t){keyboard_area.x1 + lv_area_get_width(&keyboard_area) * 7 / 52,
+                           keyboard_area.y1 + lv_area_get_height(&keyboard_area) / 8};
+    pressed = true;
+    advance(90);
+    lift();
+    assert(!strcmp(lv_textarea_get_text(text), "q") && lv_textarea_get_cursor_pos(text) == 1);
+    assert_text_caret_blinks(display, text);
     lv_textarea_add_text(text, "Z1!中文");
     assert(!strcmp(lv_textarea_get_text(text), "qZ1!"));
     snapshot(display, argv[1], "pc-keyboard");
     text_error = ESP_FAIL;
     tap(control(ui.screen, "发送文本"));
     assert(text_requests == 1 && !strcmp(lv_textarea_get_text(text), "qZ1!"));
+    assert(!lv_obj_has_state(text, LV_STATE_FOCUSED) && !text_caret_drawn(display, text));
+    advance(650);
+    assert(!text_caret_drawn(display, text));
     text_error = ESP_OK;
     tap(control(ui.screen, "发送文本"));
     assert(text_requests == 2 && !strcmp(sent, "qZ1!") && !lv_textarea_get_text(text)[0]);
@@ -314,9 +391,11 @@ int main(int argc, char **argv)
     assert(lv_obj_has_flag(keyboard, LV_OBJ_FLAG_HIDDEN));
     tap(text);
     assert(!lv_obj_has_flag(keyboard, LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_state(text, LV_STATE_FOCUSED) && text_caret_drawn(display, text));
     tap(control(ui.screen, "回车"));
     assert(keys == 1 && last_key == 0x28);
     puts("PASS actual LVGL keyboard input, ASCII filter, Enter/OK once, dismiss/restore, retained text on error and direct Enter");
+    puts("PASS PC Remote caret blinks on/off/on and after typing, stays hidden when Send takes focus, and returns on touching the field");
 
     tap(control(ui.screen, "空气鼠标"));
     lv_obj_t *move = control(ui.screen, "按住移动");
@@ -328,16 +407,46 @@ int main(int argc, char **argv)
     assert(clicks == 2 && last_click == 2);
     status.gyro_ready = true; advance(170);
     assert(lv_obj_has_state(move, LV_STATE_USER_1));
-    assert(find_label(ui.screen, "请将设备静置片刻，等待陀螺仪就绪。"));
+    assert(find_label(ui.screen, "平放设备，或点漂移校准"));
+    status.connected = false;
+    advance(170);
+    tap(control(ui.screen, "漂移校准"));
+    assert(app_ui_modal_present(ui.screen) && find_label(ui.screen, "屏幕朝上平放\n2 秒后开始"));
+    calibration.phase = APP_GYRO_CAL_SAMPLING;
+    calibration.remaining_ms = 5000;
+    advance(170);
+    assert(find_label(ui.screen, "保持静止\n还需 5 秒") && !moving);
+    tap(control(ui.screen, "取消"));
+    assert(calibration_cancels == 1 && !app_ui_modal_present(ui.screen));
+    tap(control(ui.screen, "漂移校准"));
+    calibration.phase = APP_GYRO_CAL_SAVING;
+    advance(170);
+    assert(find_label(ui.screen, "正在保存校准") && lv_obj_has_state(control(ui.screen, "关闭"), LV_STATE_DISABLED));
+    calibration.phase = APP_GYRO_CAL_COMPLETE;
+    advance(170);
+    assert(find_label(ui.screen, "校准完成，补偿已保存。"));
+    tap(control(ui.screen, "关闭"));
+    assert(calibration_cancels == 1 && !app_ui_modal_present(ui.screen));
+    tap(control(ui.screen, "漂移校准"));
+    calibration.phase = APP_GYRO_CAL_FAILED;
+    calibration.error = ESP_ERR_INVALID_RESPONSE;
+    advance(170);
+    assert(find_label(ui.screen, "请平放设备并保持静止，再试一次。"));
+    calibration.error = ESP_ERR_INVALID_STATE;
+    advance(170);
+    assert(find_label(ui.screen, "设备忙，请稍后重试。"));
+    tap(control(ui.screen, "关闭"));
+    status.connected = true;
+    advance(170);
     tap(control(ui.screen, "回中"));
     assert(recenters == 1);
     touch(move);
     assert(!moving);
     status.gyro_calibrated = true; advance(70);
     assert(moving);
-    snapshot(display, argv[1], "pc-air-mouse");
     advance(130);
     assert(moving && motion_on >= 2);
+    snapshot(display, argv[1], "pc-air-mouse");
     lift();
     assert(!moving && motion_off == 1);
     touch(move);
@@ -391,6 +500,7 @@ int main(int argc, char **argv)
     status.connected = true;
     lift();
     assert(triggers == 1 && last_slot == 0);
+    advance(160);
     snapshot(display, argv[1], "obs-switcher");
     for (unsigned i = 0; i < 4; ++i) { tap(scenes[i]); assert(last_slot == i && triggers == i+2); }
     assert(find_label(ui.screen, "快捷键已提交"));

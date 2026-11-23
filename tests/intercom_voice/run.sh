@@ -12,7 +12,7 @@ source = (root / 'main/app_intercom.c').read_text(encoding='utf-8')
 types = source.index('#define FRAME_US')
 state = source.index('static portMUX_TYPE s_lock', types)
 voice = source.index('static void finish_voice(')
-capture = source.index('static void begin_capture(', voice)
+capture = source.index('static void run_session(', voice)
 (out / 'voice-types.inc').write_text(source[types:state], encoding='utf-8')
 (out / 'voice-production.inc').write_text(source[voice:capture], encoding='utf-8')
 PY

@@ -1,6 +1,7 @@
 #include "app_ui_internal.h"
 #include "aether_recorder.h"
 #include "app_audio_system.h"
+#include "app_battery.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,14 @@ lv_obj_t *app_ui_add_text(lv_obj_t *p,const char *s,lv_align_t a,int32_t x,int32
 {lv_obj_t *o=lv_label_create(p);lv_label_set_text(o,s);lv_obj_set_style_text_font(o,f?f:app_ui_chinese_font(),0);lv_obj_set_style_text_color(o,lv_color_hex(c),0);lv_obj_align(o,a,x,y);return o;}
 void app_ui_media_control_gate(app_ui_t *ui,bool blocked,bool invalidate)
 {(void)ui;gate_blocked=blocked;if(invalidate)++gate_invalidations;}
+int64_t esp_timer_get_time(void) { return (int64_t)lv_tick_get() * 1000; }
+void app_tools_get_snapshot(app_tools_snapshot_t *snapshot)
+{
+    *snapshot = (app_tools_snapshot_t){
+        .ready = true, .battery_updated_ms = lv_tick_get(),
+        .battery = {.presence_valid = true, .battery_present = true, .percentage_valid = true, .percentage = 83},
+    };
+}
 static void header_back(lv_event_t *event)
 {(void)app_ui_go_back(lv_event_get_user_data(event));}
 lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
@@ -61,13 +70,18 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
     ui->page_context=NULL;ui->page_back=NULL;
     lv_obj_t *old=ui->screen;
     ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x070A12),0);
+    lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x101321),0);
     lv_obj_set_style_text_font(ui->screen,app_ui_chinese_font(),0);
     lv_obj_t *back=lv_button_create(ui->screen);
     lv_obj_set_pos(back,14,12);lv_obj_set_size(back,48,44);
+    lv_obj_set_style_radius(back,14,0);
+    lv_obj_set_style_bg_color(back,lv_color_hex(0x232842),0);
     lv_obj_add_event_cb(back,header_back,LV_EVENT_CLICKED,ui);
-    app_ui_add_text(back,LV_SYMBOL_LEFT,LV_ALIGN_CENTER,0,0,0xBFD7FF,&lv_font_montserrat_16);
+    app_ui_add_text(back,LV_SYMBOL_LEFT,LV_ALIGN_CENTER,0,0,0xBFD7FF,&lv_font_montserrat_20);
     app_ui_add_text(ui->screen,title,LV_ALIGN_TOP_MID,0,20,0xEAF2FF,app_ui_chinese_font_size(24));
+    lv_obj_t *battery = app_battery_create(ui->screen, 70);
+    assert(battery);
+    lv_obj_align(battery, LV_ALIGN_TOP_RIGHT, -14, 20);
     ui->content=lv_obj_create(ui->screen);lv_obj_set_size(ui->content,448,394);
     lv_obj_align(ui->content,LV_ALIGN_BOTTOM_MID,0,-14);lv_obj_set_style_pad_all(ui->content,20,0);
     lv_obj_set_style_border_width(ui->content,0,0);lv_obj_set_style_radius(ui->content,24,0);
@@ -110,6 +124,18 @@ static void capture(lv_display_t *d,const char *directory,const char *name)
     for(unsigned i=0;i<480*480;++i){uint16_t p=framebuffer[i];uint8_t rgb[]={(p>>11)*255/31,((p>>5)&63)*255/63,(p&31)*255/31};assert(fwrite(rgb,1,3,f)==3);}fclose(f);
 }
 
+static uint32_t waveform_pixels(lv_display_t *display, lv_obj_t *panel)
+{
+    lv_refr_now(display);
+    lv_area_t area;
+    lv_obj_get_coords(panel, &area);
+    uint32_t hash = 2166136261U;
+    for (int y = area.y1 + 5; y <= area.y1 + 46; ++y)
+        for (int x = area.x1 + 20; x <= area.x2 - 20; ++x)
+            hash = (hash ^ framebuffer[y * 480 + x]) * 16777619U;
+    return hash;
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==2);setbuf(stdout,NULL);lv_init();lv_display_t *d=lv_display_create(480,480);
@@ -120,7 +146,11 @@ int main(int argc,char **argv)
     app_ui_t ui={.storage=(void*)1};app_open_recorder(&ui);advance(150);
     assert(find(ui.screen,"准备录音"));assert(!gate_blocked);
     lv_obj_t *start=control(&ui,"开始录音"),*pause=control(&ui,"暂停"),*stop=control(&ui,"停止保存");
-    assert(lv_obj_get_height(start)==48);assert(lv_obj_has_state(pause,LV_STATE_DISABLED));
+    assert(lv_obj_get_height(start)>=90);assert(lv_obj_has_state(pause,LV_STATE_DISABLED));
+    lv_obj_t *timer_text = find(ui.screen, "00:00");
+    assert(timer_text && lv_obj_get_style_text_font(timer_text, 0) == &lv_font_montserrat_48);
+    lv_obj_t *waveform = control(&ui, "输入电平");
+    const uint32_t idle_waveform = waveform_pixels(d, waveform);
     lv_area_t content,last;lv_obj_get_content_coords(ui.content,&content);lv_obj_get_coords(control(&ui,"录音文件"),&last);
     assert(last.x1>=content.x1&&last.x2<=content.x2&&last.y2<=content.y2);
     capture(d,argv[1],"recorder-idle");
@@ -146,12 +176,26 @@ int main(int argc,char **argv)
     deliver(&ui,ESP_ERR_TIMEOUT);advance(110);assert(find(ui.screen,"ESP_ERR_TIMEOUT"));
     assert(!gate_blocked&&!lv_obj_has_state(start,LV_STATE_DISABLED));
     tap(start);deliver(&ui,ESP_OK);assert(start_calls==1&&status.state==AETHER_RECORDER_STARTING&&gate_blocked);
-    status.state=AETHER_RECORDER_RECORDING;status.duration_ms=125000;status.data_bytes=12000000;status.peak=16384;
+    status.state=AETHER_RECORDER_RECORDING;status.duration_ms=121300;status.data_bytes=12000000;
+    static const uint16_t peaks[] = {
+        1400, 4800, 9200, 12900, 8300, 5100, 2500, 3800, 12400, 21100, 27000, 19600,
+        12800, 7200, 3100, 4700, 14500, 29200, 24700, 17000, 10000, 4700, 2400, 5500,
+        11000, 20900, 28100, 22000, 11300, 7400, 4700, 6400, 15800, 23500, 19000, 11100,
+    };
+    for (size_t i = 0; i < sizeof(peaks) / sizeof(peaks[0]); ++i) {
+        status.duration_ms += 100;
+        status.peak = peaks[i];
+        advance(100);
+    }
+    status.duration_ms=125000;status.peak=16384;
     advance(120);assert(find(ui.screen,"02:05")&&find(ui.screen,"50%"));
+    const uint32_t recording_waveform = waveform_pixels(d, waveform);
+    assert(recording_waveform != idle_waveform);
     assert(lv_obj_has_state(input,LV_STATE_DISABLED));
     assert(!lv_obj_has_state(pause,LV_STATE_DISABLED));capture(d,argv[1],"recorder-recording");
     tap(pause);assert(pause_calls==1&&status.state==AETHER_RECORDER_PAUSED);advance(200);
     assert(find(ui.screen,"继续")&&find(ui.screen,"0%")&&find(ui.screen,"02:05"));
+    assert(waveform_pixels(d, waveform) == recording_waveform);
     tap(control(&ui,"继续"));assert(pause_calls==2&&status.state==AETHER_RECORDER_RECORDING);
     tap(stop);assert(stop_calls==1&&status.state==AETHER_RECORDER_SAVING&&gate_blocked);
     assert(lv_obj_has_state(control(&ui,"回放录音"),LV_STATE_DISABLED));

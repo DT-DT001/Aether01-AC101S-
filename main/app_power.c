@@ -79,17 +79,14 @@ static void dispatch_user_key(app_power_t *manager, bool pressed, user_key_t *ke
         manager->shutdown_state == APP_POWER_SHUTDOWN_REQUESTED ||
         manager->shutdown_cancel_error != ESP_OK || manager->sensor_restore_error != ESP_OK;
     void (*handler)(void *, int64_t) = manager->user_key_handler;
-    void (*tap_handler)(void *, int64_t) = manager->user_key_tap_handler;
+    void (*press_handler)(void *, int64_t) = manager->user_key_press_handler;
     void *context = manager->user_key_context;
     portEXIT_CRITICAL(&s_settings_lock);
     const bool wake = !key->down && (pressed || edge) && sleeping && !blocked;
     if (!pressed) {
-        const int64_t started = key->down ? key->started_at_us : pressed_at_us;
-        const bool tap = (key->down || edge) && !key->consumed && !sleeping && !blocked &&
-                         now - started < USER_KEY_HOLD_US;
         *key = (user_key_t){0};
-        if (tap && tap_handler) tap_handler(context, started);
     } else {
+        const bool first_press = !key->down;
         if (!key->down || (edge && !key->consumed))
             key->started_at_us = pressed_at_us;
         key->down = true;
@@ -97,6 +94,8 @@ static void dispatch_user_key(app_power_t *manager, bool pressed, user_key_t *ke
         if (!key->consumed && now - key->started_at_us >= USER_KEY_HOLD_US) {
             key->consumed = true;
             if (handler) handler(context, key->started_at_us);
+        } else if (first_press && !key->consumed && press_handler) {
+            press_handler(context, key->started_at_us);
         }
     }
     if (wake) (void)app_power_wake(manager);
@@ -854,11 +853,11 @@ esp_err_t app_power_set_user_key_handler(app_power_t *manager, void (*handler)(v
     return ESP_OK;
 }
 
-esp_err_t app_power_set_user_key_tap_handler(app_power_t *manager, void (*handler)(void *, int64_t))
+esp_err_t app_power_set_user_key_press_handler(app_power_t *manager, void (*handler)(void *, int64_t))
 {
     if (!manager || !manager->task) return ESP_ERR_INVALID_ARG;
     portENTER_CRITICAL(&s_settings_lock);
-    manager->user_key_tap_handler = handler;
+    manager->user_key_press_handler = handler;
     portEXIT_CRITICAL(&s_settings_lock);
     return ESP_OK;
 }

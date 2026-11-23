@@ -333,6 +333,25 @@ static int test_stale_report(void)
     ++source_sequence;
     CHECK(sample().state == LV_INDEV_STATE_RELEASED);
     puts("PASS fresh stationary hold, lost release with/without IRQ, cached suppression and a new gesture");
+
+    reset();
+    CHECK(app_touch_add(&display, &touch, &power));
+    CHECK(sample().state == LV_INDEV_STATE_PRESSED);
+    point_x += TOUCH_MOTION_DISTANCE;
+    ++source_sequence;
+    CHECK(sample().state == LV_INDEV_STATE_PRESSED && s_touch.moving);
+    registered_irq(&touch);
+    CHECK(sample().state == LV_INDEV_STATE_PRESSED);
+    now_us += 90000;
+    CHECK(sample().state == LV_INDEV_STATE_PRESSED && !resets);
+    point_x += 2;
+    ++source_sequence;
+    CHECK(sample().point.x == point_x && !resets);
+    registered_irq(&touch);
+    CHECK(sample().state == LV_INDEV_STATE_PRESSED);
+    now_us += TOUCH_MOVING_IRQ_US;
+    CHECK(sample().state == LV_INDEV_STATE_RELEASED && resets == 1);
+    puts("PASS moving gesture survives delayed report and stale cached movement still cancels");
     return 0;
 }
 

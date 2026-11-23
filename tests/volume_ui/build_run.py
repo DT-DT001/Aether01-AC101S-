@@ -10,12 +10,13 @@ lvgl=root/'managed_components/lvgl__lvgl'
 cached=Path(os.environ.get('AETHER_LVGL_CACHE', root/'build/host_reader_ui'))
 compiler=os.environ.get('CC', 'gcc')
 objects=sorted(cached.glob('managed_components_lvgl__lvgl_src_*.c.o'))
+objects=[obj for obj in objects if not obj.name.endswith('_lv_font_montserrat_20.c.o')]
 objects += [cached/'main_assets_font_16.c.o',cached/'main_assets_font_24.c.o']
 if not objects:raise SystemExit('Run reader_ui build first')
 # Keep the unchanged status/RTC pages out of this focused host harness. These
 # settings functions and their shared action/free helpers are copied verbatim.
 system=(root/'main/apps/app_system.c').read_text(encoding='utf-8')
-helpers=system[system.index('static lv_obj_t *action('):system.index('static void update_status(')]
+helpers=system[system.index('static lv_obj_t *action('):system.index('static const char *component_status(')]
 settings=system[system.index('typedef struct {\n    lv_obj_t *volume,'):]
 source=out/'settings.c'
 source.write_text('#include "app_ui_internal.h"\n#include "app_otg_control.h"\n#include "app_audio_system.h"\n#include "aether_usb_audio.h"\n#include "aether_usb_storage.h"\n#include "aether_media_fs.h"\n#include <stdlib.h>\n#include <stdio.h>\n'+helpers+settings, encoding='utf-8')
@@ -25,10 +26,23 @@ shutdown.write_text('#include "app_ui_internal.h"\n#include "app_ui_modal.h"\n'+
     ui[ui.index('static void shutdown_notice_close('):ui.index('static void service_timer(')]+
     ui[ui.index('esp_err_t app_ui_quiesce_storage_begin('):ui.index('esp_err_t app_ui_start(')]+
     '\nvoid test_ui_shutdown_service(app_ui_t *ui) { app_ui_shutdown_service(ui); }\n', encoding='utf-8')
+chrome=out/'page_chrome.c'
+chrome.write_text('#include "app_ui_internal.h"\n#include "app_battery.h"\n#include "app_screen.h"\n'
+    'lv_obj_t *app_ui_new_screen(app_ui_t *ui);\n'
+    'void app_ui_set_user_key_exit(app_ui_t *ui, bool enabled);\n'
+    'static void back_event_cb(lv_event_t *event) {\n'
+    '    app_ui_t *ui = lv_event_get_user_data(event);\n'
+    '    if (ui->page_back) ui->page_back(ui);\n}\n'+
+    ui[ui.index('lv_obj_t *app_ui_begin_page('):ui.index('static void shutdown_notice_close(')], encoding='utf-8')
 flags=[compiler,'-std=c11','-O0','-g','-Wall','-Wextra','-Werror','-ffunction-sections','-fdata-sections',
-       '-DLV_CONF_INCLUDE_SIMPLE','-DLV_CONF_SUPPRESS_DEFINE_CHECK=1','-D_DEFAULT_SOURCE',
-       *['-I'+str(p) for p in [test/'stubs',root/'tests/reader_ui/stubs',root/'tests/home_ui/stubs',root/'tests/reader_ui',root/'main',root/'main/ui',root/'components/aether_usb_host/include',root/'components/aether_usb_audio/include',root/'components/aether_usb_storage/include',lvgl]]]
-for src in [source,shutdown,root/'main/ui/app_ui_modal.c',root/'main/apps/app_music.c',root/'main/app_text.c',root/'main/apps/app_usb.c',test/'smoke.c']:
+       '-DLV_CONF_INCLUDE_SIMPLE','-DLV_CONF_SUPPRESS_DEFINE_CHECK=1','-D_DEFAULT_SOURCE','-DAETHER_VOLUME_REAL_CHROME',
+       '-DLV_FONT_MONTSERRAT_20=1',
+       *['-I'+str(p) for p in [test/'stubs',root/'tests/reader_ui/stubs',root/'tests/home_ui/stubs',
+          root/'tests/battery_ui/stubs',root/'tests/reader_ui',root/'main',root/'main/ui',
+          root/'components/aether_usb_host/include',root/'components/aether_usb_audio/include',
+          root/'components/aether_usb_storage/include',root/'components/tg29/include',
+          root/'components/pcf85063/include',lvgl]]]
+for src in [source,shutdown,chrome,lvgl/'src/font/lv_font_montserrat_20.c',root/'main/ui/app_battery.c',root/'main/ui/app_ui_modal.c',root/'main/apps/app_music.c',root/'main/app_lyrics.c',root/'main/app_text.c',root/'main/apps/app_usb.c',test/'smoke.c']:
     obj=out/(src.stem+'.o')
     subprocess.run(flags+['-c',str(src),'-o',str(obj)],check=True)
     objects.append(obj)

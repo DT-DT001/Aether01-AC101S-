@@ -38,6 +38,7 @@ typedef struct {
     bool playing;
     bool stop_received;
     bool rebuffering;
+    bool screen_talk;
     unsigned buffered;
     unsigned empty_frames;
     unsigned capture_errors;
@@ -67,6 +68,7 @@ static struct {
     app_io_handle_t io;
     uint32_t generation, session_generation;
     bool requested, worker_running, session_running, key_armed, key_pending;
+    bool screen_talk_held, screen_talk_pending;
     int64_t entered_at_us;
     voice_mode_t mode;
     intercom_command_t command;
@@ -87,6 +89,14 @@ static bool still_requested(uint32_t generation)
     const bool current = s.requested && s.generation == generation;
     portEXIT_CRITICAL(&s_lock);
     return current;
+}
+
+static bool screen_talk_held(uint32_t generation)
+{
+    portENTER_CRITICAL(&s_lock);
+    const bool held = s.requested && s.generation == generation && s.screen_talk_held;
+    portEXIT_CRITICAL(&s_lock);
+    return held;
 }
 
 static void finish_voice(intercom_voice_t *voice)
@@ -295,12 +305,17 @@ static void playback_step(intercom_voice_t *voice, aether_intercom_audio_handle_
     }
 }
 
+static bool talk_held(uint32_t generation, bool screen_talk)
+{
+    return screen_talk ? screen_talk_held(generation) : gpio_get_level(AETHER_GPIO_BOOT_KEY) == 0;
+}
+
 static void capture_step(intercom_voice_t *voice, aether_intercom_audio_handle_t audio,
                          uint32_t generation, int64_t now)
 {
-    if (gpio_get_level(AETHER_GPIO_BOOT_KEY) != 0) {
+    if (!talk_held(generation, voice->screen_talk)) {
         if (!voice->release_us) voice->release_us = now;
-        if (now - voice->release_us >= KEY_RELEASE_US) {
+        if (voice->screen_talk || now - voice->release_us >= KEY_RELEASE_US) {
             finish_voice(voice);
             publish(VOICE_IDLE, ESP_OK);
         }
@@ -327,14 +342,15 @@ static void capture_step(intercom_voice_t *voice, aether_intercom_audio_handle_t
 }
 
 static void begin_capture(intercom_voice_t *voice, aether_intercom_audio_handle_t audio,
-                          uint32_t generation)
+                          uint32_t generation, bool screen_talk)
 {
     voice->codec_pending = true;
     esp_err_t error = aether_intercom_audio_start(audio, AETHER_INTERCOM_AUDIO_CAPTURE);
-    if (error == ESP_OK && still_requested(generation) && gpio_get_level(AETHER_GPIO_BOOT_KEY) == 0) {
+    if (error == ESP_OK && still_requested(generation) && talk_held(generation, screen_talk)) {
         error = aether_intercom_radio_send(AETHER_INTERCOM_PACKET_START, NULL, 0);
         if (error == ESP_OK) {
             voice->mode = VOICE_TX;
+            voice->screen_talk = screen_talk;
             voice->release_us = 0;
             voice->talk_started_us = esp_timer_get_time();
             voice->capture_errors = 0;
@@ -378,9 +394,11 @@ static void run_session(uint32_t generation, ac101s_audio_handle_t codec, app_io
         const bool current = s.requested && s.generation == generation;
         intercom_command_t command = current ? s.command : COMMAND_NONE;
         const bool pressed = current && s.key_pending;
+        const bool screen_pressed = current && s.screen_talk_pending;
         if (current) {
             s.command = COMMAND_NONE;
             s.key_pending = false;
+            s.screen_talk_pending = false;
         }
         portEXIT_CRITICAL(&s_lock);
         if (!current) break;
@@ -414,7 +432,7 @@ static void run_session(uint32_t generation, ac101s_audio_handle_t codec, app_io
         aether_intercom_packet_t packet;
         const bool idle = voice->mode == VOICE_IDLE;
         for (unsigned i = 0; i < RX_SLOTS && aether_intercom_radio_receive(&packet,
-             idle && online && !pressed && i == 0 ? 10 : 0); ++i) {
+             idle && online && !pressed && !screen_pressed && i == 0 ? 10 : 0); ++i) {
             if (online && command == COMMAND_NONE)
                 receive_voice(voice, &packet, radio.local_has_priority, esp_timer_get_time());
         }
@@ -428,8 +446,11 @@ static void run_session(uint32_t generation, ac101s_audio_handle_t codec, app_io
                 continue;
             }
         }
-        if (online && command == COMMAND_NONE && voice->mode == VOICE_IDLE && pressed && ready_for_key &&
-            gpio_get_level(AETHER_GPIO_BOOT_KEY) == 0) begin_capture(voice, audio, generation);
+        if (online && command == COMMAND_NONE && voice->mode == VOICE_IDLE) {
+            if (screen_pressed && talk_held(generation, true)) begin_capture(voice, audio, generation, true);
+            else if (pressed && ready_for_key && talk_held(generation, false))
+                begin_capture(voice, audio, generation, false);
+        }
         const int64_t now = esp_timer_get_time();
         if (voice->mode == VOICE_TX) {
             capture_step(voice, audio, generation, now);
@@ -501,6 +522,7 @@ esp_err_t app_intercom_enter(ac101s_audio_handle_t codec, app_io_handle_t io)
     s.io = io;
     s.requested = true;
     s.key_pending = false;
+    s.screen_talk_held = s.screen_talk_pending = false;
     s.key_armed = true;
     s.entered_at_us = now;
     s.command = COMMAND_NONE;
@@ -526,6 +548,7 @@ void app_intercom_leave(void)
     s.requested = false;
     s.key_armed = false;
     s.key_pending = false;
+    s.screen_talk_held = s.screen_talk_pending = false;
     s.command = COMMAND_NONE;
     portEXIT_CRITICAL(&s_lock);
 }
@@ -553,6 +576,15 @@ bool app_intercom_user_key(int64_t pressed_at_us)
     if (owned && pressed_at_us >= s.entered_at_us) s.key_pending = true;
     portEXIT_CRITICAL(&s_lock);
     return owned;
+}
+
+void app_intercom_set_screen_talk(bool held)
+{
+    portENTER_CRITICAL(&s_lock);
+    if (!held) s.screen_talk_held = s.screen_talk_pending = false;
+    else if (s.requested && s.mode == VOICE_IDLE && !s.screen_talk_held)
+        s.screen_talk_held = s.screen_talk_pending = true;
+    portEXIT_CRITICAL(&s_lock);
 }
 
 void app_intercom_get_status(app_intercom_status_t *status)

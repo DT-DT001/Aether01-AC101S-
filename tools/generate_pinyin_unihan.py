@@ -1,0 +1,137 @@
+"""Regenerate the offline Mandarin candidate table using the official Unihan archive.
+
+Download https://www.unicode.org/Public/17.0.0/ucd/Unihan.zip and run
+    python tools/generate_pinyin_unihan.py /path/to/Unihan.zip
+Add --check to validate the checked-in table without writing it.
+"""
+
+import argparse
+import hashlib
+from pathlib import Path
+import re
+import unicodedata
+from zipfile import ZipFile
+
+
+ASSETS = Path(__file__).resolve().parents[1] / "main" / "assets"
+UNIHAN_URL = "https://www.unicode.org/Public/17.0.0/ucd/Unihan.zip"
+UNIHAN_SHA256 = "f7a48b2b545acfaa77b2d607ae28747404ce02baefee16396c5d2d7a8ef34b5e"
+ROW = re.compile(r'^\s*\{\s*"([a-z]+)",\s*"([^"]+)"\s*\},$', re.M)
+
+
+def font_codepoints(path):
+    """Read the LVGL converter's character maps without loading bitmap pixels."""
+    text = path.read_text(encoding="utf-8")
+    arrays = {
+        name: [int(value, 0) for value in re.findall(r"\b(?:0x[\da-fA-F]+|\d+)\b", body)]
+        for name, body in re.findall(
+            r"static const uint(?:8|16)_t ((?:unicode_list|glyph_id_ofs_list)_\d+)\[\]\s*=\s*\{([^}]+)\};",
+            text,
+        )
+    }
+    maps = re.search(r"lv_font_fmt_txt_cmap_t cmaps\[\]\s*=\s*\{(.*?)\};", text, re.S)
+    if maps is None:
+        raise ValueError(f"No character maps found in {path}")
+    codepoints = set()
+    for block in re.findall(r"\{([^}]+)\}", maps[1]):
+        fields = dict(re.findall(r"\.(\w+)\s*=\s*(\w+)", block))
+        start = int(fields["range_start"])
+        length = int(fields["range_length"])
+        kind = fields["type"].removeprefix("LV_FONT_FMT_TXT_CMAP_")
+        if kind == "FORMAT0_TINY":
+            offsets = range(length)
+        elif kind == "FORMAT0_FULL":
+            glyph_ids = arrays[fields["glyph_id_ofs_list"]]
+            if len(glyph_ids) != length:
+                raise ValueError(f"Invalid glyph offset array in {path}")
+            # In a full map a zero at the range start is the first glyph.
+            # A zero after that marks an unassigned code point.
+            offsets = [offset for offset, glyph_id in enumerate(glyph_ids) if offset == 0 or glyph_id]
+        elif kind == "SPARSE_TINY":
+            offsets = arrays[fields["unicode_list"]]
+            if len(offsets) != int(fields["list_length"]) or any(i >= length for i in offsets):
+                raise ValueError(f"Invalid sparse character map in {path}")
+        else:
+            raise ValueError(f"Unsupported character map {kind} in {path}")
+        codepoints.update(start + offset for offset in offsets)
+    if not codepoints:
+        raise ValueError(f"No glyphs found in {path}")
+    return codepoints
+
+
+def spelling(reading):
+    # Separate tone marks, preserving the diaeresis as the keyboard's v key.
+    base = unicodedata.normalize("NFD", reading.lower()).replace("u\u0308", "v")
+    result = "".join(letter for letter in base if not unicodedata.combining(letter))
+    if re.fullmatch("[a-z]{1,6}", result) is None:
+        raise ValueError(f"Unexpected kMandarin reading {reading!r}")
+    return result
+
+
+def mandarin_readings(path, renderable):
+    if hashlib.sha256(path.read_bytes()).hexdigest() != UNIHAN_SHA256:
+        raise ValueError(f"Expected the official Unicode 17.0.0 archive at {UNIHAN_URL}")
+    with ZipFile(path) as archive:
+        readings = archive.read("Unihan_Readings.txt").decode("utf-8")
+    by_spelling = {}
+    for line in readings.splitlines():
+        if not line.startswith("U+"):
+            continue
+        codepoint, property_name, value = line.split("\t")
+        if property_name != "kMandarin":
+            continue
+        codepoint = int(codepoint[2:], 16)
+        if codepoint in renderable:
+            for reading in value.split():
+                by_spelling.setdefault(spelling(reading), set()).add(chr(codepoint))
+    return by_spelling
+
+
+def generate(path):
+    renderable = font_codepoints(ASSETS / "font_16.c") & font_codepoints(ASSETS / "font_24.c")
+    primary = (ASSETS / "pinyin_candidates.inc").read_text(encoding="utf-8")
+    supplement = (ASSETS / "pinyin_supplement.inc").read_text(encoding="utf-8")
+    license_comment = primary[:primary.index("*/") + 2]
+    candidates = {}
+    for source in (primary, supplement):
+        for key, text in ROW.findall(source):
+            if any(ord(character) not in renderable for character in text):
+                raise ValueError(f"Existing candidates for {key!r} are missing a font glyph")
+            candidates.setdefault(key, {}).update(dict.fromkeys(text))
+    original_chars = set().union(*candidates.values())
+
+    imported = mandarin_readings(path, renderable)
+    for key, chars in sorted(imported.items()):
+        candidates.setdefault(key, {}).update(dict.fromkeys(sorted(chars)))
+
+    chars = set().union(*candidates.values())
+    data = "".join(f'    {{ "{key}", "{"".join(row)}" }},\n' for key, row in candidates.items())
+    generated = (
+        "/* Generated by tools/generate_pinyin_unihan.py.\n"
+        " * Original candidate order is followed by Unicode 17.0.0 kMandarin readings.\n"
+        " * See pinyin_unihan.LICENSE.txt for Unicode data terms and provenance. */\n"
+        f"{license_comment}\n{data}"
+    ).encode("utf-8")
+    counts = len(candidates), len(chars), len(chars - original_chars)
+    return generated, counts
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("archive", type=Path, help="official Unicode 17.0.0 Unihan.zip")
+    parser.add_argument("--check", action="store_true", help="compare with checked-in output")
+    args = parser.parse_args()
+
+    generated, counts = generate(args.archive)
+    destination = ASSETS / "pinyin_unihan.inc"
+    if args.check:
+        if destination.read_bytes().replace(b"\r\n", b"\n") != generated:
+            parser.error("pinyin_unihan.inc differs from regenerated output")
+    else:
+        destination.write_bytes(generated)
+    syllables, chars, added = counts
+    print(f"{syllables} syllables, {chars} distinct characters ({added} new)")
+
+
+if __name__ == "__main__":
+    main()

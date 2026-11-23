@@ -14,7 +14,7 @@ spec.loader.exec_module(fatfs)
 sources = list((lvgl / "src").rglob("*.c")) + [
     root / "main/assets/font_16.c", root / "main/assets/font_24.c",
     root / "main/apps/app_reader.c", root / "main/app_reader_layout.c",
-    root / "main/apps/app_music.c",
+    root / "main/apps/app_music.c", root / "main/app_lyrics.c",
     root / "main/app_reader_file.c", root / "main/app_text.c", test / "smoke.c", fatfs.source_path(root),
 ]
 flags = ["gcc", "-std=c11", "-O0", "-g", "-Werror=implicit-function-declaration", "-ffunction-sections", "-fdata-sections",
@@ -60,5 +60,7 @@ for codec,bom in [("utf-8",b"\xef\xbb\xbf"),("gbk",b""),("utf-16-le",b"\xff\xfe"
     case.mkdir(exist_ok=True)
     book = case / "中文阅读测试.txt"
     book.write_bytes(bom + text.encode(codec))
+    lyric = "[ti:海边的风]\r\n[00:38]远处灯火慢慢亮起来\r\n[00:42.00]海风轻轻穿过长街\r\n[00:48.500]我们沿着星光慢慢走"
+    (case / "海边的风.lrc").write_bytes(bom + lyric.encode(codec))
     subprocess.run([str(binary), str(book), str(case)], check=True)
     print("PASS actual reader UI + project fonts + source offsets:",codec)

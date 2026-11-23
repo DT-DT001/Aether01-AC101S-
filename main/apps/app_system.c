@@ -25,9 +25,13 @@ static lv_obj_t *action(lv_obj_t *parent, const char *text, int x, int y,
     lv_obj_set_pos(button, x, y);
     lv_obj_set_size(button, width, 44);
     lv_obj_set_style_radius(button, 14, 0);
-    lv_obj_set_style_bg_color(button, lv_color_hex(0x2768D8), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x273B58), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x395E83), LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(button, 0, 0);
     lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, ui);
-    app_ui_add_text(button, text, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, app_ui_chinese_font());
+    const bool icon = (unsigned char)text[0] == 0xEF && (unsigned char)text[1] < 0xA0;
+    app_ui_add_text(button, text, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF,
+                    icon ? &lv_font_montserrat_20 : app_ui_chinese_font());
     return button;
 }
 
@@ -35,6 +39,17 @@ static void page_free(app_ui_t *ui)
 {
     free(ui->page_context);
     ui->page_context = NULL;
+}
+
+static lv_obj_t *section_card(lv_obj_t *parent, int y, int height,
+                              const char *symbol, const char *title, uint32_t accent);
+static lv_obj_t *section_text(lv_obj_t *card, const char *text, int y, uint32_t color);
+static lv_obj_t *system_dropdown(lv_obj_t *card, int x, int y, int width, const char *options);
+
+static const char *component_status(bool ready, esp_err_t error)
+{
+    if (!ready) return "未连接";
+    return error == ESP_OK ? "正常" : esp_err_to_name(error);
 }
 
 static void update_status(lv_timer_t *timer)
@@ -64,35 +79,28 @@ static void update_status(lv_timer_t *timer)
         snprintf(te_text, sizeof(te_text), "TE %lu.%lu Hz",
                  (unsigned long)(hz_x10 / 10), (unsigned long)(hz_x10 % 10));
     }
-    app_ui_label_fmt(ui->app_obj[0],
-        "运行 %llu 小时 %02llu 分 %02llu 秒\n"
-        "固件 %s / IDF %s\n\n"
-        "TG29 %s\nDCDC2 %u mV\nDCDC 0x%02X / LDO 0x%02X 0x%02X\n"
-        "%s\n\n"
-        "显示 %s / 触摸 %s / 音频 %s\n"
-        "%s\n"
-        "六轴 %s\n气压 %s\nRTC %s\n\n"
-        "PSRAM 总量 %u MiB / 空闲 %u KiB\n"
-        "内部堆空闲 %u KiB / 历史最低 %u KiB\n"
-        "最大连续内部内存 %u KiB\n\n"
-        "TF %s\n容量 %llu MiB / 错误 %s\n设置存储 %s",
+    app_ui_label_fmt(ui->app_obj[0], "%02llu:%02llu:%02llu",
         (unsigned long long)(seconds / 3600), (unsigned long long)(seconds / 60 % 60),
-        (unsigned long long)(seconds % 60), app->version, app->idf_ver,
+        (unsigned long long)(seconds % 60));
+    app_ui_label_fmt(ui->app_obj[1], "固件 %s\nESP-IDF %s", app->version, app->idf_ver);
+    app_ui_label_fmt(ui->app_obj[2], "显示 %s   触摸 %s   音频 %s\n%s\n六轴 %s\n气压 %s\nRTC %s",
+        component_status(ui->board->display_ready, ESP_OK),
+        component_status(ui->board->touch_ready, ESP_OK),
+        component_status(ui->board->audio_ready, ESP_OK), te_text,
+        component_status(ui->board->imu_ready, samples.imu_error),
+        component_status(ui->board->barometer_ready, samples.barometer_error),
+        component_status(ui->board->rtc_ready, samples.rtc_error));
+    app_ui_label_fmt(ui->app_obj[3], "TG29 %s\nDCDC2 %u mV\nDCDC 0x%02X / LDO 0x%02X 0x%02X\n%s",
         tools.power_error == ESP_OK ? "通信正常" : esp_err_to_name(tools.power_error),
         tools.power.dcdc2_mv, tools.power.dcdc_enable, tools.power.ldo_enable_0, tools.power.ldo_enable_1,
-        battery_text,
-        ui->board->display_ready ? "已初始化" : "不可用",
-        ui->board->touch_ready ? "已初始化" : "不可用",
-        ui->board->audio_ready ? "已初始化" : "不可用",
-        te_text,
-        ui->board->imu_ready ? esp_err_to_name(samples.imu_error) : "未连接",
-        ui->board->barometer_ready ? esp_err_to_name(samples.barometer_error) : "未连接",
-        ui->board->rtc_ready ? esp_err_to_name(samples.rtc_error) : "未连接",
+        battery_text);
+    app_ui_label_fmt(ui->app_obj[4], "PSRAM %u MiB / 空闲 %u KiB\n内部堆 %u KiB / 最低 %u KiB\n最大连续块 %u KiB",
         (unsigned)(esp_psram_get_size() / (1024U * 1024U)),
         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
         (unsigned)(heap_caps_get_free_size(caps) / 1024),
         (unsigned)(heap_caps_get_minimum_free_size(caps) / 1024),
-        (unsigned)(heap_caps_get_largest_free_block(caps) / 1024),
+        (unsigned)(heap_caps_get_largest_free_block(caps) / 1024));
+    app_ui_label_fmt(ui->app_obj[5], "TF %s\n容量 %llu MiB / 错误 %s\n设置存储 %s",
         sd_error != ESP_OK ? esp_err_to_name(sd_error) :
             sd.mounted ? "已挂载" : sd.card_inserted ? "插入 / 尚未就绪" : "未插卡",
         (unsigned long long)(sd.capacity_bytes / (1024ULL * 1024ULL)),
@@ -105,10 +113,24 @@ void app_open_status(app_ui_t *ui)
 {
     lv_obj_t *content = app_ui_begin_page(ui, "设备状态");
     app_telemetry_set_interest(APP_TELEMETRY_IMU | APP_TELEMETRY_BAROMETER);
-    ui->app_obj[0] = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 0, 0, 0xC9DCF8, app_ui_chinese_font());
-    lv_obj_set_width(ui->app_obj[0], 402);
-    lv_label_set_long_mode(ui->app_obj[0], LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_line_space(ui->app_obj[0], 8, 0);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content, 12, 0);
+    lv_obj_t *system = section_card(content, 0, LV_SIZE_CONTENT, LV_SYMBOL_PLAY, "运行时长", 0x86E3C9);
+    ui->app_obj[0] = app_ui_add_text(system, "", LV_ALIGN_TOP_LEFT, 16, 58, 0x86E3C9,
+                                    &lv_font_montserrat_48);
+    ui->app_obj[1] = section_text(system, "", 122, 0xA6B4CD);
+    static const struct { const char *icon, *name; uint32_t accent; } details[] = {
+        {LV_SYMBOL_SETTINGS, "组件状态", 0x8FD7FF},
+        {LV_SYMBOL_BATTERY_FULL, "供电", 0x86E3C9},
+        {LV_SYMBOL_SAVE, "运行内存", 0xADC8FF},
+        {LV_SYMBOL_SD_CARD, "存储", 0xBEBAFF},
+    };
+    for (unsigned i = 0; i < sizeof(details) / sizeof(details[0]); ++i) {
+        lv_obj_t *card = section_card(content, 0, LV_SIZE_CONTENT, details[i].icon, details[i].name, details[i].accent);
+        ui->app_obj[2 + i] = section_text(card, "", 58, 0xD3E2FA);
+        lv_obj_set_style_text_line_space(ui->app_obj[2 + i], 4, 0);
+    }
     app_ui_set_timer(ui, update_status, 1000);
     update_status(ui->timer);
 }
@@ -257,11 +279,7 @@ static lv_obj_t *clock_field(lv_obj_t *parent, const char *name, int x, int y,
                               unsigned first, unsigned count, app_ui_t *ui)
 {
     app_ui_add_text(parent, name, LV_ALIGN_TOP_LEFT, x + 4, y, 0x8FA9CD, app_ui_chinese_font());
-    lv_obj_t *field = lv_dropdown_create(parent);
-    lv_obj_set_pos(field, x, y + 24);
-    lv_obj_set_size(field, 122, 44);
-    lv_obj_set_style_text_font(field, app_ui_chinese_font(), 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(field), app_ui_chinese_font(), 0);
+    lv_obj_t *field = system_dropdown(parent, x, y + 24, 122, "");
     char options[512];
     size_t length = 0;
     for (unsigned i = 0; i < count; ++i) {
@@ -291,18 +309,27 @@ void app_open_clock(app_ui_t *ui)
     }
     ui->page_context = page;
     ui->page_cleanup = page_free;
-    ui->app_obj[0] = app_ui_add_text(content, "--:--:--", LV_ALIGN_TOP_MID, 0, 0, 0x77B8FF, &lv_font_montserrat_28);
-    ui->app_obj[1] = app_ui_add_text(content, "等待 RTC…", LV_ALIGN_TOP_MID, 0, 38, 0xC9DCF8, app_ui_chinese_font());
-    action(content, LV_SYMBOL_BELL, 350, 6, 52, show_alarm, ui);
-    page->fields[0] = clock_field(content, "年", 0, 82, 2000, 100, ui);
-    page->fields[1] = clock_field(content, "月", 140, 82, 1, 12, ui);
-    page->fields[2] = clock_field(content, "日", 280, 82, 1, 31, ui);
-    page->fields[3] = clock_field(content, "时", 0, 160, 0, 24, ui);
-    page->fields[4] = clock_field(content, "分", 140, 160, 0, 60, ui);
-    page->fields[5] = clock_field(content, "秒", 280, 160, 0, 60, ui);
-    ui->app_obj[3] = action(content, "保存日期时间", 0, 246, 192, clock_save, ui);
-    ui->app_obj[4] = action(content, "NTP 校时", 210, 246, 192, clock_sync, ui);
-    ui->app_obj[2] = app_ui_add_text(content, "连上 Wi-Fi 后可同步北京时间", LV_ALIGN_TOP_MID, 0, 310, 0x8FA9CD, app_ui_chinese_font());
+    lv_obj_t *face = lv_obj_create(content);
+    lv_obj_set_size(face, 404, 96);
+    lv_obj_remove_flag(face, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(face, 0, 0);
+    lv_obj_set_style_radius(face, 20, 0);
+    lv_obj_set_style_bg_color(face, lv_color_hex(0x1B2842), 0);
+    lv_obj_set_style_border_color(face, lv_color_hex(0x34435E), 0);
+    lv_obj_set_style_border_width(face, 1, 0);
+    ui->app_obj[0] = app_ui_add_text(face, "--:--:--", LV_ALIGN_TOP_LEFT, 18, 5, 0x90E5D8, &lv_font_montserrat_48);
+    ui->app_obj[1] = app_ui_add_text(face, "等待 RTC…", LV_ALIGN_BOTTOM_LEFT, 21, -10, 0xB9C8E1, app_ui_chinese_font());
+    action(face, LV_SYMBOL_BELL, 334, 23, 54, show_alarm, ui);
+    page->fields[0] = clock_field(content, "年", 0, 110, 2000, 100, ui);
+    page->fields[1] = clock_field(content, "月", 140, 110, 1, 12, ui);
+    page->fields[2] = clock_field(content, "日", 280, 110, 1, 31, ui);
+    page->fields[3] = clock_field(content, "时", 0, 185, 0, 24, ui);
+    page->fields[4] = clock_field(content, "分", 140, 185, 0, 60, ui);
+    page->fields[5] = clock_field(content, "秒", 280, 185, 0, 60, ui);
+    ui->app_obj[3] = action(content, "保存日期时间", 0, 264, 192, clock_save, ui);
+    lv_obj_set_style_bg_color(ui->app_obj[3], lv_color_hex(0x23615F), 0);
+    ui->app_obj[4] = action(content, "NTP 校时", 210, 264, 192, clock_sync, ui);
+    ui->app_obj[2] = app_ui_add_text(content, "连上 Wi-Fi 后可同步北京时间", LV_ALIGN_TOP_MID, 0, 320, 0x8FA9CD, app_ui_chinese_font());
     lv_obj_set_width(ui->app_obj[2], 402);
     lv_obj_set_style_text_align(ui->app_obj[2], LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(ui->app_obj[2], LV_LABEL_LONG_WRAP);
@@ -322,7 +349,7 @@ typedef struct {
     esp_err_t otg_submit_error;
 } settings_page_t;
 
-enum { OTG_HID_Y = 1386, OTG_HID_HEIGHT = 220, OTG_HELP_GAP = 22 };
+enum { OTG_HID_Y = 380, OTG_HID_HEIGHT = 220, OTG_HELP_GAP = 16 };
 
 static void refresh_usb(app_ui_t *ui, settings_page_t *page)
 {
@@ -666,6 +693,65 @@ static void nes_controls_event(lv_event_t *event)
     ui->page_back = app_open_settings;
 }
 
+static lv_obj_t *section_card(lv_obj_t *parent, int y, int height,
+                               const char *symbol, const char *title, uint32_t accent)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_size(card, lv_pct(100), height);
+    lv_obj_set_pos(card, 0, y);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_set_style_pad_bottom(card, 16, 0);
+    lv_obj_set_style_radius(card, 22, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x303B57), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x1B2337), 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *icon = app_ui_add_text(card, symbol, LV_ALIGN_TOP_LEFT, 16, 14, accent,
+                                    &lv_font_montserrat_20);
+    lv_obj_set_size(icon, 36, 34);
+    lv_obj_set_style_pad_top(icon, 6, 0);
+    lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_color(icon, lv_color_hex(0x303850), 0);
+    lv_obj_set_style_bg_opa(icon, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(icon, 10, 0);
+    app_ui_add_text(card, title, LV_ALIGN_TOP_LEFT, 63, 17, 0xEDF3FF, app_ui_chinese_font_size(24));
+    return card;
+}
+
+static lv_obj_t *section_text(lv_obj_t *card, const char *text, int y, uint32_t color)
+{
+    lv_obj_t *label = app_ui_add_text(card, text, LV_ALIGN_TOP_LEFT, 16, y, color, app_ui_chinese_font());
+    lv_obj_set_width(label, 380);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    return label;
+}
+
+static lv_obj_t *system_dropdown(lv_obj_t *card, int x, int y, int width, const char *options)
+{
+    lv_obj_t *choice = lv_dropdown_create(card);
+    lv_obj_set_pos(choice, x, y);
+    lv_obj_set_size(choice, width, 44);
+    lv_obj_set_style_text_font(choice, app_ui_chinese_font(), 0);
+    lv_obj_set_style_text_font(choice, &lv_font_montserrat_16, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(choice, lv_color_hex(0x29354F), 0);
+    lv_obj_set_style_text_color(choice, lv_color_hex(0xEAF2FF), 0);
+    lv_obj_set_style_border_width(choice, 0, 0);
+    lv_obj_set_style_radius(choice, 13, 0);
+    lv_obj_set_style_pad_top(choice, 12, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(choice), app_ui_chinese_font(), 0);
+    lv_dropdown_set_options(choice, options);
+    return choice;
+}
+
+static lv_obj_t *settings_switch(lv_obj_t *card, int y, lv_event_cb_t callback, app_ui_t *ui)
+{
+    lv_obj_t *control = lv_switch_create(card);
+    lv_obj_set_pos(control, 324, y);
+    lv_obj_set_size(control, 70, 36);
+    lv_obj_add_event_cb(control, callback, LV_EVENT_VALUE_CHANGED, ui);
+    return control;
+}
+
 void app_open_settings(app_ui_t *ui)
 {
     lv_obj_t *content = app_ui_begin_page(ui, "设置");
@@ -676,111 +762,74 @@ void app_open_settings(app_ui_t *ui)
     }
     ui->page_context = page;
     ui->page_cleanup = page_free;
-    app_ui_add_text(content, "声音", LV_ALIGN_TOP_LEFT, 4, 0, 0xA9DDD5, app_ui_chinese_font_size(24));
-    page->volume_label = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 42, 0xD9E8FF, app_ui_chinese_font());
-    page->volume = lv_slider_create(content);
-    lv_obj_set_pos(page->volume, 16, 92);
-    lv_obj_set_size(page->volume, 270, 18);
+    lv_obj_set_style_pad_all(content, 16, 0);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_t *sound = section_card(content, 0, 216, LV_SYMBOL_VOLUME_MAX, "声音", 0x86E3C9);
+    page->volume_label = section_text(sound, "", 60, 0xD9E8FF);
+    page->volume = lv_slider_create(sound);
+    lv_obj_set_pos(page->volume, 24, 93);
+    lv_obj_set_size(page->volume, 263, 16);
     lv_slider_set_range(page->volume, 0, 100);
     lv_obj_set_ext_click_area(page->volume, 14);
     lv_obj_set_style_bg_color(page->volume, lv_color_hex(0x79CDBA), LV_PART_INDICATOR);
     lv_obj_add_event_cb(page->volume, volume_event, LV_EVENT_VALUE_CHANGED, ui);
     lv_obj_add_event_cb(page->volume, volume_event, LV_EVENT_RELEASED, ui);
-    page->mute_button = action(content, "静音", 312, 76, 88, mute_event, ui);
+    page->mute_button = action(sound, "静音", 310, 75, 86, mute_event, ui);
+    lv_obj_set_style_bg_color(page->mute_button, lv_color_hex(0x29354F), 0);
     page->mute_label = lv_obj_get_child(page->mute_button, 0);
-    app_ui_add_text(content, "音频输出", LV_ALIGN_TOP_LEFT, 4, 144, 0xD9E8FF, app_ui_chinese_font());
-    page->output = lv_dropdown_create(content);
-    lv_obj_set_pos(page->output, 4, 174);
-    lv_obj_set_size(page->output, 398, 44);
-    lv_obj_set_style_text_font(page->output, app_ui_chinese_font(), 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(page->output), app_ui_chinese_font(), 0);
-    lv_dropdown_set_options(page->output, "扬声器\n蓝牙耳机\nUSB 耳机 / 声卡");
+    section_text(sound, "音频输出", 137, 0xD9E8FF);
+    page->output = system_dropdown(sound, 158, 124, 238, "扬声器\n蓝牙耳机\nUSB 耳机 / 声卡");
     lv_obj_add_event_cb(page->output, output_event, LV_EVENT_VALUE_CHANGED, ui);
-    lv_obj_t *help = app_ui_add_text(content, "蓝牙耳机需先在主页连接；音乐与蓝牙页面共用系统音量。",
-                                     LV_ALIGN_TOP_LEFT, 4, 234, 0x8FA9AD, app_ui_chinese_font());
-    lv_obj_set_width(help, 398);
-    lv_label_set_long_mode(help, LV_LABEL_LONG_WRAP);
-    page->audio_status = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 288, 0x9CCFBE, app_ui_chinese_font());
-    lv_obj_set_width(page->audio_status, 398);
-    lv_label_set_long_mode(page->audio_status, LV_LABEL_LONG_WRAP);
-    app_ui_add_text(content, "显示", LV_ALIGN_TOP_LEFT, 4, 354, 0xA8C8FF, app_ui_chinese_font_size(24));
-    ui->app_obj[1] = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 398, 0xD9E8FF, app_ui_chinese_font());
-    lv_obj_t *brightness = lv_slider_create(content);
-    lv_obj_set_pos(brightness, 18, 448);
-    lv_obj_set_size(brightness, 370, 18);
+    page->audio_status = section_text(sound, "", 173, 0x9CCFBE);
+
+    lv_obj_t *display = section_card(content, 230, 270, LV_SYMBOL_IMAGE, "显示", 0xADC8FF);
+    ui->app_obj[1] = section_text(display, "", 59, 0xD9E8FF);
+    lv_obj_t *brightness = lv_slider_create(display);
+    lv_obj_set_pos(brightness, 24, 94);
+    lv_obj_set_size(brightness, 360, 16);
     lv_slider_set_range(brightness, 5, 100);
     lv_slider_set_value(brightness, app_power_get_brightness(ui->power), LV_ANIM_OFF);
     lv_obj_set_ext_click_area(brightness, 12);
     lv_obj_add_event_cb(brightness, brightness_event, LV_EVENT_VALUE_CHANGED, ui);
     lv_obj_add_event_cb(brightness, brightness_event, LV_EVENT_RELEASED, ui);
-    ui->app_obj[0] = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 496, 0xD9E8FF, app_ui_chinese_font());
-    lv_obj_t *timeout = lv_dropdown_create(content);
-    lv_obj_set_pos(timeout, 4, 526);
-    lv_obj_set_size(timeout, 398, 44);
-    lv_obj_set_style_text_font(timeout, app_ui_chinese_font(), 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(timeout), app_ui_chinese_font(), 0);
-    lv_dropdown_set_options(timeout, "永不\n15 秒\n30 秒\n1 分钟\n2 分钟\n5 分钟\n10 分钟\n30 分钟\n1 小时");
+    ui->app_obj[0] = section_text(display, "", 137, 0xD9E8FF);
+    lv_obj_t *timeout = system_dropdown(display, 232, 122, 164,
+        "永不\n15 秒\n30 秒\n1 分钟\n2 分钟\n5 分钟\n10 分钟\n30 分钟\n1 小时");
     static const uint16_t values[] = {0,15,30,60,120,300,600,1800,3600};
     for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
         if (values[i] == app_power_get_timeout(ui->power)) lv_dropdown_set_selected(timeout, i);
     }
     lv_obj_add_event_cb(timeout, timeout_event, LV_EVENT_VALUE_CHANGED, ui);
-    action(content, "立即息屏", 110, 598, 188, sleep_event, ui);
-    ui->app_obj[2] = app_ui_add_text(content, "按电源键唤醒屏幕；触摸不唤醒", LV_ALIGN_TOP_LEFT, 4, 666, 0x8FA9CD, app_ui_chinese_font());
-    lv_obj_set_width(ui->app_obj[2], 402);
-    lv_obj_set_style_text_align(ui->app_obj[2], LV_TEXT_ALIGN_CENTER, 0);
-    app_ui_add_text(content, "USB 虚拟U盘", LV_ALIGN_TOP_LEFT, 4, 738, 0xA8C8FF, app_ui_chinese_font_size(24));
-    page->usb_switch = lv_switch_create(content);
-    lv_obj_set_pos(page->usb_switch, 326, 738);
-    lv_obj_set_size(page->usb_switch, 72, 36);
-    lv_obj_add_event_cb(page->usb_switch, usb_switch_event, LV_EVENT_VALUE_CHANGED, ui);
-    page->usb_status = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 790, 0x9CCFBE, app_ui_chinese_font());
-    lv_obj_set_size(page->usb_status, 398, 48);
-    lv_label_set_long_mode(page->usb_status, LV_LABEL_LONG_WRAP);
-    lv_obj_t *usb_help = app_ui_add_text(content,
-        "默认关闭，重启后关闭。开启后停止媒体并让电脑读写 TF；关闭后恢复本地使用和烧录串口。",
-        LV_ALIGN_TOP_LEFT, 4, 850, 0x8FA9AD, app_ui_chinese_font());
-    lv_obj_set_width(usb_help, 398);
-    lv_label_set_long_mode(usb_help, LV_LABEL_LONG_WRAP);
-    action(content, "NES 按键映射", 4, 930, 194, nes_controls_event, ui);
-    action(content, "传输详情", 208, 930, 194, usb_details, ui);
-    app_ui_add_text(content, "自动 OTG（CC 检测）", LV_ALIGN_TOP_LEFT, 4, 1020,
-                    0xA8C8FF, app_ui_chinese_font_size(24));
-    page->otg_switch = lv_switch_create(content);
-    lv_obj_set_pos(page->otg_switch, 326, 1020);
-    lv_obj_set_size(page->otg_switch, 72, 36);
-    lv_obj_add_event_cb(page->otg_switch, otg_switch_event, LV_EVENT_VALUE_CHANGED, ui);
-    app_ui_add_text(content, "手动 OTG（无 CC 外设）", LV_ALIGN_TOP_LEFT, 4, 1072,
-                    0xA8C8FF, app_ui_chinese_font_size(24));
-    page->otg_manual_switch = lv_switch_create(content);
-    lv_obj_set_pos(page->otg_manual_switch, 326, 1072);
-    lv_obj_set_size(page->otg_manual_switch, 72, 36);
-    lv_obj_add_event_cb(page->otg_manual_switch, otg_switch_event, LV_EVENT_VALUE_CHANGED, ui);
-    lv_obj_t *manual_warning = app_ui_add_text(content,
-        "接充电器或电脑前，请关闭手动 OTG 并等供电停止。",
-        LV_ALIGN_TOP_LEFT, 4, 1118, 0xE8C388, app_ui_chinese_font());
-    lv_obj_set_width(manual_warning, 398);
-    lv_label_set_long_mode(manual_warning, LV_LABEL_LONG_WRAP);
-    page->otg_status = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 1170,
-                                     0x9CCFBE, app_ui_chinese_font());
-    lv_obj_set_size(page->otg_status, 398, 54);
-    lv_label_set_long_mode(page->otg_status, LV_LABEL_LONG_WRAP);
-    page->otg_power = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 1236,
-                                    0x8FA9AD, app_ui_chinese_font());
-    lv_obj_set_size(page->otg_power, 398, 128);
-    lv_label_set_long_mode(page->otg_power, LV_LABEL_LONG_WRAP);
-    page->otg_hid = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, OTG_HID_Y,
-                                  0x8FA9AD, app_ui_chinese_font());
-    lv_obj_set_size(page->otg_hid, 398, OTG_HID_HEIGHT);
-    lv_label_set_long_mode(page->otg_hid, LV_LABEL_LONG_WRAP);
-    page->otg_help = app_ui_add_text(content,
-        "两种 OTG 均默认关闭，与虚拟U盘互斥。自动模式在 CC 确认受电设备后供电。支持标准 HID 键盘、鼠标、通用手柄，UAC 1.0 耳机/麦克风及 FAT32/exFAT U盘。USB 音频在输出/录音页选择，文件浏览切换到 USB U盘。NES 按 GPIO61/BOOT 用户键退出，键盘按键可在 NES 按键映射中设置。",
-        LV_ALIGN_TOP_LEFT, 4, OTG_HID_Y, 0x8FA9AD, app_ui_chinese_font());
-    lv_obj_set_width(page->otg_help, 398);
-    lv_label_set_long_mode(page->otg_help, LV_LABEL_LONG_WRAP);
+    action(display, "立即息屏", 16, 174, 140, sleep_event, ui);
+    ui->app_obj[2] = section_text(display, "按电源键唤醒屏幕", 225, 0xA6B4CD);
+
+    lv_obj_t *storage = section_card(content, 514, 206, LV_SYMBOL_SD_CARD, "存储与按键", 0xBEBAFF);
+    section_text(storage, "USB 虚拟U盘", 67, 0xD9E8FF);
+    page->usb_switch = settings_switch(storage, 58, usb_switch_event, ui);
+    page->usb_status = section_text(storage, "", 100, 0x9CCFBE);
+    action(storage, "传输详情", 16, 148, 183, usb_details, ui);
+    action(storage, "NES 按键映射", 213, 148, 183, nes_controls_event, ui);
+    lv_obj_t *otg = section_card(content, 734, LV_SIZE_CONTENT, LV_SYMBOL_USB, "USB 外设", 0x8FD7FF);
+    section_text(otg, "自动 OTG（CC 检测）", 67, 0xD9E8FF);
+    page->otg_switch = settings_switch(otg, 58, otg_switch_event, ui);
+    section_text(otg, "手动 OTG（无 CC 外设）", 117, 0xD9E8FF);
+    page->otg_manual_switch = settings_switch(otg, 108, otg_switch_event, ui);
+    section_text(otg, "接充电器或电脑前，请关闭手动 OTG 并等供电停止。", 156, 0xF0C786);
+    page->otg_status = section_text(otg, "", 208, 0x9CCFBE);
+    page->otg_power = section_text(otg, "", 264, 0xA6B4CD);
+    page->otg_hid = section_text(otg, "", OTG_HID_Y, 0xA6B4CD);
+    lv_obj_set_height(page->otg_hid, OTG_HID_HEIGHT);
+    page->otg_help = section_text(otg,
+        "OTG 与虚拟U盘互斥。自动模式在 CC 确认后供电。支持 HID 键鼠、手柄、UAC 1.0 音频和 FAT32/exFAT U盘。USB 音频在声音与录音页选择，U盘在文件管理中打开。",
+        OTG_HID_Y, 0xA6B4CD);
     refresh_setting_labels(ui);
     refresh_audio(page);
     refresh_usb(ui, page);
     refresh_otg(ui, page);
+    /* Take focus before the previous screen's deferred deletion can move it
+     * to one of this page's lower controls and start an automatic scroll. */
+    lv_obj_update_layout(content);
+    lv_group_focus_obj(page->volume);
+    lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
     app_ui_set_timer(ui, settings_timer, 300);
 }

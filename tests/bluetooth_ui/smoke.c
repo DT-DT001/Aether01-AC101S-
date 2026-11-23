@@ -86,6 +86,16 @@ int main(void)
     status.state=AETHER_BT_STOPPING;status.connected=false;advance(350);
     assert(lv_obj_has_state(route,LV_STATE_DISABLED)&&lv_obj_has_state(scan,LV_STATE_DISABLED)&&lv_obj_has_state(row,LV_STATE_DISABLED));
     puts("PASS ACL failure detail stays above device list; disconnecting/late connected and stopping disable scan/select/output");
+    status.state=AETHER_BT_CONNECTED;status.connected=true;status.channels=2;
+    strcpy(status.peer.name,"Paired headphones");audio.applied_output=APP_AUDIO_OUTPUT_BLUETOOTH;
+    advance(350);
+    lv_obj_t *speaker=lv_obj_get_parent(find(ui.screen,"使用扬声器"));
+    assert(find(ui.screen,"Paired headphones")&&find(ui.screen,"44100 Hz · 立体声"));
+    assert(lv_obj_has_state(route,LV_STATE_CHECKED)&&!lv_obj_has_state(speaker,LV_STATE_CHECKED));
+    assert(lv_obj_get_height(route)>=44&&lv_obj_get_height(row)>=44);
+    audio.applied_output=APP_AUDIO_OUTPUT_SPEAKER;advance(350);
+    assert(!lv_obj_has_state(route,LV_STATE_CHECKED)&&lv_obj_has_state(speaker,LV_STATE_CHECKED));
+    puts("PASS audio format and applied output stay visible, with full-size controls");
     if(ui.timer)lv_timer_delete(ui.timer);
     if(ui.page_cleanup)ui.page_cleanup(&ui);
     lv_obj_delete(ui.screen);lv_indev_delete(in);assert(lv_mem_test()==LV_RESULT_OK);lv_display_delete(d);lv_deinit();

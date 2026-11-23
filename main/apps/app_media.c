@@ -1,5 +1,6 @@
 #include "aether_media_fs.h"
 #include "app_ui_internal.h"
+#include "app_catalog_ui.h"
 #include "app_touch.h"
 #include "app_audio_system.h"
 
@@ -41,7 +42,7 @@ typedef struct {
     int64_t interaction_us, notice_until_us;
     lv_point_t press_point;
     lv_obj_t *header, *controls, *time, *progress, *volume, *volume_label;
-    lv_obj_t *speed, *play, *mute, *mute_label;
+    lv_obj_t *speed, *play, *play_icon, *mute, *mute_label, *mute_icon;
     char notice[96];
 } video_page_t;
 
@@ -95,13 +96,18 @@ static lv_obj_t *media_button(lv_obj_t *parent, const char *text, int x, int y,
 {
     lv_obj_t *button = lv_button_create(parent);
     lv_obj_set_pos(button, x, y); lv_obj_set_size(button, width, 44);
-    lv_obj_set_style_radius(button, 14, 0);
-    lv_obj_set_style_bg_color(button, lv_color_hex(0x263C55), 0);
-    lv_obj_set_style_bg_opa(button, LV_OPA_60, 0);
-    lv_obj_set_style_shadow_width(button, 0, 0);
+    app_catalog_control(button, 0x20344C);
+    lv_obj_set_style_bg_opa(button, LV_OPA_90, 0);
     lv_obj_remove_flag(button, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
     if (callback) lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, ui);
     return app_ui_add_text(button, text, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, app_ui_chinese_font());
+}
+
+static lv_obj_t *media_button_icon(lv_obj_t *label, const char *symbol)
+{
+    lv_obj_align(label, LV_ALIGN_CENTER, 11, 0);
+    return app_ui_add_text(lv_obj_get_parent(label), symbol, LV_ALIGN_CENTER, -24, 0,
+                           0xA1E4EC, &lv_font_montserrat_16);
 }
 
 static void video_controls(app_ui_t *ui, bool visible)
@@ -204,6 +210,7 @@ static void video_show_error(app_ui_t *ui, const char *action, esp_err_t error, 
     app_ui_label_fmt(ui->app_obj[1], "%s：%s%s%s\n\n%s", action, esp_err_to_name(error),
         detail && detail[0] ? "\n" : "", detail ? detail : "", hint);
     app_ui_label_text(ui->app_obj[2], "重试");
+    app_ui_label_text(page->play_icon, LV_SYMBOL_REFRESH);
 }
 
 static void video_reset_frame(void *context)
@@ -265,7 +272,7 @@ static void video_time(app_ui_t *ui, uint32_t position_ms, uint32_t duration_ms)
     video_page_t *page = ui->page_context; char at[24], total[24];
     time_text(at, sizeof(at), position_ms); time_text(total, sizeof(total), duration_ms);
     if (duration_ms) app_ui_label_fmt(page->time, "%s / %s", at, total);
-    else app_ui_label_fmt(page->time, "已播 %s · 总时长未知", at);
+    else app_ui_label_fmt(page->time, "%s / --:--", at);
 }
 
 static void video_seek_event(lv_event_t *event)
@@ -333,6 +340,7 @@ static void video_audio(app_ui_t *ui)
     if (!lv_obj_has_state(page->volume, LV_STATE_PRESSED)) lv_slider_set_value(page->volume, audio.master_volume, LV_ANIM_OFF);
     app_ui_label_fmt(page->volume_label, "%u%%", audio.master_volume);
     app_ui_label_text(page->mute_label, audio.master_volume ? "静音" : "恢复");
+    app_ui_label_text(page->mute_icon, audio.master_volume ? LV_SYMBOL_VOLUME_MID : LV_SYMBOL_MUTE);
     if (audio.ready) { lv_obj_remove_state(page->volume, LV_STATE_DISABLED); lv_obj_remove_state(page->mute, LV_STATE_DISABLED); }
     else { lv_obj_add_state(page->volume, LV_STATE_DISABLED); lv_obj_add_state(page->mute, LV_STATE_DISABLED); }
 }
@@ -365,23 +373,28 @@ static void video_status_timer(lv_timer_t *timer)
         (int32_t)((uint64_t)position * 1000U / status.duration_ms) : 0, LV_ANIM_OFF);
     switch (status.state) {
     case AETHER_VIDEO_STARTING:
+        app_ui_label_text(page->play_icon, LV_SYMBOL_PAUSE);
         app_ui_label_text(ui->app_obj[1], "正在初始化解码器…"); app_ui_label_text(ui->app_obj[2], "暂停"); break;
     case AETHER_VIDEO_PLAYING:
         if (status.seeking || page->seek_pending) app_ui_label_text(ui->app_obj[1], "正在跳转…");
-        else if (status.width && status.height) app_ui_label_fmt(ui->app_obj[1], "%ux%u · 播放中", status.width, status.height);
+        else if (status.width && status.height) app_ui_label_fmt(ui->app_obj[1], "%ux%u", status.width, status.height);
         else app_ui_label_text(ui->app_obj[1], "等待首帧…");
         /* Metrics remain cached in the player/display. Never print from this
          * LVGL callback: an absent USB console must not stall touch/render. */
         app_ui_label_text(ui->app_obj[2], "暂停");
+        app_ui_label_text(page->play_icon, LV_SYMBOL_PAUSE);
         break;
     case AETHER_VIDEO_PAUSED:
+        app_ui_label_text(page->play_icon, LV_SYMBOL_PLAY);
         app_ui_label_text(ui->app_obj[1], status.seeking || page->seek_pending ? "已暂停 · 正在跳转…" : "已暂停");
         app_ui_label_text(ui->app_obj[2], "继续"); break;
     case AETHER_VIDEO_FINISHED:
+        app_ui_label_text(page->play_icon, LV_SYMBOL_REFRESH);
         app_ui_label_text(ui->app_obj[1], "播放完毕"); app_ui_label_text(ui->app_obj[2], "重播"); break;
     case AETHER_VIDEO_ERROR:
         video_show_error(ui, "播放错误", status.last_error, status.detail); return;
     default:
+        app_ui_label_text(page->play_icon, LV_SYMBOL_PLAY);
         app_ui_label_text(ui->app_obj[1], "已停止"); app_ui_label_text(ui->app_obj[2], "播放"); break;
     }
     const int64_t now = esp_timer_get_time();
@@ -407,7 +420,9 @@ static void video_loaded(app_ui_t *ui, const app_io_result_t *result)
 
 static void video_prepare(app_ui_t *ui)
 {
+    video_page_t *page = ui->page_context;
     video_error_layout(ui, false); video_activity(ui);
+    app_ui_label_text(page->play_icon, LV_SYMBOL_PLAY);
     app_ui_label_text(ui->app_obj[1], "正在准备视频…"); app_ui_label_text(ui->app_obj[2], "等待");
     app_io_request_t request = {.operation = APP_IO_PREPARE, .filter = APP_IO_VIDEO};
     strlcpy(request.path, ui->app_path, sizeof(request.path)); app_ui_request_io_ex(ui, &request, video_loaded);
@@ -437,6 +452,7 @@ static void video_stop_event(lv_event_t *event)
     page->seekable = false; lv_obj_add_state(page->progress, LV_STATE_DISABLED);
     ui->media_active = false; ui->media_started = false; app_frames_set_active(ui->frames, false);
     video_error_layout(ui, false); video_activity(ui);
+    app_ui_label_text(page->play_icon, LV_SYMBOL_PLAY);
     app_ui_label_text(ui->app_obj[1], "已停止"); app_ui_label_text(ui->app_obj[2], "播放");
 }
 
@@ -476,6 +492,7 @@ void app_open_video_path(app_ui_t *ui, const char *path)
     lv_obj_set_size(page->time, 432, 20);
     page->progress = lv_slider_create(page->controls); lv_obj_set_pos(page->progress, 24, 46);
     lv_obj_set_size(page->progress, 432, 10); lv_slider_set_range(page->progress, 0, 1000);
+    lv_obj_set_style_bg_color(page->progress, lv_color_hex(0x66C6D6), LV_PART_INDICATOR);
     lv_obj_set_ext_click_area(page->progress, 14); lv_obj_add_state(page->progress, LV_STATE_DISABLED);
     lv_obj_remove_flag(page->progress, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(page->progress, video_seek_event, LV_EVENT_ALL, ui);
@@ -484,8 +501,11 @@ void app_open_video_path(app_ui_t *ui, const char *path)
     if (video_is_mp4(selected)) lv_obj_add_state(page->speed, LV_STATE_DISABLED);
     ui->app_obj[2] = media_button(page->controls, "等待", 177, 76, 126, video_action_event, ui);
     page->play = lv_obj_get_parent(ui->app_obj[2]);
+    app_catalog_control(page->play, 0x2C576C);
+    page->play_icon = media_button_icon(ui->app_obj[2], LV_SYMBOL_PLAY);
     page->mute_label = media_button(page->controls, "静音", 348, 76, 112, video_mute_event, ui);
     page->mute = lv_obj_get_parent(page->mute_label);
+    page->mute_icon = media_button_icon(page->mute_label, LV_SYMBOL_VOLUME_MID);
     page->volume = lv_slider_create(page->controls); lv_obj_set_pos(page->volume, 24, 142);
     lv_obj_set_size(page->volume, 354, 12); lv_slider_set_range(page->volume, 0, 100);
     lv_obj_set_ext_click_area(page->volume, 12); lv_obj_remove_flag(page->volume, LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -665,12 +685,16 @@ static void picker_select(lv_event_t *event)
 static lv_obj_t *create_picker_row(lv_obj_t *parent, void *context)
 {
     lv_obj_t *row = lv_button_create(parent);
-    lv_obj_set_size(row, 400, 44);
-    lv_obj_set_style_radius(row, 12, 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x18243A), 0);
-    lv_obj_t *label = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 0, 0, 0xEAF2FF, NULL);
-    lv_obj_set_width(label, 360);
+    lv_obj_set_size(row, 408, 52);
+    app_catalog_row(row);
+    lv_obj_set_style_pad_all(row, 8, 0);
+    lv_obj_t *label = app_ui_add_text(row, "", LV_ALIGN_LEFT_MID, 46, 0, 0xEAF2FF, NULL);
+    lv_obj_set_width(label, 342);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    const app_ui_t *ui = context;
+    const media_picker_t *picker = ui->page_context;
+    app_catalog_badge(app_ui_add_text(row, picker->filter == APP_IO_VIDEO ? LV_SYMBOL_VIDEO : LV_SYMBOL_PLAY,
+                                      LV_ALIGN_LEFT_MID, 0, 0, 0x8DE0E1, &lv_font_montserrat_16));
     lv_obj_add_event_cb(row, picker_select, LV_EVENT_CLICKED, context);
     return row;
 }
@@ -702,13 +726,8 @@ static void picker_loaded(app_ui_t *ui, const app_io_result_t *r)
     app_scroll_list_set_count(&p->rows, p->count);
     app_ui_label_fmt(p->info, "%u 个文件%s", (unsigned)r->total_count, r->truncated ? " · 部分文件未索引" : "");
     if (!p->count) {
-        if (p->filter == APP_IO_VIDEO) {
-            lv_obj_set_height(p->rows.viewport, 210);
-            lv_obj_set_y(p->info, 264);
-            app_ui_label_text(p->info,
-                "Video 文件夹和根目录没有视频\n支持 H.264/AAC-LC MP4 和 MJPEG，最高 480×480");
-        } else app_ui_label_text(p->info,
-            "ROMs 文件夹和根目录没有 iNES 游戏");
+        app_ui_label_text(p->info, p->filter == APP_IO_VIDEO ?
+            "没有视频 · 支持 H.264 MP4 与 MJPEG" : "没有 iNES 游戏");
     }
 }
 
@@ -722,8 +741,6 @@ static void picker_load(app_ui_t *ui)
     free(p->entries);
     p->entries = NULL;
     p->count = 0;
-    lv_obj_set_height(p->rows.viewport, 260);
-    lv_obj_set_y(p->info, 316);
     if (!p->mounted) { app_ui_label_text(p->info, "存储设备未就绪"); return; }
     const app_io_request_t q = {.operation = APP_IO_CATALOG, .filter = p->filter, .limit = 4096};
     app_ui_label_text(p->info, "正在读取…");
@@ -750,21 +767,23 @@ static void media_picker(app_ui_t *ui, app_io_operation_t filter)
     ui->page_context = p; ui->page_cleanup = picker_cleanup;
     p->filter = filter;
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    app_catalog_panel(content);
+    lv_obj_set_style_pad_all(content, 19, 0);
     lv_obj_t *list = lv_obj_create(content);
-    lv_obj_set_pos(list, 0, 48);
-    lv_obj_set_size(list, 408, 260);
+    lv_obj_set_pos(list, 0, 57);
+    lv_obj_set_size(list, 408, 295);
     lv_obj_set_style_pad_all(list, 0, 0);
     lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    app_scroll_list_init(&p->rows, list, 50, create_picker_row, bind_picker_row, ui);
-    p->info = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 0, 316, 0xAFC6E9, NULL);
-    lv_obj_set_width(p->info, 405);
+    app_scroll_list_init(&p->rows, list, 60, create_picker_row, bind_picker_row, ui);
+    p->info = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 0, 2, 0xAFC6E9, NULL);
+    lv_obj_set_width(p->info, 340);
     lv_obj_t *refresh = lv_button_create(content);
-    lv_obj_set_pos(refresh, 350, 0);
-    lv_obj_set_size(refresh, 54, 40);
-    lv_obj_set_style_bg_color(refresh, lv_color_hex(0x20334F), 0);
+    lv_obj_set_pos(refresh, 354, 0);
+    lv_obj_set_size(refresh, 54, 44);
+    app_catalog_control(refresh, 0x20344C);
     lv_obj_add_event_cb(refresh, picker_action, LV_EVENT_CLICKED, ui);
-    app_ui_add_text(refresh, LV_SYMBOL_REFRESH, LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, &lv_font_montserrat_24);
+    app_ui_add_text(refresh, LV_SYMBOL_REFRESH, LV_ALIGN_CENTER, 0, 0, 0x9DDCEB, &lv_font_montserrat_24);
     app_ui_set_timer(ui, picker_timer, 500); picker_load(ui);
 }
 void app_open_video(app_ui_t *ui) { media_picker(ui, APP_IO_VIDEO); }

@@ -18,6 +18,8 @@ static lv_point_t pointer;
 static bool held;
 static int64_t now_us;
 static unsigned master_updates,master_persist,music_updates;
+static unsigned music_seek_requests;
+static uint32_t music_seek_position;
 static uint8_t requested_master,saved_master;
 static app_audio_system_snapshot_t master={.ready=true,.master_volume=17,.applied_volume=17};
 static aether_audio_player_status_t music={.active=true,.state=AETHER_AUDIO_PLAYING,.volume=100,.sample_rate=44100,.channels=2,.duration_ms=120000,.path="/sdcard/Music/test.mp3"};
@@ -82,29 +84,60 @@ const lv_font_t *app_ui_chinese_font(void){return &font_16;}
 void app_ui_label_text(lv_obj_t *o,const char *s){if(strcmp(lv_label_get_text(o),s))lv_label_set_text(o,s);}
 void app_ui_label_fmt(lv_obj_t *o,const char *f,...){char s[512];va_list a;va_start(a,f);vsnprintf(s,sizeof(s),f,a);va_end(a);app_ui_label_text(o,s);}
 lv_obj_t *app_ui_add_text(lv_obj_t *p,const char *s,lv_align_t a,int32_t x,int32_t y,uint32_t c,const lv_font_t *f){lv_obj_t *o=lv_label_create(p);lv_label_set_text(o,s);lv_obj_set_style_text_font(o,f,0);lv_obj_set_style_text_color(o,lv_color_hex(c),0);lv_obj_align(o,a,x,y);return o;}
-lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
+#ifdef AETHER_VOLUME_REAL_CHROME
+#include "app_tools.h"
+void app_tools_get_snapshot(app_tools_snapshot_t *snapshot)
 {
-    (void)title;if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}if(ui->page_cleanup){ui->page_cleanup(ui);ui->page_cleanup=NULL;}
+    *snapshot = (app_tools_snapshot_t){.ready = true, .battery_updated_ms = (uint32_t)(now_us / 1000),
+        .battery = {.presence_valid = true, .battery_present = true, .percentage_valid = true, .percentage = 80}};
+}
+void app_ui_set_user_key_exit(app_ui_t *ui, bool enabled) {(void)ui; (void)enabled;}
+lv_obj_t *app_ui_new_screen(app_ui_t *ui)
+#else
+lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
+#endif
+{
+    if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}if(ui->page_cleanup){ui->page_cleanup(ui);ui->page_cleanup=NULL;}
     ui->page_can_exit=NULL;
     ui->page_back=NULL;
     ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x070A12),0);lv_obj_set_style_bg_opa(ui->screen,LV_OPA_COVER,0);
+    lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x101321),0);lv_obj_set_style_bg_opa(ui->screen,LV_OPA_COVER,0);
     lv_obj_set_style_text_font(ui->screen,&font_16,0);
+#ifdef AETHER_VOLUME_REAL_CHROME
+    return ui->screen;
+#else
+    (void)title;
     ui->content=lv_obj_create(ui->screen);lv_obj_set_size(ui->content,448,394);lv_obj_align(ui->content,LV_ALIGN_BOTTOM_MID,0,-14);
     lv_obj_set_style_pad_all(ui->content,20,0);lv_obj_set_style_border_width(ui->content,0,0);
     lv_obj_set_style_bg_color(ui->content,lv_color_hex(0x10192A),0);
     app_ui_load_screen(ui->screen);return ui->content;
+#endif
 }
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t ms){ui->timer=lv_timer_create(cb,ms,ui);}
 void app_ui_show_home(app_ui_t *ui){assert(lvgl_locked);app_ui_begin_page(ui,"主页");}
 void app_open_nes_controls(app_ui_t *ui){(void)ui;}
 static unsigned music_page_releases;
-esp_err_t app_io_release_media(app_io_handle_t io){assert(io);++music_page_releases;music.active=false;music.state=AETHER_AUDIO_STOPPED;music.track_count=0;music.path[0]=0;return ESP_OK;}
+esp_err_t app_io_release_media(app_io_handle_t io){assert(io);++music_page_releases;music.active=false;music.state=AETHER_AUDIO_STOPPED;music.track_count=0;music.path[0]=0;music.position_ms=music.duration_ms=0;return ESP_OK;}
 #ifndef APP_VOLUME_UI_DOUBLES_ONLY
 void app_ui_request_io_ex(app_ui_t *ui,const app_io_request_t *q,void (*cb)(app_ui_t *,const app_io_result_t *))
 {app_io_result_t r={.operation=q->operation,.error=ESP_OK};cb(ui,&r);}
 #endif
 esp_err_t aether_audio_player_get_status(aether_audio_player_handle_t h,aether_audio_player_status_t *s){assert(h);*s=music;return ESP_OK;}
+#ifndef APP_VOLUME_UI_DOUBLES_ONLY
+esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t h,char *path,size_t size)
+{ assert(h && path && size); return ESP_ERR_NOT_FOUND; }
+esp_err_t aether_audio_player_restore(aether_audio_player_handle_t h)
+{ assert(h); return ESP_ERR_NOT_FOUND; }
+esp_err_t aether_audio_player_play(aether_audio_player_handle_t h,const char *path,int volume)
+{
+    assert(h && path && volume >= 0 && volume <= 100);
+    strlcpy(music.path,path,sizeof(music.path));
+    music.volume=(uint8_t)volume;
+    music.active=true;
+    music.state=AETHER_AUDIO_PLAYING;
+    return ESP_OK;
+}
+#endif
 esp_err_t aether_audio_player_set_volume(aether_audio_player_handle_t h,int v){assert(h&&v>=0&&v<=100);music.volume=(uint8_t)v;++music_updates;return ESP_OK;}
 static unsigned ui_playlist_copies,ui_playlist_selects;
 static size_t ui_playlist_selected_index;
@@ -118,7 +151,13 @@ esp_err_t aether_audio_player_set_repeat(aether_audio_player_handle_t h,aether_a
 static esp_err_t eq_submit_error;
 esp_err_t aether_audio_player_set_eq(aether_audio_player_handle_t h, const aether_audio_eq_t *eq)
 { assert(h && eq); if (eq_submit_error) return eq_submit_error; music.eq = *eq; return ESP_OK; }
-esp_err_t aether_audio_player_seek(aether_audio_player_handle_t h,uint32_t p){(void)h;(void)p;return ESP_OK;}
+esp_err_t aether_audio_player_seek(aether_audio_player_handle_t h, uint32_t position_ms)
+{
+    assert(h);
+    ++music_seek_requests;
+    music_seek_position = position_ms;
+    return ESP_OK;
+}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p){const uint16_t *s=(const uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*s++;}lv_display_flush_ready(d);}
 static void read_pointer(lv_indev_t *i,lv_indev_data_t *d){(void)i;d->point=pointer;d->state=held?LV_INDEV_STATE_PRESSED:LV_INDEV_STATE_RELEASED;}
 static void advance(unsigned ms){for(unsigned i=0;i<ms;++i){lv_tick_inc(1);now_us+=1000;lv_timer_handler();}}
@@ -136,8 +175,14 @@ static lv_obj_t *find(lv_obj_t *p,const char *text)
 #ifndef APP_VOLUME_UI_DOUBLES_ONLY
 static lv_obj_t *switch_control(lv_obj_t *p)
 {if(lv_obj_check_type(p,&lv_switch_class))return p;for(unsigned i=0;i<lv_obj_get_child_count(p);++i){lv_obj_t *o=switch_control(lv_obj_get_child(p,i));if(o)return o;}return NULL;}
-static lv_obj_t *switch_y(lv_obj_t *p,int y)
-{if(lv_obj_check_type(p,&lv_switch_class)&&lv_obj_get_y(p)==y)return p;for(unsigned i=0;i<lv_obj_get_child_count(p);++i){lv_obj_t *o=switch_y(lv_obj_get_child(p,i),y);if(o)return o;}return NULL;}
+static lv_obj_t *settings_switch_for(lv_obj_t *screen, const char *title)
+{
+    lv_obj_t *label = find(screen, title);
+    assert(label);
+    lv_obj_t *control = lv_obj_get_sibling(label, 1);
+    assert(lv_obj_check_type(control, &lv_switch_class));
+    return control;
+}
 #endif
 static aether_usb_audio_status_t usb_audio_status;
 static aether_usb_storage_status_t usb_storage_status;
@@ -151,12 +196,12 @@ static void test_otg(app_ui_t *ui)
 {
     usb=(app_io_usb_status_t){.media_present=true};otg=(aether_usb_host_status_t){0};
     app_open_settings(ui);advance(350);
-    lv_obj_t *s=switch_y(ui->content,1020);assert(s&&!lv_obj_has_state(s,LV_STATE_CHECKED));
+    lv_obj_t *s=settings_switch_for(ui->content, "自动 OTG（CC 检测）");assert(s&&!lv_obj_has_state(s,LV_STATE_CHECKED));
     lv_obj_add_state(s,LV_STATE_CHECKED);lv_obj_send_event(s,LV_EVENT_VALUE_CHANGED,NULL);advance(350);
     assert(otg_commands==1&&otg.enabled&&lv_obj_has_state(s,LV_STATE_CHECKED));
     assert(find(ui->screen,"等待 CC 确认受电设备…"));
-    lv_obj_scroll_to_y(ui->content,950,LV_ANIM_OFF);advance(100);capture("settings-otg-wait");
-    assert(lv_obj_has_state(switch_y(ui->content,738),LV_STATE_DISABLED));
+    lv_obj_scroll_to_y(ui->content,716,LV_ANIM_OFF);advance(100);capture("settings-otg-wait");
+    assert(lv_obj_has_state(settings_switch_for(ui->content, "USB 虚拟U盘"),LV_STATE_DISABLED));
     otg.cleanup_pending=true;otg.state=AETHER_OTG_STOPPING;advance(350);
     assert(!lv_obj_has_state(s,LV_STATE_DISABLED)); /* User can always turn an enabled host OFF. */
     otg.cleanup_pending=false;
@@ -170,7 +215,7 @@ static void test_otg(app_ui_t *ui)
     advance(350);
     assert(find(ui->screen,"供电已验证；等待 USB 设备枚举…"));
     assert(find(ui->screen,"采样 VBUS:5.126 V TS:0.500 V\nCC:16 R19:16 R13:01 R50:1E 温度:00\nC0:07 ADC原码:1406\nERR:0 OFF:0 DIAG:0"));
-    lv_obj_scroll_to_y(ui->content,1138,LV_ANIM_OFF);advance(100);capture("settings-otg-power");
+    lv_obj_scroll_to_y(ui->content,905,LV_ANIM_OFF);advance(100);capture("settings-otg-power");
     otg_power.valid=otg_power.vbus_valid=otg_power.ts_valid=otg_power.output_verified=false;otg_power.age_ms=2500;
     advance(350);assert(find(ui->screen,"Host 已启动；供电状态待确认"));
     assert(find(ui->screen,"快照已过期 VBUS:未测或过期 TS:未测或过期\nCC:-- R19:-- R13:-- R50:-- 温度:--\nC0:-- ADC原码:----\nERR:0 OFF:0 DIAG:0"));
@@ -195,7 +240,7 @@ static void test_otg(app_ui_t *ui)
     otg.transfer_status=0;advance(350);
     assert(find(ui->screen,"USB HID 已连接：1 个接口"));
     assert(find(ui->screen,"USB 046D:C52B 输入:1 跳过:2\n阶段:可用 接口:0 类型:1/1\n描述符:63/63 字节 传输:0\n解析:0 HID错误:0\nUSB 音频 播放:未接入 录音:未接入\n音频错误:0 不支持:0\nUSB U盘:未接入 0 MiB\nU盘错误:0"));
-    lv_obj_scroll_to_y(ui->content,1288,LV_ANIM_OFF);advance(100);capture("settings-otg-receiver");
+    lv_obj_scroll_to_y(ui->content,1056,LV_ANIM_OFF);advance(100);capture("settings-otg-receiver");
     otg.hid_stage=AETHER_USB_HID_STAGE_REPORT_DESCRIPTOR;otg.last_interface=2;
     otg.report_received=0;otg.transfer_status=4;otg.hid_error=otg.last_error=(esp_err_t)0x108; /* INVALID_RESPONSE fixture. */
     advance(350);
@@ -210,9 +255,9 @@ static void test_otg(app_ui_t *ui)
     lv_obj_remove_state(s,LV_STATE_CHECKED);lv_obj_send_event(s,LV_EVENT_VALUE_CHANGED,NULL);
     otg.active=otg.vbus_enabled=false;otg.cleanup_pending=true;otg.state=AETHER_OTG_STOPPING;advance(350);
     assert(otg_commands==2&&!otg.enabled&&!lv_obj_has_state(s,LV_STATE_CHECKED));
-    assert(lv_obj_has_state(switch_y(ui->content,738),LV_STATE_DISABLED));
+    assert(lv_obj_has_state(settings_switch_for(ui->content, "USB 虚拟U盘"),LV_STATE_DISABLED));
     otg.cleanup_pending=false;otg.state=AETHER_OTG_OFF;advance(350);
-    assert(!lv_obj_has_state(switch_y(ui->content,738),LV_STATE_DISABLED));
+    assert(!lv_obj_has_state(settings_switch_for(ui->content, "USB 虚拟U盘"),LV_STATE_DISABLED));
     usb.blocked=usb.active=true;advance(350);
     assert(lv_obj_has_state(s,LV_STATE_DISABLED));
     lv_obj_add_state(s,LV_STATE_CHECKED);lv_obj_send_event(s,LV_EVENT_VALUE_CHANGED,NULL);advance(350);
@@ -224,7 +269,7 @@ static void test_otg(app_ui_t *ui)
 
 static void tap_switch(lv_obj_t *control)
 {
-    lv_obj_scroll_to_view(control, LV_ANIM_OFF);
+    lv_obj_scroll_to_view_recursive(control, LV_ANIM_OFF);
     advance(100);
     lv_area_t area;
     lv_obj_get_coords(control, &area);
@@ -233,6 +278,68 @@ static void tap_switch(lv_obj_t *control)
     advance(80);
     held = false;
     advance(80);
+}
+
+static void launch_settings(lv_event_t *event)
+{
+    app_open_settings(lv_event_get_user_data(event));
+}
+
+static void assert_settings_at_top(app_ui_t *ui)
+{
+    assert(lv_obj_get_scroll_y(ui->content) == 0);
+    advance(1000);
+    const int32_t offset = lv_obj_get_scroll_y(ui->content);
+    if (offset) fprintf(stderr, "Settings opened at scroll offset %d\n", (int)offset);
+    assert(offset == 0);
+}
+
+static void test_settings_entry(app_ui_t *ui)
+{
+    lv_group_t *previous_group = lv_group_get_default();
+    lv_group_t *group = lv_group_create();
+    assert(group);
+    lv_group_set_default(group);
+    lv_obj_t *drawer = app_ui_begin_page(ui, "应用列表");
+    lv_obj_t *launcher = lv_button_create(drawer);
+    lv_obj_add_event_cb(launcher, launch_settings, LV_EVENT_CLICKED, ui);
+    lv_group_focus_obj(launcher);
+    assert(lv_group_get_focused(group) == launcher);
+    tap_switch(launcher);
+    assert_settings_at_top(ui);
+
+    lv_area_t viewport;
+    lv_obj_get_coords(ui->content, &viewport);
+    pointer = (lv_point_t){viewport.x1 + 8, viewport.y2 - 48};
+    held = true;
+    advance(60);
+    for (unsigned i = 0; i < 16; ++i) {
+        pointer.y -= 8;
+        advance(20);
+    }
+    held = false;
+    advance(1000);
+    assert(lv_obj_get_scroll_y(ui->content) > 0);
+    lv_obj_scroll_to_y(ui->content, 0, LV_ANIM_OFF);
+
+    lv_obj_t *lower = settings_switch_for(ui->content, "自动 OTG（CC 检测）");
+    assert(lower);
+    lv_group_focus_obj(lower);
+    advance(1000);
+    const int32_t scrolled = lv_obj_get_scroll_y(ui->content);
+    assert(scrolled > 0);
+    advance(600);
+    assert(lv_obj_get_scroll_y(ui->content) == scrolled);
+
+    lv_obj_t *details = find(ui->screen, "传输详情");
+    assert(details);
+    tap_switch(lv_obj_get_parent(details));
+    assert(ui->page_back == app_open_settings);
+    ui->page_back(ui);
+    assert_settings_at_top(ui);
+    lv_group_set_default(previous_group);
+    lv_group_delete(group);
+    puts("PASS Settings opens at top, touch and keyboard scroll, and return from transfer details starts at top");
 }
 
 /* Force a stale event past LVGL's disabled state to check the handler guard. */
@@ -247,9 +354,9 @@ static void test_manual_otg(app_ui_t *ui)
 {
     app_open_settings(ui);
     advance(350);
-    lv_obj_t *automatic = switch_y(ui->content, 1020);
-    lv_obj_t *manual = switch_y(ui->content, 1072);
-    lv_obj_t *msc = switch_y(ui->content, 738);
+    lv_obj_t *automatic = settings_switch_for(ui->content, "自动 OTG（CC 检测）");
+    lv_obj_t *manual = settings_switch_for(ui->content, "手动 OTG（无 CC 外设）");
+    lv_obj_t *msc = settings_switch_for(ui->content, "USB 虚拟U盘");
     assert(automatic && manual && msc);
     assert(find(ui->screen, "手动 OTG（无 CC 外设）"));
     assert(find(ui->screen, "接充电器或电脑前，请关闭手动 OTG 并等供电停止。"));
@@ -373,6 +480,8 @@ static void test_usb(app_ui_t *ui)
     commands=usb_commands;
     app_open_settings(ui);advance(350);assert(usb_commands==commands);
     app_open_usb(ui);advance(350);capture("usb-local");
+    assert(find(ui->screen,"退出前请在电脑安全弹出。"));
+    assert(lv_obj_get_height(lv_obj_get_parent(find(ui->screen,"开启传输")))>=44);
     click(ui,"开启传输");assert(usb.pending&&usb_commands==commands+1);
     app_open_settings(ui);advance(350);s=switch_control(ui->content);
     assert(lv_obj_has_state(s,LV_STATE_DISABLED)&&!lv_obj_has_state(s,LV_STATE_CHECKED));
@@ -522,6 +631,7 @@ int main(int argc,char **argv)
     lv_display_set_buffers(d,buffer,NULL,sizeof(buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
     lv_indev_t *in=lv_indev_create();lv_indev_set_type(in,LV_INDEV_TYPE_POINTER);lv_indev_set_display(in,d);lv_indev_set_read_cb(in,read_pointer);
     app_power_t power={.brightness=75,.timeout=60};app_ui_t ui={.power=&power,.storage=(void*)1,.audio_player=(void*)2,.io=(void*)4};
+    test_settings_entry(&ui);
     app_open_settings(&ui);advance(200);unsigned seen=0;lv_obj_t *s=slider(ui.content,0,&seen);assert(s);
     drag(s,70,offset);assert(requested_master==70&&master.master_volume==70&&saved_master==70&&master_persist==1&&master_updates>=10);
     advance(1500);assert(lv_slider_get_value(s)==70&&master.master_volume==70);
@@ -536,6 +646,7 @@ int main(int argc,char **argv)
     printf("PASS actual music pointer y%+d 10->70: global-request=%u persist-request=%u; stream-gain=%u unchanged; hold+timer stable\n",offset,requested_master,saved_master,music.volume);
     test_music_eq(&ui);
     app_open_settings(&ui);advance(200);seen=0;s=slider(ui.content,0,&seen);assert(s&&lv_slider_get_value(s)==70);
+    capture("settings-main");
     assert(master_persist==before_persist+1); /* Reopening pages never writes preferences. */
     puts("PASS settings -> music -> external volume update -> settings share master and reopening does not persist");
     test_usb(&ui);

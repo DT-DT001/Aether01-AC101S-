@@ -5,3 +5,5 @@ static inline bool aether_media_fs_path_ready(aether_storage_handle_t tf, const 
 { return path && !strncmp(path,"/sdcard",7) && aether_storage_is_mounted(tf) && !app_io_usb_storage_blocked(NULL); }
 static inline const char *aether_media_fs_default_root(aether_storage_handle_t tf)
 { (void)tf; return "/sdcard"; }
+static inline uint32_t aether_media_fs_generation(aether_storage_handle_t tf, const char *path)
+{ return aether_media_fs_path_ready(tf, path) ? 1 : 0; }

@@ -1,14 +1,18 @@
 #include "app_ui_internal.h"
+#include "app_instrument_ui.h"
 #include "app_telemetry.h"
 #include "app_motion_filter.h"
+#include "app_ui_gyro_calibration.h"
 #include "esp_timer.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 typedef struct {
     app_motion_filter_t filter;
-    lv_obj_t *model, *trace, *state, *metrics, *values[3];
+    app_ui_gyro_calibration_t calibration;
+    lv_obj_t *model, *trace, *state, *acceleration, *rotation, *values[3];
     uint32_t draw_ms, label_ms;
+    uint32_t state_color;
     float shown_roll,shown_pitch,shown_yaw,shown_linear;
     app_motion_action_t shown_action;
     bool sleeping;
@@ -96,19 +100,41 @@ static void trace_draw(lv_event_t *event) {
              a.x1+i*width/47,a.y2-2-fminf(n/12,1)*height,action_color(page->filter.action),2);
     }
 }
-static void motion_cleanup(app_ui_t *ui) {free(ui->page_context);ui->page_context=NULL;}
+static void motion_cleanup(app_ui_t *ui)
+{
+    motion_page_t *page = ui->page_context;
+    if (!page) return;
+    app_ui_gyro_calibration_close(&page->calibration);
+    free(page);
+    ui->page_context = NULL;
+}
+static void motion_state(motion_page_t *page, const char *text, uint32_t color)
+{
+    app_ui_label_text(page->state, text);
+    if (page->state_color != color) {
+        lv_obj_set_style_text_color(page->state, lv_color_hex(color), 0);
+        page->state_color = color;
+    }
+}
+
 static void update_labels(motion_page_t *page) {
     app_ui_label_fmt(page->values[0],"%+.0f°",page->filter.roll);
     app_ui_label_fmt(page->values[1],"%+.0f°",page->filter.pitch);
     app_ui_label_fmt(page->values[2],"%+.0f°",page->filter.yaw);
-    app_ui_label_text(page->state,app_motion_action_name(page->filter.action));
-    lv_obj_set_style_text_color(page->state,lv_color_hex(action_color(page->filter.action)),0);
-    app_ui_label_fmt(page->metrics,"动态加速度 %.1f m/s^2  转速 %.0f°/s",page->filter.linear,page->filter.rotation);
+    motion_state(page, app_motion_action_name(page->filter.action), action_color(page->filter.action));
+    app_ui_label_fmt(page->acceleration, "%.1f m/s^2", page->filter.linear);
+    app_ui_label_fmt(page->rotation, "%.0f°/s", page->filter.rotation);
 }
 static void motion_zero(lv_event_t *e) {
     app_ui_t *ui=lv_event_get_user_data(e);motion_page_t *page=ui->page_context;
     if(!page || !page->filter.initialized) return;
     app_motion_filter_zero(&page->filter);update_labels(page);lv_obj_invalidate(page->model);
+}
+static void motion_calibrate(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    motion_page_t *page = ui->page_context;
+    if (page) app_ui_gyro_calibration_open(ui->screen, &page->calibration);
 }
 static void motion_tick(lv_timer_t *timer) {
     app_ui_t *ui=lv_timer_get_user_data(timer);motion_page_t *page=ui->page_context;
@@ -116,19 +142,29 @@ static void motion_tick(lv_timer_t *timer) {
     bool asleep=app_power_is_sleeping(ui->power);
     if(asleep) {
         if(!page->sleeping) app_telemetry_set_interest(0);
+        app_ui_gyro_calibration_close(&page->calibration);
         page->sleeping=true;return;
     }
     if(page->sleeping) {page->sleeping=false;app_telemetry_set_interest(APP_TELEMETRY_IMU);}
+    app_ui_gyro_calibration_refresh(&page->calibration);
     app_telemetry_snapshot_t sample;app_telemetry_get(&sample);
+    if(sample.gyro_calibrating) return;
     if(sample.imu_error!=ESP_OK) {
-        app_ui_label_text(page->state,"等待采样");
-        app_ui_label_fmt(page->metrics,"六轴传感器：%s",esp_err_to_name(sample.imu_error));return;
+        motion_state(page, "等待采样", INSTRUMENT_MUTED);
+        app_ui_label_text(page->acceleration, "--");
+        app_ui_label_text(page->rotation, "--");
+        return;
     }
     for(unsigned i=0;i<3;++i) if(!isfinite(sample.imu.accel_mps2[i]) || !isfinite(sample.imu.gyro_dps[i])) {
-        app_ui_label_text(page->state,"数据异常");
-        app_ui_label_text(page->metrics,"传感器样本无效，已暂停姿态更新");return;
+        motion_state(page, "数据异常", 0xFF9791);
+        app_ui_label_text(page->acceleration, "--");
+        app_ui_label_text(page->rotation, "--");
+        return;
     }
-    if(!app_motion_filter_update(&page->filter,sample.imu.accel_mps2,sample.imu.gyro_dps,sample.imu_updated_ms)) return;
+    const float still_gyro[3] = {0};
+    const float *gyro = sample.imu.gyro_stationary ? still_gyro : sample.imu.gyro_dps;
+    if(!app_motion_filter_update_tilt(&page->filter,sample.imu.accel_mps2,gyro,
+                                      sample.imu_updated_ms,sample.imu.gyro_bias_valid)) return;
     uint32_t now=(uint32_t)(esp_timer_get_time()/1000);
     bool changed=fabsf(page->filter.roll-page->shown_roll)>.15f || fabsf(page->filter.pitch-page->shown_pitch)>.15f ||
         fabsf(page->filter.yaw-page->shown_yaw)>.15f || fabsf(page->filter.linear-page->shown_linear)>.12f || page->shown_action!=page->filter.action;
@@ -148,27 +184,38 @@ void app_open_motion(app_ui_t *ui) {
     if(!page) {text(content,"内存不足",0,0,0xFF9791,16);return;}
     ui->page_context=page;ui->page_cleanup=motion_cleanup;app_motion_filter_init(&page->filter);
     app_telemetry_set_interest(APP_TELEMETRY_IMU);
-    page->state=text(content,"等待采样",8,4,0x7EDDC8,24);
-    text(content,"实时六轴融合",274,9,0x7898B4,16);
-    page->model=lv_obj_create(content);lv_obj_remove_style_all(page->model);
-    lv_obj_set_pos(page->model,78,30);lv_obj_set_size(page->model,252,166);
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    const lv_font_t *small = app_ui_chinese_font();
+    const lv_font_t *large = app_ui_chinese_font_size(24);
+    lv_obj_t *overview = instrument_card(content, 0, 0, 408, 178);
+    page->model=lv_obj_create(overview);lv_obj_remove_style_all(page->model);
+    lv_obj_set_pos(page->model,4,6);lv_obj_set_size(page->model,252,166);
     lv_obj_remove_flag(page->model,LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(page->model,model_draw,LV_EVENT_DRAW_MAIN,page);
-    static const char *const labels[]={"横滚","俯仰","相对航向"};
-    for(unsigned i=0;i<3;++i) {
-        int x=8+i*134;text(content,labels[i],x,204,0x7898B4,16);
-        page->values[i]=text(content,"--",x,228,0xD9E8FF,24);
-    }
-    page->metrics=text(content,"等待有效传感器数据",8,270,0xA8BED3,16);
-    lv_obj_set_width(page->metrics,396);lv_label_set_long_mode(page->metrics,LV_LABEL_LONG_DOT);
-    page->trace=lv_obj_create(content);lv_obj_remove_style_all(page->trace);
-    lv_obj_set_pos(page->trace,8,302);lv_obj_set_size(page->trace,280,30);
+    page->state = instrument_text(overview, "等待采样", 259, 9, 140, INSTRUMENT_MUTED, large);
+    instrument_text(overview, "动态加速度", 259, 46, 140, INSTRUMENT_MUTED, small);
+    page->acceleration = instrument_text(overview, "--", 259, 63, 142, INSTRUMENT_TEAL, large);
+    instrument_text(overview, "转速", 259, 96, 134, INSTRUMENT_MUTED, small);
+    page->rotation = instrument_text(overview, "--", 259, 113, 142, INSTRUMENT_TEXT, large);
+    page->trace=lv_obj_create(overview);lv_obj_remove_style_all(page->trace);
+    lv_obj_set_pos(page->trace,259,147);lv_obj_set_size(page->trace,133,20);
     lv_obj_remove_flag(page->trace,LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(page->trace,trace_draw,LV_EVENT_DRAW_MAIN,page);
-    lv_obj_t *zero=lv_button_create(content);lv_obj_set_pos(zero,306,296);lv_obj_set_size(zero,94,36);
-    lv_obj_set_style_bg_color(zero,lv_color_hex(0x2768D8),0);
+    static const char *const labels[]={"横滚","俯仰","相对航向"};
+    for(unsigned i=0;i<3;++i) {
+        lv_obj_t *axis = instrument_card(content, (int)i * 138, 188, 132, 77);
+        instrument_text(axis, labels[i], 14, 9, 102, INSTRUMENT_MUTED, small);
+        page->values[i] = instrument_text(axis, "--", 14, 33, 106, INSTRUMENT_BLUE, &lv_font_montserrat_28);
+    }
+    lv_obj_t *zero=lv_button_create(content);lv_obj_set_pos(zero,0,276);lv_obj_set_size(zero,198,46);
+    instrument_button_style(zero, INSTRUMENT_SECONDARY);
     lv_obj_add_event_cb(zero,motion_zero,LV_EVENT_CLICKED,ui);
     app_ui_add_text(zero,"姿态归零",LV_ALIGN_CENTER,0,0,0xFFFFFF,app_ui_chinese_font());
-    text(content,"六轴航向为相对值，长时间使用会漂移",8,334,0x6985A3,16);
+    lv_obj_t *calibrate=lv_button_create(content);
+    lv_obj_set_pos(calibrate,210,276);lv_obj_set_size(calibrate,198,46);
+    instrument_button_style(calibrate, INSTRUMENT_PRIMARY);
+    lv_obj_add_event_cb(calibrate,motion_calibrate,LV_EVENT_CLICKED,ui);
+    app_ui_add_text(calibrate,"漂移校准",LV_ALIGN_CENTER,0,0,0xFFFFFF,app_ui_chinese_font());
+    text(content,"相对航向可能随时间漂移",8,333,INSTRUMENT_MUTED,16);
     app_ui_set_timer(ui,motion_tick,20);motion_tick(ui->timer);
 }

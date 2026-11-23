@@ -10,6 +10,8 @@
 
 #define TOUCH_STALE_US 1800000LL
 #define TOUCH_UNMATCHED_IRQ_US 64000LL
+#define TOUCH_MOVING_IRQ_US 140000LL
+#define TOUCH_MOTION_DISTANCE 12
 
 typedef struct {
     esp_lcd_touch_handle_t touch;
@@ -20,7 +22,8 @@ typedef struct {
     atomic_bool consume_gesture;
     atomic_bool enabled;
     atomic_uint irq_count;
-    bool pressed, have_report, transport_blocked, stale_report, unmatched_irq;
+    bool pressed, moving, have_report, transport_blocked, stale_report, unmatched_irq;
+    int16_t origin_x, origin_y;
     uint32_t report_sequence, report_irq;
     int64_t report_us, unmatched_irq_us;
     int64_t perf_begin_us;
@@ -145,11 +148,11 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
             ctx->unmatched_irq = true;
             ctx->unmatched_irq_us = sampled_at;
         }
-        /* Polls faster than the controller can return no new data while a
-         * real finger is held. Give it time to report, with a shorter
-         * recovery window when a new IRQ did not yield any valid snapshot. */
+        /* A moving finger can span a brief delay between IRQ and report.
+         * Releases and transport failures still end the contact immediately. */
+        const int64_t irq_timeout = ctx->pressed && ctx->moving ? TOUCH_MOVING_IRQ_US : TOUCH_UNMATCHED_IRQ_US;
         if (sampled_at - ctx->report_us >= TOUCH_STALE_US ||
-            (ctx->unmatched_irq && sampled_at - ctx->unmatched_irq_us >= TOUCH_UNMATCHED_IRQ_US)) {
+            (ctx->unmatched_irq && sampled_at - ctx->unmatched_irq_us >= irq_timeout)) {
             ctx->stale_report = true;
             cancel_press(ctx);
             ESP_LOGW("app_touch", "discarded stale contact age_ms=%lu unmatched_irq=%u",
@@ -158,6 +161,14 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
         }
     }
     if (ctx->transport_blocked) return;
+    if (!ctx->pressed) {
+        ctx->origin_x = points[0].x;
+        ctx->origin_y = points[0].y;
+        ctx->moving = false;
+    } else if (!ctx->moving) {
+        const int dx = (int)points[0].x - ctx->origin_x, dy = (int)points[0].y - ctx->origin_y;
+        ctx->moving = dx * dx + dy * dy >= TOUCH_MOTION_DISTANCE * TOUCH_MOTION_DISTANCE;
+    }
     data->point.x = points[0].x;
     data->point.y = points[0].y;
     data->state = LV_INDEV_STATE_PRESSED;

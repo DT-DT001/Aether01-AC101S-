@@ -20,7 +20,28 @@ enum {
     AUDIO_DMA_FRAMES = 240,
     PCM16_STEREO_BYTES = 4,
     ALERT_MAX_FRAMES = 5760,
+    MIC_GAIN_UNITY_Q12 = 1 << 12,
+    MIC_GAIN_QUIET_Q12 = 2 * MIC_GAIN_UNITY_Q12,
+    MIC_CAPTURE_PEAK = 24000,
+    MIC_GAIN_RELEASE_SHIFT = 12,
+    MIC_GAIN_HISTORY_BITS = 8,
+    RECORDING_GAIN_IDLE_Q12 = 5 * MIC_GAIN_UNITY_Q12 / 4,
+    RECORDING_GAIN_MAX_Q12 = 6 * MIC_GAIN_UNITY_Q12,
+    RECORDING_GAIN_MIN_Q12 = MIC_GAIN_UNITY_Q12 / 2,
+    RECORDING_NOISE_LEVEL = 96,
+    RECORDING_VOICE_LEVEL = 256,
+    RECORDING_TARGET_LEVEL = 4800,
+    RECORDING_LIMITER_KNEE = 16000,
+    RECORDING_GAIN_INTERVAL = 120,
 };
+
+typedef struct {
+    int32_t dc_q8;
+    int32_t level_q8;
+    int32_t gain_history;
+    int32_t target_gain;
+    unsigned gain_countdown;
+} recording_gain_t;
 
 struct ac101s_audio_dev_t {
     i2s_chan_handle_t tx;
@@ -41,6 +62,8 @@ struct ac101s_audio_dev_t {
     uint8_t master_volume;
     int requested_volume;
     float mic_gain_db;
+    int32_t capture_gain_history;
+    recording_gain_t recording_gain;
     ac101s_audio_output_t output;
     ac101s_audio_sink_t sink;
     ac101s_audio_sink_t usb_sink;
@@ -287,6 +310,11 @@ static esp_err_t capture_start_locked(ac101s_audio_handle_t handle, float gain_d
     if (err != ESP_OK) {
         capture_stop_locked(handle);
     } else {
+        handle->capture_gain_history = MIC_GAIN_QUIET_Q12 << MIC_GAIN_HISTORY_BITS;
+        handle->recording_gain = (recording_gain_t){
+            .gain_history = RECORDING_GAIN_IDLE_Q12 << MIC_GAIN_HISTORY_BITS,
+            .target_gain = RECORDING_GAIN_IDLE_Q12 << MIC_GAIN_HISTORY_BITS,
+        };
         handle->capture_ready = true;
         ESP_LOGI(TAG, "capture start local ADC 48000Hz PCM16 stereo, gain=%.0fdB, DAC muted, PA off", gain_db);
     }
@@ -304,6 +332,98 @@ esp_err_t ac101s_audio_capture_start(ac101s_audio_handle_t handle, float gain_db
         err = handle->board_owner ? ESP_ERR_INVALID_STATE : capture_start_locked(handle, gain_db);
     xSemaphoreGive(handle->mutex);
     return err;
+}
+
+static int32_t recording_target_gain(int32_t level)
+{
+    /* Keep the quiet floor low without gating faint sounds or syllables. */
+    if (level <= RECORDING_NOISE_LEVEL) return RECORDING_GAIN_IDLE_Q12;
+    if (level < RECORDING_VOICE_LEVEL) {
+        return RECORDING_GAIN_IDLE_Q12 + (RECORDING_GAIN_MAX_Q12 - RECORDING_GAIN_IDLE_Q12) *
+            (level - RECORDING_NOISE_LEVEL) / (RECORDING_VOICE_LEVEL - RECORDING_NOISE_LEVEL);
+    }
+    const int32_t target = RECORDING_TARGET_LEVEL * MIC_GAIN_UNITY_Q12 / level;
+    if (target > RECORDING_GAIN_MAX_Q12) return RECORDING_GAIN_MAX_Q12;
+    if (target < RECORDING_GAIN_MIN_Q12) return RECORDING_GAIN_MIN_Q12;
+    return target;
+}
+
+static int16_t process_recording_sample(recording_gain_t *state, int16_t sample)
+{
+    /* Remove DC and sub-bass from both the detector and the recorded signal. */
+    const int32_t dc_delta_q8 = (int32_t)sample * 256 - state->dc_q8;
+    state->dc_q8 += dc_delta_q8 / 128;
+    const int32_t signal = dc_delta_q8 / 256;
+    const int32_t magnitude = signal < 0 ? -signal : signal;
+
+    /* Measure the envelope continuously, without letting one peak set the gain
+     * for every frame in a read. At 48 kHz the detector rises in ~5 ms. */
+    const int32_t level_delta = magnitude * 256 - state->level_q8;
+    state->level_q8 += level_delta / (level_delta > 0 ? 240 : 2048);
+    if (state->gain_countdown == 0) {
+        state->target_gain = recording_target_gain(state->level_q8 / 256)
+            << MIC_GAIN_HISTORY_BITS;
+        state->gain_countdown = RECORDING_GAIN_INTERVAL;
+    }
+    --state->gain_countdown;
+
+    const int32_t delta = state->target_gain - state->gain_history;
+    state->gain_history += delta < 0 ? -((-delta + 127) / 128) : (delta + 511) / 512;
+    const int32_t gain = state->gain_history >> MIC_GAIN_HISTORY_BITS;
+    int32_t output = magnitude * gain / MIC_GAIN_UNITY_Q12;
+    if (output > RECORDING_LIMITER_KNEE) {
+        const uint32_t excess = (uint32_t)(output - RECORDING_LIMITER_KNEE);
+        const uint32_t headroom = MIC_CAPTURE_PEAK - RECORDING_LIMITER_KNEE;
+        /* The product fits uint32_t for the maximum DC step and 6x gain. */
+        output = RECORDING_LIMITER_KNEE + headroom * excess / (headroom + excess);
+    }
+    return (int16_t)(signal < 0 ? -output : output);
+}
+
+static void finish_board_capture(ac101s_audio_handle_t handle, uint8_t *frames, size_t bytes)
+{
+    if (handle->capture_active && !handle->board_owner) {
+        for (size_t i = 0; i < bytes; i += PCM16_STEREO_BYTES) {
+            int16_t sample;
+            memcpy(&sample, frames + i, sizeof(sample));
+            sample = process_recording_sample(&handle->recording_gain, sample);
+            memcpy(frames + i, &sample, sizeof(sample));
+            memcpy(frames + i + sizeof(sample), &sample, sizeof(sample));
+        }
+        return;
+    }
+
+    const bool voice_capture = handle->capture_active;
+    int32_t gain = handle->capture_gain_history;
+    int32_t target = gain;
+    if (voice_capture) {
+        int32_t peak = 1;
+        for (size_t i = 0; i < bytes; i += PCM16_STEREO_BYTES) {
+            int16_t sample;
+            memcpy(&sample, frames + i, sizeof(sample));
+            const int32_t magnitude = sample < 0 ? -(int32_t)sample : sample;
+            if (magnitude > peak) peak = magnitude;
+        }
+        const int32_t peak_gain = MIC_CAPTURE_PEAK * MIC_GAIN_UNITY_Q12 / peak;
+        const int32_t target_q12 = peak_gain < MIC_GAIN_QUIET_Q12 ? peak_gain : MIC_GAIN_QUIET_Q12;
+        target = target_q12 << MIC_GAIN_HISTORY_BITS;
+        /* The full block is already buffered. Limit a sudden loud input before
+         * writing any sample, and restore quiet gain over about 85 ms at 48 kHz. */
+        if (gain > target) gain = target;
+    }
+    for (size_t i = 0; i < bytes; i += PCM16_STEREO_BYTES) {
+        int16_t sample;
+        memcpy(&sample, frames + i, sizeof(sample));
+        if (voice_capture) {
+            gain += (target - gain + (1 << MIC_GAIN_RELEASE_SHIFT) - 1) >> MIC_GAIN_RELEASE_SHIFT;
+            const int32_t gain_q12 = gain >> MIC_GAIN_HISTORY_BITS;
+            sample = (int16_t)((int32_t)sample * gain_q12 / MIC_GAIN_UNITY_Q12);
+            memcpy(frames + i, &sample, sizeof(sample));
+        }
+        /* The mono ADC is in the first slot. Both caller channels use it. */
+        memcpy(frames + i + sizeof(sample), &sample, sizeof(sample));
+    }
+    if (voice_capture) handle->capture_gain_history = gain;
 }
 
 static esp_err_t board_pcm_locked(ac101s_audio_handle_t handle, bool capture, void *data,
@@ -332,15 +452,9 @@ static esp_err_t board_pcm_locked(ac101s_audio_handle_t handle, bool capture, vo
             : i2s_channel_write(handle->tx, (uint8_t *)data + offset, chunk, &count, timeout_ms);
         if (err != ESP_OK) return err;
         if (!count || count > chunk || count % PCM16_STEREO_BYTES) return ESP_FAIL;
-        if (capture) {
-            /* Use the mono ADC from the first slot in the app's stereo PCM contract. */
-            uint8_t *frame = (uint8_t *)data + offset;
-            for (size_t i = 0; i < count; i += PCM16_STEREO_BYTES) {
-                memcpy(frame + i + sizeof(int16_t), frame + i, sizeof(int16_t));
-            }
-        }
         offset += count;
     }
+    if (capture) finish_board_capture(handle, data, bytes);
     return ESP_OK;
 }
 

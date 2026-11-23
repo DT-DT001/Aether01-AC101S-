@@ -10,6 +10,8 @@ This standalone firmware demo targets the AC101S edition of Aether01, a handheld
 
 ![Everyday apps on Aether01](docs/images/02-daily-apps.png)
 
+![Enlarged offline Pinyin keyboard, TF and USB file browsing, and long-press file actions](docs/images/06-keyboard-files.png)
+
 ![2048, Sokoban, Snake, and platform jumping](docs/images/03-built-in-games.png)
 
 The 480 × 480 previews use the current firmware's LVGL interface with demo content.
@@ -17,6 +19,8 @@ The 480 × 480 previews use the current firmware's LVGL interface with demo cont
 Swipe up from the desktop to open the app drawer. Returning to the drawer restores its scroll position. The drawer's Home button or a two-second hold of the physical user button opens the desktop.
 
 The firmware includes music playback with a live five-band EQ, video, recording, a TXT reader, NES emulation, USB OTG, Wi-Fi, Bluetooth controls, and ESP-NOW push-to-talk. Everyday tools include alarms, notes, a calendar, and weather. 2048 supports swipe and tilt controls. Sokoban and Snake respond to directional touch regions, and Snake also supports tilt.
+
+Music playback supports synchronized LRC lyrics and remembers playback position. The recorder shows a live waveform and has its own recording list. The offline Pinyin keyboard supports glide typing and an optional vocabulary extension. Long-press a file to see its details, copy it, move it, or delete it.
 
 Build from this checkout using an ESP-IDF 6.1 environment with ESP32-S31 support.
 

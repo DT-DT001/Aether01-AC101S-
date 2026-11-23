@@ -12,6 +12,7 @@ extern const lv_font_t font_16, font_24;
 static uint16_t framebuffer[480 * 480];
 static uint16_t draw_buffer[480 * 40];
 static const char *book_path;
+static const char *fixture_directory;
 static bool mounted = true;
 static bool usb_blocked;
 static unsigned book_catalog_calls,music_catalog_calls,text_calls;
@@ -86,8 +87,18 @@ void app_ui_request_io_ex(app_ui_t *ui, const app_io_request_t *q,
         r.encoding_hint = has_saved ? saved.encoding_hint : 0;
         r.turn_mode = has_saved ? saved.turn_mode : APP_READER_TURN_SWIPE_HORIZONTAL;
     } else if (q->operation == APP_IO_READ_TEXT) {
+        const char *source = q->path;
+        const size_t path_length = strlen(source);
+        char lyric_fixture[1024];
+        if (path_length >= 4 && !strcmp(source + path_length - 4, ".lrc")) {
+            const char *name = strrchr(source, '/');
+            assert(name);
+            const int length = snprintf(lyric_fixture, sizeof(lyric_fixture), "%s/%s", fixture_directory, name + 1);
+            assert(length > 0 && (size_t)length < sizeof(lyric_fixture));
+            source = lyric_fixture;
+        }
         app_reader_chunk_t chunk;
-        r.error = app_reader_file_read_ex(q->path, q->offset, q->limit, q->source_boundary, q->encoding_hint, &chunk);
+        r.error = app_reader_file_read_ex(source, q->offset, q->limit, q->source_boundary, q->encoding_hint, &chunk);
         r.text = chunk.text; r.offset = chunk.offset; r.next_offset = chunk.next_offset;
         r.source_offsets = chunk.source_offsets; r.encoding = chunk.encoding; r.invalid_count = chunk.invalid_count;
         r.file_size = chunk.file_size; r.text_start_offset = chunk.text_start_offset;
@@ -138,6 +149,19 @@ void app_ui_set_timer(app_ui_t *ui, lv_timer_cb_t callback, uint32_t ms)
 
 esp_err_t aether_audio_player_get_status(aether_audio_player_handle_t h, aether_audio_player_status_t *status)
 { assert(h); *status = audio_status; return ESP_OK; }
+esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t h, char *path, size_t size)
+{ assert(h && path && size); return ESP_ERR_NOT_FOUND; }
+esp_err_t aether_audio_player_restore(aether_audio_player_handle_t h)
+{ assert(h); return ESP_ERR_NOT_FOUND; }
+esp_err_t aether_audio_player_play(aether_audio_player_handle_t h, const char *path, int volume)
+{
+    assert(h && path && volume >= 0 && volume <= 100);
+    strlcpy(audio_status.path, path, sizeof(audio_status.path));
+    audio_status.volume = (uint8_t)volume;
+    audio_status.active = true;
+    audio_status.state = AETHER_AUDIO_PLAYING;
+    return ESP_OK;
+}
 esp_err_t aether_audio_player_set_playlist(aether_audio_player_handle_t h, const char *const *paths, size_t count)
 {
     assert(h && count <= 16);
@@ -285,7 +309,8 @@ int main(int argc, char **argv)
     const unsigned before_modes = text_calls;
     show_reader_toolbar();
     assert(!lv_obj_has_flag(toolbar, LV_OBJ_FLAG_HIDDEN) && text_calls == before_modes);
-    assert(find_text_contains(ui.screen,"缺字0/坏码0"));
+    assert(find_text_contains(ui.screen,"0.0% · ") && !find_text_contains(ui.screen,"缺字0/坏码0"));
+    snapshot(argv[2], "reader-controls");
     click(&ui, "左右滑动");
     gesture(400, 160, 400, 160, 60);
     gesture(70, 160, 70, 160, 60);
@@ -333,11 +358,14 @@ int main(int argc, char **argv)
     assert(find_text(ui.screen,"自动编码"));
     for (unsigned i = 0; i < 50; ++i) { app_open_reader(&ui); app_open_reader_path(&ui, book_path); tick(); }
     ui.audio_player = (aether_audio_player_handle_t)1;
+    fixture_directory = argv[2];
     app_open_music(&ui); snapshot(argv[2], "music-playing");
-    click(&ui, "暂停"); assert(audio_status.state == AETHER_AUDIO_PAUSED);
-    snapshot(argv[2], "music-paused"); click(&ui, "继续");
-    click(&ui, "下一首"); assert(audio_status.track_index == 1);
-    click(&ui, "上一首"); assert(audio_status.track_index == 0);
+    lv_obj_t *active_lyric = find_text(ui.screen, "海风轻轻穿过长街");
+    assert(active_lyric && lv_color_eq(lv_obj_get_style_text_color(active_lyric, LV_PART_MAIN), lv_color_hex(0x79DBB7)));
+    click(&ui, LV_SYMBOL_PAUSE); assert(audio_status.state == AETHER_AUDIO_PAUSED);
+    snapshot(argv[2], "music-paused"); click(&ui, LV_SYMBOL_PLAY);
+    click(&ui, LV_SYMBOL_NEXT); assert(audio_status.track_index == 1);
+    click(&ui, LV_SYMBOL_PREV); assert(audio_status.track_index == 0);
     click(&ui, "列表循环"); assert(audio_status.repeat == AETHER_AUDIO_REPEAT_ONE);
     unsigned seen = 0; lv_obj_t *volume = find_slider(ui.screen, 1, &seen); assert(volume);
     lv_slider_set_value(volume, 27, LV_ANIM_OFF); lv_obj_send_event(volume, LV_EVENT_VALUE_CHANGED, NULL);

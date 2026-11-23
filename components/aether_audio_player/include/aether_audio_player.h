@@ -54,7 +54,7 @@ typedef struct {
     bool active;
     bool closing; /* Session release remains pending until codec and playlist are free. */
     esp_err_t settings_error;
-    bool preferences_pending; /* Actual worker-owned NVS dirty state. */
+    bool preferences_pending; /* Actual worker-owned NVS dirty state, including resume. */
     uint16_t track_index;
     uint16_t track_count;
     bool mp3;
@@ -70,7 +70,7 @@ typedef struct {
 /**
  * Create a WAV/MP3 player with a persistent worker. Supports PCM16 WAV and
  * MP3 mono/stereo 8..48 kHz, linearly resampled to fixed 48 kHz stereo output.
- * Volume, repeat and EQ preferences are saved by the worker.
+ * Volume, repeat, EQ and the last track position are saved by the worker.
  */
 esp_err_t aether_audio_player_new(ac101s_audio_handle_t audio,
                                   aether_storage_handle_t storage,
@@ -97,6 +97,12 @@ esp_err_t aether_audio_player_set_eq(aether_audio_player_handle_t handle, const 
  * The worker applies repeat/shuffle on natural EOF, never after stop/error. */
 esp_err_t aether_audio_player_set_playlist(aether_audio_player_handle_t handle,
                                            const char *const *paths, size_t count);
+/** Copy the cached last music track path. Recordings are excluded from the
+ * music bookmark. Does not access storage or NVS. */
+esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t handle, char *path, size_t size);
+/** Select the saved position if the prepared playlist still has that track.
+ * Leaves playback idle until play is requested for this selection. */
+esp_err_t aether_audio_player_restore(aether_audio_player_handle_t handle);
 /** Previous/next wrap the playlist and replace the current stream asynchronously. */
 esp_err_t aether_audio_player_next(aether_audio_player_handle_t handle, int direction);
 /** Select a playlist entry without relying on a foreground UI timer. */

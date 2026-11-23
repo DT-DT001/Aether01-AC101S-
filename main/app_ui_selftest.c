@@ -1,14 +1,21 @@
 #include "app_ui_selftest.h"
+#include "app_pinyin_extended.h"
 
 #include <inttypes.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
+#include "aether_media_fs.h"
 #include "aether_recorder.h"
+#include "aether_storage.h"
 #include "aether_wifi.h"
 #include "app_display_metrics.h"
 #include "app_home.h"
+#include "app_otg_control.h"
 #include "app_telemetry.h"
+#include "app_text_input.h"
 #include "app_ui_internal.h"
 #include "app_utilities.h"
 #include "esp_heap_caps.h"
@@ -16,6 +23,8 @@
 #include "esp_lvgl_port.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
+#include "app_ui_selftest_mic.h"
+#include "app_ui_selftest_files.h"
 
 enum { ROUNDS = 8, DRAWER_BACK_ROUND = 2, PAGE_TIMEOUT_MS = 5000, POLL_MS = 40 };
 static const char *const TAG = "ui_selftest";
@@ -444,6 +453,258 @@ static bool exit_to_desktop(probe_t *probe, bool check_stale)
     return wait_desktop(probe);
 }
 
+typedef struct {
+    lv_point_t center[26];
+    uint32_t seen;
+} ime_keys_t;
+
+static void collect_ime_keys(lv_event_t *event)
+{
+    lv_draw_task_t *task = lv_event_get_draw_task(event);
+    if (lv_draw_task_get_type(task) != LV_DRAW_TASK_TYPE_FILL) return;
+    const lv_draw_dsc_base_t *draw = lv_draw_task_get_draw_dsc(task);
+    if (draw->part != LV_PART_ITEMS) return;
+    const char *key = lv_keyboard_get_button_text(lv_event_get_current_target_obj(event), draw->id1);
+    if (!key || key[0] < 'a' || key[0] > 'z' || key[1]) return;
+    ime_keys_t *keys = lv_event_get_user_data(event);
+    const unsigned letter = (unsigned)(key[0] - 'a');
+    lv_area_t area;
+    lv_draw_task_get_area(task, &area);
+    keys->center[letter] = (lv_point_t){(area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2};
+    keys->seen |= UINT32_C(1) << letter;
+}
+
+static void ime_sample(lv_indev_t *pointer, lv_indev_data_t *sample, lv_point_t point, bool pressed)
+{
+    sample->point = point;
+    sample->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    lv_indev_read(pointer);
+}
+
+static bool ime_pick_locked(lv_obj_t *dock, lv_indev_t *pointer, lv_indev_data_t *sample,
+                            const char *word)
+{
+    lv_obj_t *button = button_for(dock, word);
+    if (!button || lv_obj_has_flag(button, LV_OBJ_FLAG_HIDDEN)) return false;
+    lv_obj_scroll_to_view_recursive(button, LV_ANIM_OFF);
+    lv_obj_update_layout(button);
+    lv_area_t area;
+    lv_obj_get_coords(button, &area);
+    const lv_point_t point = {(area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2};
+    ime_sample(pointer, sample, point, true);
+    ime_sample(pointer, sample, point, false);
+    return true;
+}
+
+static void ime_trace_locked(lv_indev_t *pointer, lv_indev_data_t *sample,
+                             const ime_keys_t *keys, const char *spelling, int32_t shift, bool brush_edge)
+{
+    lv_point_t from = keys->center[*spelling++ - 'a'];
+    if (shift) { from.x += shift; from.y -= 6; }
+    ime_sample(pointer, sample, from, true);
+    if (brush_edge) {
+        const lv_point_t nearby = {from.x, from.y + 18};
+        ime_sample(pointer, sample, nearby, true);
+        ime_sample(pointer, sample, (lv_point_t){from.x, from.y + 53}, true);
+        ime_sample(pointer, sample, (lv_point_t){from.x + 5, from.y + 53}, true);
+        ime_sample(pointer, sample, (lv_point_t){from.x + 10, from.y + 53}, true);
+        ime_sample(pointer, sample, nearby, true);
+        ime_sample(pointer, sample, from, true);
+    }
+    const int32_t steps = shift ? 3 : 8;
+    for (; *spelling; ++spelling) {
+        lv_point_t to = keys->center[*spelling - 'a'];
+        if (shift) { to.x += shift < 0 ? shift + 1 : *spelling == 'i' ? 7 : 13; to.y -= 5; }
+        for (int32_t i = 1; i <= steps; ++i) {
+            const lv_point_t point = {from.x + (to.x - from.x) * i / steps,
+                                      from.y + (to.y - from.y) * i / steps};
+            ime_sample(pointer, sample, point, true);
+        }
+        from = to;
+    }
+    ime_sample(pointer, sample, from, false);
+}
+
+static void ime_glide_locked(lv_indev_t *pointer, lv_indev_data_t *sample,
+                             const ime_keys_t *keys, const char *spelling, bool sparse)
+{
+    ime_trace_locked(pointer, sample, keys, spelling, sparse ? 12 : 0, false);
+}
+
+static bool test_ime_locked(lv_obj_t *screen)
+{
+    lv_obj_t *scope = lv_obj_create(screen);
+    if (!scope) return false;
+    lv_obj_set_size(scope, lv_obj_get_width(screen), lv_obj_get_height(screen));
+    lv_obj_set_pos(scope, 0, 0);
+    lv_obj_set_style_pad_all(scope, 0, 0);
+    lv_obj_set_style_border_width(scope, 0, 0);
+    lv_obj_remove_flag(scope, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *field = lv_textarea_create(scope);
+    if (field) {
+        lv_obj_set_pos(field, 24, 24);
+        lv_obj_set_size(field, 400, 90);
+        lv_obj_set_style_text_font(field, app_ui_chinese_font(), 0);
+        lv_group_remove_obj(field);
+    }
+    lv_obj_t *dock = field ? app_text_input_create(scope, field, true, NULL, NULL) : NULL;
+    if (dock) app_text_input_show(dock, true);
+    lv_obj_t *keyboard = dock ? find_class(dock, &lv_keyboard_class) : NULL;
+    bool typed = false, swiped = false, segmented_swipe = false, homophone_swipe = false;
+    bool edge_tap = false, short_tap = false, sparse_glide = false, actions_guarded = false;
+    bool sentence_glide = false, sentence_parts = false, requested_words = false, cold_glide = false;
+    bool meal_glide = false, edge_glide = false, shifted_meal = false;
+    unsigned meal_questions = 0;
+    const bool cold_available = app_pinyin_extended_count() > 0;
+    int64_t segmented_us = 0, sentence_us = 0;
+    unsigned key_count = 0;
+    bool pointer_created = false, first_letter = false, tap_composition = false;
+    bool tap_candidate = false, swipe_composition = false, swipe_candidate = false;
+    if (keyboard) {
+        ime_keys_t keys = {0};
+        lv_obj_add_event_cb(keyboard, collect_ime_keys, LV_EVENT_DRAW_TASK_ADDED, &keys);
+        lv_obj_update_layout(scope);
+        lv_obj_invalidate(keyboard);
+        lv_display_t *display = lv_obj_get_display(keyboard);
+        lv_refr_now(display);
+        lv_obj_remove_event_cb(keyboard, collect_ime_keys);
+        key_count = (unsigned)__builtin_popcount(keys.seen);
+        lv_indev_data_t sample = {0};
+        lv_indev_t *pointer = keys.seen == ((UINT32_C(1) << 26) - 1) ? create_pointer(display, &sample) : NULL;
+        pointer_created = pointer != NULL;
+        if (pointer) {
+            lv_obj_t *actions = find_class(dock, &lv_buttonmatrix_class);
+            if (actions && actions != keyboard) {
+                lv_area_t area;
+                lv_obj_get_coords(actions, &area);
+                const lv_point_t enter = {area.x2 - 18, (area.y1 + area.y2) / 2};
+                ime_sample(pointer, &sample, keys.center['m' - 'a'], true);
+                ime_sample(pointer, &sample, enter, true);
+                ime_sample(pointer, &sample, enter, false);
+                const bool drag_safe = !lv_textarea_get_text(field)[0];
+                app_text_input_show(dock, false);
+                app_text_input_show(dock, true);
+                lv_obj_update_layout(scope);
+                ime_sample(pointer, &sample, enter, true);
+                const bool pressed_safe = !lv_textarea_get_text(field)[0];
+                ime_sample(pointer, &sample, enter, false);
+                actions_guarded = drag_safe && pressed_safe && !strcmp(lv_textarea_get_text(field), "\n");
+                lv_textarea_set_text(field, "");
+            }
+            lv_area_t keyboard_area;
+            lv_obj_get_coords(keyboard, &keyboard_area);
+            const lv_point_t edge = {keyboard_area.x1 - 4, keys.center['q' - 'a'].y};
+            ime_sample(pointer, &sample, edge, true);
+            ime_sample(pointer, &sample, edge, false);
+            edge_tap = find_label(dock, "q", false) != NULL;
+            app_text_input_show(dock, false);
+            app_text_input_show(dock, true);
+            lv_obj_update_layout(scope);
+            const lv_point_t key_q = keys.center['q' - 'a'];
+            const lv_point_t drift = {key_q.x + 17, key_q.y};
+            ime_sample(pointer, &sample, key_q, true);
+            ime_sample(pointer, &sample, drift, true);
+            ime_sample(pointer, &sample, drift, false);
+            short_tap = find_label(dock, "q", false) != NULL;
+            app_text_input_show(dock, false);
+            app_text_input_show(dock, true);
+            lv_obj_update_layout(scope);
+            for (const char *key = "ni"; *key; ++key) {
+                const lv_point_t point = keys.center[*key - 'a'];
+                ime_sample(pointer, &sample, point, true);
+                ime_sample(pointer, &sample, point, false);
+                if (*key == 'n') first_letter = find_label(dock, "n", false) != NULL;
+            }
+            tap_composition = find_label(dock, "ni", false) != NULL;
+            tap_candidate = ime_pick_locked(dock, pointer, &sample, "你");
+            typed = first_letter && tap_composition && tap_candidate && !strcmp(lv_textarea_get_text(field), "你");
+            ime_glide_locked(pointer, &sample, &keys, "nihao", false);
+            swipe_composition = find_label(dock, "nihao", false) != NULL;
+            swipe_candidate = ime_pick_locked(dock, pointer, &sample, "你好");
+            swiped = swipe_composition && swipe_candidate && !strcmp(lv_textarea_get_text(field), "你你好");
+            lv_textarea_set_text(field, "");
+            const int64_t started = esp_timer_get_time();
+            ime_glide_locked(pointer, &sample, &keys, "woxianghecha", false);
+            segmented_us = esp_timer_get_time() - started;
+            segmented_swipe = find_label(dock, "woxianghecha", false) &&
+                ime_pick_locked(dock, pointer, &sample, "我想喝茶") &&
+                !strcmp(lv_textarea_get_text(field), "我想喝茶");
+            lv_textarea_set_text(field, "");
+            ime_glide_locked(pointer, &sample, &keys, "xian", false);
+            homophone_swipe = find_label(dock, "xian", false) &&
+                ime_pick_locked(dock, pointer, &sample, "西安") &&
+                !strcmp(lv_textarea_get_text(field), "西安");
+            lv_textarea_set_text(field, "");
+            ime_glide_locked(pointer, &sample, &keys, "mudidi", true);
+            sparse_glide = ime_pick_locked(dock, pointer, &sample, "目的地") &&
+                !strcmp(lv_textarea_get_text(field), "目的地");
+            lv_textarea_set_text(field, "");
+            ime_glide_locked(pointer, &sample, &keys, "nishi", false);
+            const bool nishi = ime_pick_locked(dock, pointer, &sample, "你是");
+            ime_glide_locked(pointer, &sample, &keys, "nishishui", false);
+            requested_words = nishi && ime_pick_locked(dock, pointer, &sample, "你是谁") &&
+                !strcmp(lv_textarea_get_text(field), "你是你是谁");
+            lv_textarea_set_text(field, "");
+            ime_glide_locked(pointer, &sample, &keys, "nichifanlema", false);
+            meal_glide = ime_pick_locked(dock, pointer, &sample, "你吃饭了吗") &&
+                !strcmp(lv_textarea_get_text(field), "你吃饭了吗");
+            lv_textarea_set_text(field, "");
+            ime_trace_locked(pointer, &sample, &keys, "nichifanlema", 0, true);
+            edge_glide = ime_pick_locked(dock, pointer, &sample, "你吃饭了吗") &&
+                !strcmp(lv_textarea_get_text(field), "你吃饭了吗");
+            lv_textarea_set_text(field, "");
+            ime_trace_locked(pointer, &sample, &keys, "nichifanlema", -16, false);
+            shifted_meal = ime_pick_locked(dock, pointer, &sample, "你吃饭了吗") &&
+                !strcmp(lv_textarea_get_text(field), "你吃饭了吗");
+            static const struct { const char *spelling, *text; int32_t shift; } meal_cases[] = {
+                {"nichilema", "你吃了吗", 0},
+                {"nichiwufanlema", "你吃午饭了吗", -12},
+                {"diyici", "第一次", 0},
+            };
+            for (size_t i = 0; i < sizeof(meal_cases) / sizeof(meal_cases[0]); ++i) {
+                lv_textarea_set_text(field, "");
+                ime_trace_locked(pointer, &sample, &keys, meal_cases[i].spelling, meal_cases[i].shift, false);
+                if (ime_pick_locked(dock, pointer, &sample, meal_cases[i].text) &&
+                    !strcmp(lv_textarea_get_text(field), meal_cases[i].text)) meal_questions |= 1U << i;
+            }
+            lv_textarea_set_text(field, "");
+            if (cold_available) {
+                ime_glide_locked(pointer, &sample, &keys, "shoujike", false);
+                cold_glide = ime_pick_locked(dock, pointer, &sample, "手机壳") &&
+                    !strcmp(lv_textarea_get_text(field), "手机壳");
+                lv_textarea_set_text(field, "");
+            }
+            const int64_t sentence_start = esp_timer_get_time();
+            ime_glide_locked(pointer, &sample, &keys, "woxianghechayexiangtingyinyue", false);
+            sentence_us = esp_timer_get_time() - sentence_start;
+            sentence_glide = ime_pick_locked(dock, pointer, &sample, "我想喝茶也想听音乐") &&
+                !strcmp(lv_textarea_get_text(field), "我想喝茶也想听音乐");
+            lv_textarea_set_text(field, "");
+            const char *const strokes[] = {"mingtian", "woxiang", "genni", "yiqi", "qu", "gongyuan"};
+            for (size_t i = 0; i < sizeof(strokes) / sizeof(strokes[0]); ++i)
+                ime_glide_locked(pointer, &sample, &keys, strokes[i], false);
+            sentence_parts = ime_pick_locked(dock, pointer, &sample, "明天我想跟你一起去公园") &&
+                !strcmp(lv_textarea_get_text(field), "明天我想跟你一起去公园");
+            lv_indev_delete(pointer);
+        }
+    }
+    lv_obj_delete(scope);
+    ESP_LOGI(TAG, "CHECK notes-ime keys=%u pointer=%u first_letter=%u tap_composition=%u tap_candidate=%u"
+             " swipe_composition=%u swipe_candidate=%u synthetic_key_taps=%u synthetic_swipe=%u"
+             " segmented_swipe=%u segmented_us=%" PRIi64 " homophone_swipe=%u edge_tap=%u short_tap=%u sparse_glide=%u"
+             " actions_guarded=%u requested_words=%u meal_glide=%u edge_glide=%u shifted_meal=%u meal_questions=0x%x"
+             " cold_available=%u cold_glide=%u"
+             " sentence_glide=%u sentence_us=%" PRIi64 " sentence_parts=%u disposable_text=1",
+             key_count, pointer_created, first_letter, tap_composition, tap_candidate,
+             swipe_composition, swipe_candidate, typed, swiped, segmented_swipe, segmented_us,
+             homophone_swipe, edge_tap, short_tap, sparse_glide, actions_guarded, requested_words, meal_glide, edge_glide, shifted_meal,
+             meal_questions, cold_available, cold_glide, sentence_glide, sentence_us, sentence_parts);
+    return typed && swiped && segmented_swipe && homophone_swipe && edge_tap && short_tap &&
+           sparse_glide && actions_guarded && requested_words && meal_glide && edge_glide && shifted_meal &&
+           meal_questions == 7U && (!cold_available || cold_glide) &&
+           sentence_glide && sentence_parts;
+}
+
 static bool test_notes_keyboard(probe_t *probe)
 {
     if (!lvgl_port_lock(1000)) return false;
@@ -451,13 +712,40 @@ static bool test_notes_keyboard(probe_t *probe)
         find_class(probe->ui->content, &lv_textarea_class) : NULL;
     const bool can_edit = field && !lv_obj_has_state(field, LV_STATE_DISABLED);
     if (can_edit) lv_obj_send_event(field, LV_EVENT_CLICKED, NULL);
-    const bool soft_keyboard = can_edit &&
-        find_class(probe->ui->screen, &lv_keyboard_class);
+    lv_obj_t *keyboard = can_edit ? find_class(probe->ui->screen, &lv_keyboard_class) : NULL;
+    bool input_ok = false;
+    if (keyboard && lv_obj_is_visible(keyboard)) {
+        lv_obj_update_layout(field);
+        lv_area_t field_area, dock_area;
+        lv_obj_get_coords(field, &field_area);
+        lv_obj_get_coords(lv_obj_get_parent(keyboard), &dock_area);
+        const int32_t field_height = lv_obj_get_content_height(field);
+        const int32_t width = lv_obj_get_width(keyboard), height = lv_obj_get_height(keyboard);
+        const bool fits = field_area.y2 < dock_area.y1 &&
+            field_height >= 2 * lv_font_get_line_height(app_ui_chinese_font_size(24)) +
+                lv_obj_get_style_text_line_space(field, LV_PART_MAIN);
+        ESP_LOGI(TAG, "CHECK notes-layout field_above_keyboard=%u field_height=%" PRId32
+                 " keyboard=%" PRId32 "x%" PRId32, fits, field_height, width, height);
+        input_ok = test_ime_locked(probe->ui->screen) && fits;
+    } else if (can_edit) {
+        aether_usb_host_status_t host;
+        input_ok = app_otg_get_status(&host) == ESP_OK && host.active && host.keyboard_interfaces;
+        if (input_ok) ESP_LOGI(TAG, "SKIP notes-ime on-screen keyboard hidden during external input");
+    }
     lvgl_port_unlock();
-    if (!can_edit) return false;
-    ESP_LOGI(TAG, "CHECK notes-input opened keyboard=%u (existing text left untouched)",
-             soft_keyboard);
-    return true;
+    return input_ok;
+}
+
+static bool test_settings_top(probe_t *probe, const char *entry)
+{
+    /* Let the old screen retire and any focus-triggered animation finish. */
+    pause_ms(800);
+    if (!lvgl_port_lock(1000)) return false;
+    lv_obj_t *content = current_page(probe) ? probe->ui->content : NULL;
+    const int32_t scroll = content ? lv_obj_get_scroll_y(content) : -1;
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "CHECK settings-top entry=%s scroll=%" PRId32, entry, scroll);
+    return scroll == 0;
 }
 
 static bool test_music(probe_t *probe)
@@ -473,7 +761,7 @@ static bool test_music(probe_t *probe)
         ESP_LOGI(TAG, "SKIP music-playback no indexed track or audio backend");
         return true;
     }
-    if (!click_label(probe, "播放")) return false;
+    if (!click_label(probe, LV_SYMBOL_PLAY)) return false;
     const int64_t deadline = esp_timer_get_time() + PAGE_TIMEOUT_MS * INT64_C(1000);
     do {
         pause_ms(POLL_MS);
@@ -491,6 +779,113 @@ static bool test_music(probe_t *probe)
     return false;
 }
 
+static lv_obj_t *recordings_viewport(lv_obj_t *content)
+{
+    lv_obj_t *icon = find_class(content, &lv_image_class);
+    lv_obj_t *row = icon ? lv_obj_get_parent(icon) : NULL;
+    return row && lv_obj_check_type(row, &lv_button_class) ? lv_obj_get_parent(row) : NULL;
+}
+
+static bool recordings_header_back(probe_t *probe, route_id_t destination)
+{
+    if (!lvgl_port_lock(1000)) return false;
+    app_ui_t *ui = probe->ui;
+    lv_obj_t *back = current_page(probe) ? button_for(ui->screen, LV_SYMBOL_LEFT) : NULL;
+    const bool valid = back && lv_obj_get_parent(back) == ui->screen &&
+        !lv_obj_has_state(back, LV_STATE_DISABLED);
+    const uint64_t before = completed_regions();
+    if (valid) lv_obj_send_event(back, LV_EVENT_CLICKED, NULL);
+    const bool navigated = valid && ui->page_generation == probe->generation + 1U;
+    if (navigated) ++probe->generation;
+    lvgl_port_unlock();
+    return navigated && wait_page(probe, &routes[destination], before, true);
+}
+
+static bool test_recordings_back(probe_t *probe)
+{
+    static const char directory[] = AETHER_STORAGE_MOUNT_POINT "/Recordings";
+    app_ui_t *ui = probe->ui;
+    if (!aether_media_fs_path_ready(ui->storage, directory) || app_io_usb_storage_blocked(ui->io)) {
+        ++probe->media_skipped;
+        ESP_LOGI(TAG, "SKIP recordings-back TF not ready");
+        return true;
+    }
+
+    const uint64_t before_files = completed_regions();
+    if (!click_label(probe, "录音文件")) return false;
+    ++probe->generation;
+    if (!wait_page(probe, &routes[FILES], before_files, true) || !lvgl_port_lock(1000)) return false;
+
+    const bool listing = current_page(probe) && ui->page_back == app_open_recorder &&
+        find_label(ui->content, directory, false);
+    lv_obj_t *viewport = listing ? recordings_viewport(ui->content) : NULL;
+    lv_obj_t *fixture = NULL;
+    char expected[sizeof(((aether_audio_player_status_t *)0)->path)] = {0};
+    for (uint32_t i = 0; viewport && i < lv_obj_get_child_count(viewport); ++i) {
+        lv_obj_t *row = lv_obj_get_child(viewport, (int32_t)i);
+        if (!lv_obj_check_type(row, &lv_button_class) || lv_obj_has_flag(row, LV_OBJ_FLAG_HIDDEN)) continue;
+        lv_obj_t *label = lv_obj_get_child(row, 1);
+        lv_obj_t *metadata = lv_obj_get_child(row, 2);
+        if (!label || !metadata || strcmp(lv_label_get_text(metadata), "文件夹") == 0) continue;
+        const char *name = lv_label_get_text(label);
+        const char *ext = strrchr(name, '.');
+        if (!ext || strcasecmp(ext, ".wav") != 0) continue;
+        const int size = snprintf(expected, sizeof(expected), "%s/%s", directory, name);
+        if (size > 0 && (size_t)size < sizeof(expected)) {
+            fixture = row;
+            break;
+        }
+    }
+
+    int32_t scroll_y = 0;
+    const uint64_t before_music = completed_regions();
+    if (fixture) {
+        lv_obj_scroll_to_view_recursive(fixture, LV_ANIM_OFF);
+        scroll_y = lv_obj_get_scroll_y(viewport);
+        lv_obj_send_event(fixture, LV_EVENT_CLICKED, NULL);
+    }
+    const bool opened_music = fixture && ui->page_generation == probe->generation + 1U;
+    if (opened_music) ++probe->generation;
+    lvgl_port_unlock();
+    if (!listing) return false;
+    if (!fixture) {
+        ++probe->media_skipped;
+        ESP_LOGI(TAG, "SKIP recordings-back no WAV fixture in loaded rows");
+        return recordings_header_back(probe, RECORDER);
+    }
+    if (!opened_music) return false;
+
+    aether_audio_player_status_t audio = {0};
+    bool played = false;
+    if (wait_page(probe, &routes[MUSIC], before_music, true)) {
+        const int64_t deadline = esp_timer_get_time() + PAGE_TIMEOUT_MS * INT64_C(1000);
+        do {
+            if (!ui->audio_player || aether_audio_player_get_status(ui->audio_player, &audio) != ESP_OK ||
+                audio.state == AETHER_AUDIO_ERROR) break;
+            played = audio.position_ms > 0 && audio.sample_rate && strcmp(audio.path, expected) == 0;
+            if (played) break;
+            pause_ms(POLL_MS);
+        } while (esp_timer_get_time() < deadline);
+    }
+
+    if (!recordings_header_back(probe, FILES) || !lvgl_port_lock(1000)) return false;
+    const bool restored_directory = current_page(probe) && ui->page_back == app_open_recorder &&
+        find_label(ui->content, directory, false);
+    viewport = restored_directory ? recordings_viewport(ui->content) : NULL;
+    const bool restored_scroll = viewport && lv_obj_get_scroll_y(viewport) == scroll_y;
+    lvgl_port_unlock();
+    const bool recorder = recordings_header_back(probe, RECORDER);
+    if (!played || !restored_directory || !restored_scroll || !recorder) {
+        ESP_LOGE(TAG, "FAIL recordings-back played=%u directory=%u scroll=%u recorder=%u error=%s",
+                 played, restored_directory, restored_scroll, recorder, esp_err_to_name(audio.last_error));
+        return false;
+    }
+    ++probe->media_passed;
+    ESP_LOGI(TAG, "PASS recordings-back WAV_position=%" PRIu32 "ms scroll=%" PRId32 " recorder=1",
+             audio.position_ms, scroll_y);
+    return true;
+}
+
 static lv_obj_t *first_catalog_row(lv_obj_t *object)
 {
     if (!object || lv_obj_has_flag(object, LV_OBJ_FLAG_HIDDEN)) return NULL;
@@ -505,6 +900,49 @@ static lv_obj_t *first_catalog_row(lv_obj_t *object)
         if (row) return row;
     }
     return NULL;
+}
+
+static bool test_gallery(probe_t *probe)
+{
+    if (!lvgl_port_lock(1000)) return false;
+    const bool same = current_page(probe);
+    lv_obj_t *row = same ? first_catalog_row(probe->ui->content) : NULL;
+    const uint64_t before = completed_regions();
+    if (row) lv_obj_send_event(row, LV_EVENT_CLICKED, NULL);
+    lvgl_port_unlock();
+    if (!same) return false;
+    if (!row) {
+        ++probe->media_skipped;
+        ESP_LOGI(TAG, "SKIP gallery-decode no indexed image");
+        return true;
+    }
+
+    const int64_t deadline = esp_timer_get_time() + PAGE_TIMEOUT_MS * INT64_C(1000);
+    do {
+        pause_ms(POLL_MS);
+        if (!lvgl_port_lock(100)) continue;
+        const bool current = current_page(probe);
+        lv_obj_t *content = probe->ui->content;
+        lv_obj_t *image = current ? find_class(content, &lv_image_class) : NULL;
+        const lv_image_dsc_t *decoded = image ? lv_image_get_src(image) : NULL;
+        const unsigned width = decoded ? decoded->header.w : 0, height = decoded ? decoded->header.h : 0;
+        const bool rejected = current && find_label(content, "无法打开图片", true);
+        lvgl_port_unlock();
+        if (!current) return false;
+        if (width && height && completed_regions() > before) {
+            if (!click_label(probe, "返回列表")) return false;
+            ++probe->media_passed;
+            ESP_LOGI(TAG, "PASS gallery-decode rendered_pixels=%ux%u list_return=1", width, height);
+            return true;
+        }
+        if (rejected) {
+            ++probe->media_skipped;
+            ESP_LOGI(TAG, "SKIP gallery-decode first indexed image rejected by decoder");
+            return click_label(probe, "返回列表");
+        }
+    } while (esp_timer_get_time() < deadline);
+    ESP_LOGE(TAG, "FAIL gallery-decode image open did not finish");
+    return false;
 }
 
 static bool test_video(probe_t *probe)
@@ -639,7 +1077,10 @@ static bool test_routes(probe_t *probe, unsigned round)
         const bool actions_ok = round != 1 ||
             ((i != NOTES || test_notes_keyboard(probe)) &&
              (i != MUSIC || test_music(probe)) &&
-             (i != VIDEO || test_video(probe)));
+             (i != VIDEO || test_video(probe)) &&
+             (i != RECORDER || test_recordings_back(probe)) &&
+             (i != SETTINGS || test_settings_top(probe, "drawer")) &&
+             (i != GALLERY || test_gallery(probe)));
         const bool back_ok = round != DRAWER_BACK_ROUND ||
             back_to_drawer(probe, route, i + 1 == probe->route_count);
         const bool use_drawer_home = round == DRAWER_BACK_ROUND && i + 1 == probe->route_count;
@@ -813,6 +1254,22 @@ static bool test_game_controls(probe_t *probe, const route_t *route)
     return verified;
 }
 
+static bool settings_back_for_selftest(probe_t *probe, const char *entry)
+{
+    const uint64_t before = completed_regions();
+    if (!lvgl_port_lock(1000)) return false;
+    app_ui_t *ui = probe->ui;
+    lv_obj_t *back = current_page(probe) && ui->page_back == app_open_settings ?
+        button_for(ui->screen, LV_SYMBOL_LEFT) : NULL;
+    if (back && lv_obj_get_parent(back) != ui->screen) back = NULL;
+    if (back) {
+        lv_obj_send_event(back, LV_EVENT_CLICKED, NULL);
+        ++probe->generation;
+    }
+    lvgl_port_unlock();
+    return back && wait_page(probe, &routes[SETTINGS], before, true) && test_settings_top(probe, entry);
+}
+
 static bool test_nested_routes(probe_t *probe, unsigned round)
 {
     for (unsigned i = 0; i < sizeof(nested_routes) / sizeof(nested_routes[0]); i++) {
@@ -831,6 +1288,10 @@ static bool test_nested_routes(probe_t *probe, unsigned round)
         }
         if (round == 1 && !test_game_controls(probe, &test->page)) {
             ESP_LOGE(TAG, "FAIL nested=%s input controls", test->page.id);
+            return false;
+        }
+        if (round == 1 && test->parent == SETTINGS && !settings_back_for_selftest(probe, test->page.id)) {
+            ESP_LOGE(TAG, "FAIL nested=%s settings back/scroll", test->page.id);
             return false;
         }
         if (!exit_to_desktop(probe, false)) {
@@ -868,9 +1329,19 @@ static void report_weather_probe(void)
              network.connected, weather.valid, weather.fetching, esp_err_to_name(weather.error));
 }
 
+static bool keep_music_preferences(void *context)
+{
+    (void)context;
+    return true;
+}
+
 static void test_task(void *context)
 {
     probe_t probe = {.ui = context, .route_count = app_home_app_count()};
+    /* This diagnostic image will be replaced after the run. Test playback may
+     * advance its in-memory bookmark without changing the user's NVS. */
+    if (probe.ui->audio_player)
+        aether_audio_player_set_persistence_guard(probe.ui->audio_player, keep_music_preferences, NULL);
     pause_ms(1500);
     const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     app_display_metrics_t start_display, end_display;
@@ -915,6 +1386,11 @@ static void test_task(void *context)
     pause_ms(2000);
     report_memory(0, "idle", "desktop-after-cycles", final_active);
     report_weather_probe();
+    if (ok) {
+        ok = idle_media(probe.ui);
+        if (ok) ok = selftest_microphone(probe.ui) && selftest_files(probe.ui);
+        else ESP_LOGE(TAG, "FAIL microphone idle gate not ready");
+    }
     app_display_metrics_get(&end_display);
     const uint32_t drops = end_display.dropped_regions - start_display.dropped_regions;
     const uint32_t timeouts = end_display.flush_wait_timeouts - start_display.flush_wait_timeouts;
@@ -933,6 +1409,6 @@ static void test_task(void *context)
 esp_err_t app_ui_selftest_start(app_ui_t *ui)
 {
     if (!ui) return ESP_ERR_INVALID_ARG;
-    return xTaskCreate(test_task, "ui_selftest", 6656, ui, 2, NULL) == pdPASS ?
+    return xTaskCreate(test_task, "ui_selftest", 8192, ui, 2, NULL) == pdPASS ?
         ESP_OK : ESP_ERR_NO_MEM;
 }

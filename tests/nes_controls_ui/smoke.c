@@ -43,8 +43,17 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
 void app_ui_set_timer(app_ui_t *ui,lv_timer_cb_t cb,uint32_t period){ui->timer=lv_timer_create(cb,period,ui);}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p){const uint16_t *v=(const uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*v++;}lv_display_flush_ready(d);}
 static void advance(unsigned ms){for(unsigned i=0;i<ms;++i){++now;lv_tick_inc(1);lv_timer_handler();}}
+static lv_obj_t *find_dropdown(lv_obj_t *obj, unsigned index)
+{
+    if(lv_obj_check_type(obj,&lv_dropdown_class)&&(uintptr_t)lv_obj_get_user_data(obj)==index)return obj;
+    for(unsigned i=0;i<lv_obj_get_child_count(obj);++i){
+        lv_obj_t *found=find_dropdown(lv_obj_get_child(obj,i),index);
+        if(found)return found;
+    }
+    return NULL;
+}
 static lv_obj_t *dropdown(app_ui_t *ui,unsigned action,unsigned slot)
-{for(unsigned i=0;i<lv_obj_get_child_count(ui->content);++i){lv_obj_t *o=lv_obj_get_child(ui->content,i);if(lv_obj_check_type(o,&lv_dropdown_class)&&(uintptr_t)lv_obj_get_user_data(o)==action*2+slot)return o;}return NULL;}
+{return find_dropdown(ui->content,action*2+slot);}
 static lv_obj_t *find(lv_obj_t *o,const char *text)
 {if(lv_obj_check_type(o,&lv_label_class)&&strstr(lv_label_get_text(o),text))return o;for(unsigned i=0;i<lv_obj_get_child_count(o);++i){lv_obj_t *r=find(lv_obj_get_child(o,i),text);if(r)return r;}return NULL;}
 static void choose(app_ui_t *ui,unsigned action,unsigned slot,uint8_t usage)
@@ -56,6 +65,7 @@ int main(int argc,char **argv)
 {
  assert(argc==2);setbuf(stdout,NULL);lv_init();lv_display_t *d=lv_display_create(480,480);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);lv_display_set_buffers(d,draw_buffer,NULL,sizeof(draw_buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
  assert(app_nes_controls_init()==ESP_OK);app_nes_controls_set_persistence_guard(guard,NULL);app_ui_t ui={0};app_open_nes_controls(&ui);advance(100);
+ assert(find(ui.screen,"默认 Esc 退出游戏")&&find(ui.screen,"长按用户键 2 秒回桌面")&&!find(ui.screen,"短按用户键"));
  for(unsigned a=0;a<APP_NES_CONTROL_COUNT;++a)for(unsigned k=0;k<2;++k){lv_obj_t *o=dropdown(&ui,a,k);assert(o&&lv_dropdown_get_option_count(o)==app_nes_controls_key_count()&&lv_dropdown_get_selected(o)==app_nes_controls_key_index(defaults[a][k]));}
  snapshot(d,argv[1],"nes-keymap-defaults");
  choose(&ui,APP_NES_CONTROL_A,0,0x0a);assert(mapped(0x0a)==16&&mapped(0x1d)==0&&writes==0);
@@ -68,7 +78,8 @@ int main(int argc,char **argv)
  busy=false;assert(service_once()==portMAX_DELAY&&writes==1);advance(300);assert(find(ui.screen,"已保存"));
  puts("PASS actual11-action/22-selector LVGL page applies HID keys, rejects/reverts conflicts, supports unbind/alternate/exit binding and displays deferred/saved NVS state");
  lv_obj_t *reset=lv_obj_get_parent(find(ui.screen,"恢复默认"));lv_obj_send_event(reset,LV_EVENT_CLICKED,NULL);assert(mapped(0x1d)==16&&mapped(0x1b)==32&&mapped(0x29)==1024);advance(300);assert(service_once()==portMAX_DELAY);s.view.ready=false;assert(app_nes_controls_init()==ESP_OK);assert(mapped(0x1d)==16&&mapped(0x45)==0);
- lv_obj_scroll_to_y(ui.content,690,LV_ANIM_OFF);advance(300);snapshot(d,argv[1],"nes-keymap-exit-save");
+ lv_obj_scroll_to_view_recursive(dropdown(&ui,APP_NES_CONTROL_EXIT,0),LV_ANIM_OFF);
+ advance(300);snapshot(d,argv[1],"nes-keymap-exit-save");
  for(unsigned i=0;i<100;++i){app_open_nes_controls(&ui);advance(1);assert(dropdown(&ui,10,1));}
  if(ui.timer)lv_timer_delete(ui.timer);
  if(ui.page_cleanup)ui.page_cleanup(&ui);
