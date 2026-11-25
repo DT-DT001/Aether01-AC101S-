@@ -66,6 +66,7 @@ APP(music,5) APP(reader,6) APP(video,7) APP(files,8)
 APP(game,9) APP(nes,10) APP(recorder,11) APP(settings,12)
 APP(motion,13) APP(barometer,14) APP(displacement,15) APP(pc_remote,16)
 APP(obs_switcher,17) APP(intercom,18) APP(gps,19) APP(camera,20) APP(gallery,21)
+APP(calculator,22) APP(theme,23)
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p)
 {const uint16_t *s=(const uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x){assert(x>=0&&x<480&&y>=0&&y<480);framebuffer[y*480+x]=*s++;}lv_display_flush_ready(d);}
 static void read_input(lv_indev_t *in,lv_indev_data_t *data)
@@ -228,7 +229,7 @@ int main(int argc,char **argv)
     lv_obj_scroll_to_y(ui.content,0,LV_ANIM_OFF);
     puts("PASS Clock Back picks the Clock tile and keeps offset zero across async retirement; keyboard focus still scrolls the drawer");
     puts("PASS pointer double tap, short, sideways, sideways-dominant diagonal and down strokes stay on the desktop; one up stroke opens the drawer without also opening Clock");
-    assert(app_home_app_count()==21&&lv_obj_get_child_count(ui.content)==21);
+    assert(app_home_app_count()==23&&lv_obj_get_child_count(ui.content)==23);
     for(unsigned i=0;i<app_home_app_count();++i){
         lv_obj_t *tile=lv_obj_get_child(ui.content,i),*icon=lv_obj_get_child(tile,0);
         assert(lv_obj_get_width(tile)==102&&lv_obj_get_width(icon)==48&&lv_obj_get_height(icon)==48);
@@ -238,6 +239,7 @@ int main(int argc,char **argv)
     assert(!find(ui.content,"无线网络")&&!find(ui.content,"蓝牙耳机")&&!find(ui.content,"设备状态"));
     assert(find(ui.content,"无线对讲")&&find(ui.content,"定位"));
     assert(find(ui.content,"USB 摄像头")&&find(ui.content,"图库"));
+    assert(find(ui.content,"姿态")&&find(ui.content,"计算器")&&find(ui.content,"主题"));
     capture(display,argv[1],"drawer-top");
     lv_obj_scroll_to_y(ui.content,1000,LV_ANIM_OFF);lv_obj_update_layout(ui.screen);
     assert(lv_obj_get_scroll_y(ui.content)>0);capture(display,argv[1],"drawer-bottom");
@@ -248,13 +250,15 @@ int main(int argc,char **argv)
     for(unsigned i=17;i<app_home_app_count();++i) {
         lv_obj_t *tile=lv_obj_get_child(ui.content,i),*icon=lv_obj_get_child(tile,0);
         if(i==18) assert(lv_obj_get_child_count(icon)==6);
+        lv_obj_scroll_to_view(tile, LV_ANIM_OFF);
+        lv_obj_update_layout(ui.screen);
         lv_obj_get_coords(icon,&area);opened=0;
         tap((area.x1+area.x2)/2,(area.y1+area.y2)/2);
         assert(opened==i+1);
     }
     const int32_t scroll=lv_obj_get_scroll_y(ui.content);
     assert(scroll>0);
-    return_from_focused_app(&ui,keyboard_group,20,scroll);
+    return_from_focused_app(&ui,keyboard_group,22,scroll);
     home_label=find(ui.screen,LV_SYMBOL_HOME);
     assert(home_label);
     lv_obj_t *home_button=lv_obj_get_parent(home_label);
@@ -264,13 +268,13 @@ int main(int argc,char **argv)
     lv_obj_t *drawer=ui.screen;
     tap((area.x1+area.x2)/2,(area.y1+area.y2)/2);
     assert(ui.screen!=drawer&&ui.home_time&&!ui.content&&!ui.user_key_exit_armed);
-    assert(opened==21&&!find(ui.screen,LV_SYMBOL_HOME)&&!lv_group_get_focused(keyboard_group));
+    assert(opened==23&&!find(ui.screen,LV_SYMBOL_HOME)&&!lv_group_get_focused(keyboard_group));
     swipe(240,380,240,141);
-    assert(ui.content&&ui.user_key_exit_armed&&!ui.home_time&&opened==21);
+    assert(ui.content&&ui.user_key_exit_armed&&!ui.home_time&&opened==23);
     assert(lv_obj_get_scroll_y(ui.content)==0&&
            lv_group_get_focused(keyboard_group)==lv_obj_get_child(ui.content,0));
     return_home(&ui);
-    puts("PASS Gallery Back preserves scroll and focus; drawer Home taps to desktop; next upward swipe opens a fresh drawer at Clock without activating it");
+    puts("PASS Theme Back preserves scroll and focus; drawer Home taps to desktop; next upward swipe opens a fresh drawer at Clock without activating it");
     opened=0;
     for(unsigned run=0;run<20;++run) {
         int32_t x=70+(int32_t)(run%4)*110;
@@ -300,5 +304,5 @@ int main(int argc,char **argv)
     tools.battery_error=ESP_FAIL;advance(1100);assert(find(ui.screen,"--")&&!find(ui.screen,"12"));
     lv_timer_delete(ui.timer);lv_obj_delete(ui.screen);lv_group_delete(keyboard_group);
     lv_indev_delete(input);lv_display_delete(display);lv_deinit();
-    puts("PASS production desktop colors and 21 scrollable drawer routes; Wi-Fi, Bluetooth and device status live in Settings");
+    puts("PASS production desktop colors and 23 scrollable drawer routes; Wi-Fi, Bluetooth and device status live in Settings");
 }

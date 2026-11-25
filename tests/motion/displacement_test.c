@@ -392,14 +392,26 @@ static void faults(void)
     uint32_t stamp = 0;
     const float level[3] = {0, 0, GRAVITY};
     const float motion[3] = {1, 0, GRAVITY};
+    app_displacement_estimator_reset(&est);
+    for (unsigned i = 0; i < 25; ++i)
+        assert(feed(&est, &stamp, 10, level, zero_gyro) == APP_DISPLACEMENT_WAITING_STILL);
+    assert(est.still_samples == 25);
+    assert(feed(&est, &stamp, 90, level, zero_gyro) == APP_DISPLACEMENT_WAITING_STILL);
+    assert(est.still_samples == 1 && est.result.fault == APP_DISPLACEMENT_FAULT_NONE);
+
     ready(&est, &stamp, level, zero_gyro);
     assert(feed(&est, &stamp, 90, level, zero_gyro) == APP_DISPLACEMENT_INVALID);
-    assert(est.result.fault == APP_DISPLACEMENT_FAULT_GAP);
+    assert(est.result.fault == APP_DISPLACEMENT_FAULT_GAP && est.result.max_gap_ms == 90);
+    assert(est.result.samples == 0 && est.result.distance_m == 0.0f);
     ready(&est, &stamp, level, zero_gyro);
     for (unsigned i = 0; i < 5; ++i) feed(&est, &stamp, 10, motion, zero_gyro);
     assert(est.phase == APP_DISPLACEMENT_MOVING);
-    assert(feed(&est, &stamp, 90, motion, zero_gyro) == APP_DISPLACEMENT_INVALID);
-    assert(est.result.fault == APP_DISPLACEMENT_FAULT_GAP);
+    assert(feed(&est, &stamp, 80, motion, zero_gyro) == APP_DISPLACEMENT_MOVING);
+    assert(est.result.low_confidence && est.result.max_gap_ms == 80);
+    const app_displacement_result_t before_gap = est.result;
+    assert(feed(&est, &stamp, 81, motion, zero_gyro) == APP_DISPLACEMENT_INVALID);
+    assert(est.result.fault == APP_DISPLACEMENT_FAULT_GAP && est.result.max_gap_ms == 81);
+    assert(est.result.samples == before_gap.samples && est.result.distance_m == before_gap.distance_m);
 
     ready(&est, &stamp, level, zero_gyro);
     const float saturation[3] = {0, 0, 39.1f};
@@ -439,7 +451,7 @@ static void faults(void)
         assert(feed(&est, &stamp, 10, sustained_motion, zero_gyro) == APP_DISPLACEMENT_SETTLING);
     assert(feed(&est, &stamp, 10, sustained_motion, zero_gyro) == APP_DISPLACEMENT_INVALID);
     assert(est.result.fault == APP_DISPLACEMENT_FAULT_MOTION_TIMEOUT);
-    puts("PASS displacement dropout, saturation and sampling quality; failed first endpoint discards the raw estimate");
+    puts("PASS displacement dropout diagnostics, 80ms moving limit, saturation and sampling quality; failed first endpoint discards the raw estimate");
 }
 
 static void correct_constant_gyro_drift_on_finish(void)
@@ -473,10 +485,38 @@ static void correct_constant_gyro_drift_on_finish(void)
     puts("PASS Finish reuses the quiet window and removes large gyro-driven tilt drift from signed translation");
 }
 
+static void long_coast_waits_for_braking(void)
+{
+    app_displacement_estimator_t est;
+    uint32_t stamp = 0;
+    const float rest[3] = {0, 0, 8.89f};
+    const float acceleration[3] = {2.0f, 0, rest[2]};
+    const float braking[3] = {-2.0f, 0, rest[2]};
+    ready(&est, &stamp, rest, zero_gyro);
+    /* Reach 1 m/s in 0.5 s, coast for 1.9 s, then brake for 0.5 s. */
+    for (unsigned i = 0; i < 50; ++i) feed(&est, &stamp, 10, acceleration, zero_gyro);
+    for (unsigned i = 0; i < 190; ++i) {
+        assert(feed(&est, &stamp, 10, rest, zero_gyro) == APP_DISPLACEMENT_MOVING);
+        const app_displacement_result_t visible = app_displacement_estimator_preview(&est);
+        assert(!visible.stationary && !visible.preview_held);
+    }
+    assert(fabsf(est.result.xyz_m[0] - 2.15f) < 0.025f);
+    for (unsigned i = 0; i < 50; ++i)
+        assert(feed(&est, &stamp, 10, braking, zero_gyro) == APP_DISPLACEMENT_MOVING);
+    for (unsigned i = 0; i < 80 && !est.result.stationary; ++i)
+        assert(feed(&est, &stamp, 10, rest, zero_gyro) == APP_DISPLACEMENT_MOVING);
+    assert(est.result.stationary && est.result.endpoint_corrected);
+    assert(app_displacement_estimator_finish(&est) && est.phase == APP_DISPLACEMENT_COMPLETE);
+    assert(fabsf(est.result.xyz_m[0] - 2.40f) < 0.025f);
+    assert(fabsf(est.result.xyz_m[1]) < 0.001f && fabsf(est.result.xyz_m[2]) < 0.001f);
+    printf("PASS 1.9s coast keeps updating to the actual stop, 2.400m expected, %.5fm estimated\n", est.result.distance_m);
+}
+
 int main(void)
 {
     stationary();
     translation();
+    long_coast_waits_for_braking();
     hold_and_resume();
     late_finish();
     rotate(false);

@@ -198,6 +198,15 @@ void app_touch_set_enabled(lv_indev_t *indev, bool enabled)
     lv_indev_enable(indev, enabled);
 }
 
+bool app_touch_set_shutdown_paused(bool paused)
+{
+    if (!atomic_load(&s_touch_registered)) return false;
+    const bool was_enabled = atomic_load(&s_touch.enabled);
+    const bool enabled = !paused;
+    if (was_enabled != enabled) app_touch_set_enabled(s_touch.indev, enabled);
+    return was_enabled;
+}
+
 void app_touch_consume_wake_gesture(void)
 {
     if (atomic_load(&s_touch_registered) && atomic_load(&s_touch.enabled))

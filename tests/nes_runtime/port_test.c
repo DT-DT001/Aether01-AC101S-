@@ -130,6 +130,7 @@ static void test_audio_and_measurement(void)
         clock_us = (int64_t)(i + 1) * 1000000 / 60;
         if (!(i % 3)) ++handle.frame_number;
         osd_emulated_frame(!(i % 3));
+        osd_output_audio();
         osd_frame_end();
     }
     assert(generated == 48000 && written_bytes == 48000 * 4);
@@ -139,28 +140,32 @@ static void test_audio_and_measurement(void)
     reset();
     handle.audio_started = false;
     osd_emulated_frame(0);
+    osd_output_audio();
     assert(generated == 800 && !write_calls); /* APU progresses without codec. */
     reset();
     write_failure = true;
     osd_emulated_frame(1);
+    osd_output_audio();
     osd_emulated_frame(0);
+    osd_output_audio();
     assert(generated == 1600 && write_calls == 1 && stop_calls == 1);
     assert(handle.audio_errors == 1 && !handle.audio_started);
     atomic_store(&handle.paused, true);
-    write_audio_frame();
+    osd_output_audio();
     assert(generated == 1600); /* Pausing freezes APU time. */
     atomic_store(&handle.paused, false);
     atomic_store(&handle.stop_requested, true);
-    write_audio_frame();
+    osd_output_audio();
     assert(generated == 1600); /* Stop never fills another I2S fragment. */
     reset();
     write_failure = true;
     audio_stop_error = ESP_ERR_TIMEOUT;
     osd_emulated_frame(1);
+    osd_output_audio();
     assert(generated == 400 && write_calls == 1 && stop_calls == 1);
     assert(handle.audio_started && handle.audio_errors == 1 &&
            handle.last_error == ESP_ERR_TIMEOUT && atomic_load(&handle.stop_requested));
-    write_audio_frame();
+    osd_output_audio();
     assert(generated == 400 && write_calls == 1 && stop_calls == 1);
 }
 static void test_stage_measurement(void)
@@ -171,7 +176,7 @@ static void test_stage_measurement(void)
     memset(bitmap->data,0,224U*(size_t)bitmap->pitch);
     for(unsigned i=0;i<50;++i) {
         osd_frame_begin(); clock_us+=12000;
-        osd_emulated_frame(1); driver_blit(bitmap,0,NULL); osd_getinput();
+        osd_emulated_frame(1); driver_blit(bitmap,0,NULL); osd_output_audio(); osd_getinput();
         clock_us=(int64_t)(i+1)*20000-1000; osd_frame_end();
     }
     assert(handle.emulation_fps_x100==5000 && handle.render_fps_x100==5000);

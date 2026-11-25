@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 typedef void *esp_lcd_panel_io_handle_t;
 typedef void *esp_lcd_panel_handle_t;
@@ -11,3 +12,5 @@ typedef struct {
 } esp_lcd_panel_io_callbacks_t;
 esp_err_t esp_lcd_panel_io_register_event_callbacks(esp_lcd_panel_io_handle_t,
     const esp_lcd_panel_io_callbacks_t *, void *);
+esp_err_t esp_lcd_panel_io_tx_param(esp_lcd_panel_io_handle_t,int,const void *,size_t);
+esp_err_t esp_lcd_panel_io_tx_color(esp_lcd_panel_io_handle_t,int,const void *,size_t);

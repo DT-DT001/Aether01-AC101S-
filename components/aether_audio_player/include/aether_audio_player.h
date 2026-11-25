@@ -90,8 +90,8 @@ esp_err_t aether_audio_player_stop(aether_audio_player_handle_t handle);
 esp_err_t aether_audio_player_release_session(aether_audio_player_handle_t handle);
 /** All controls below only publish commands, and never perform codec/file I/O. */
 esp_err_t aether_audio_player_set_paused(aether_audio_player_handle_t handle, bool paused);
-/** Keep already-playing music running. Latch screen power separately from
- * the user's pause so a locked screen cannot start an idle/starting player. */
+/** Continue established music through seeks and track transitions. Recording
+ * auditions and fresh starts are held until wake, independently of user pause. */
 void aether_audio_player_set_screen_suspended(aether_audio_player_handle_t handle, bool suspended);
 esp_err_t aether_audio_player_seek(aether_audio_player_handle_t handle, uint32_t position_ms);
 esp_err_t aether_audio_player_set_volume(aether_audio_player_handle_t handle, int volume);

@@ -1,4 +1,5 @@
 #include "app_display_sync.h"
+#include "app_display_metrics.h"
 #include "co5300_display.h"
 #include "esp_timer.h"
 #include <assert.h>
@@ -31,6 +32,18 @@ BaseType_t xTaskGetCoreID(void *task) { assert(!polling && !task); return mock_a
 #define FULL_TRANSFERS (480 / TEST_BUFFER_LINES)
 static uint16_t buffer1[480*TEST_BUFFER_LINES],buffer2[480*TEST_BUFFER_LINES];
 int64_t esp_timer_get_time(void) { return now_us; }
+void app_display_metrics_nes_reset(void) {}
+void app_display_metrics_nes_arm(const lv_area_t *area, int64_t edge_us,
+                                 uint32_t period, uint16_t panel_rows)
+{ assert(!area&&!edge_us&&!period&&!panel_rows); }
+esp_err_t app_display_metrics_nes_write(lv_display_t *display, const lv_area_t *area,
+    const uint16_t *pixels, app_display_nes_wait_te_fn wait_te,
+    app_display_nes_strip_fn write_strip, void *ctx)
+{
+    (void)display; (void)area; (void)pixels; (void)wait_te; (void)write_strip; (void)ctx;
+    assert(!"normal refresh must not access the NES DMA writer");
+    return ESP_FAIL;
+}
 void test_display_log(const char *tag, const char *format, ...)
 {
     if (!strcmp(tag, "display_sync")) {

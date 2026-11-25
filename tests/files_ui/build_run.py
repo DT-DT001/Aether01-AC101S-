@@ -1,8 +1,10 @@
 """Own output directory; cached reader LVGL/font objects are read only."""
 from pathlib import Path
+import os
 import shutil,struct,subprocess,sys,zlib
 root=Path(__file__).resolve().parents[2];test=root/'tests/files_ui';out=root/'build/host_files_ui';out.mkdir(parents=True,exist_ok=True)
-lvgl=root/'managed_components/lvgl__lvgl';cached=root/'build/host_reader_ui'
+lvgl=root/'managed_components/lvgl__lvgl'
+cached=Path(os.environ.get('AETHER_LVGL_CACHE', root/'build/host_reader_ui'))
 objects=[p for p in sorted(cached.glob('managed_components_lvgl__lvgl_src_*.c.o'))
          if not p.name.endswith('lv_font_montserrat_20.c.o')]
 objects += [cached/'main_assets_font_16.c.o',cached/'main_assets_font_24.c.o']
@@ -17,6 +19,7 @@ shutil.copyfile(root/'main/ui/app_text_input.c', keyboard)
 ui = (root/'main/ui/app_ui.c').read_text(encoding='utf-8')
 chrome = out/'page_chrome.c'
 chrome.write_text('#include "app_ui_internal.h"\n#include "app_battery.h"\n#include "app_screen.h"\n'
+    '#define app_theme_background(color) (color)\n'
     'static void back_event_cb(lv_event_t *event) {\n'
     '    app_ui_t *ui = lv_event_get_user_data(event);\n'
     '    if (ui->page_back) ui->page_back(ui);\n'

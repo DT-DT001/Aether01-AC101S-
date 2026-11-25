@@ -59,6 +59,7 @@ extern void osd_setsound(void (*playfunc)(void *buffer, int size));
 /* Advance APU/output once per emulated frame, including undisplayed frames.
  * The platform may yield/service input while no emulation tick is pending. */
 extern void osd_emulated_frame(int drawn);
+extern void osd_output_audio(void);
 extern void osd_frame_begin(void);
 extern void osd_frame_end(void);
 extern void osd_waitframe(void);

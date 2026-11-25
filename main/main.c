@@ -44,12 +44,14 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_flash.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "esp_lvgl_port.h"
 #include "esp_psram.h"
 #include "lvgl.h"
 #include "nvs_flash.h"
+#include "app_theme.h"
 #include "sdkconfig.h"
 #ifdef AETHER_CODEC_SELFTEST
 #include "aether_codec_check.h"
@@ -143,9 +145,15 @@ static bool media_flash_busy(void *context)
     return app_media_control_flash_busy(s_audio_player, s_video_player, s_nes);
 }
 
+static bool standby_audio_busy(void *player)
+{
+    return app_media_control_flash_busy(player, NULL, NULL);
+}
+
 typedef struct {
     bool active, storage_gate, lease_gate, wifi_enabled, bluetooth_audio_requested, bluetooth_hid_requested, clock_pending;
     bool ui_resume_requested;
+    bool peripherals_parked, restore_render, restore_touch, restore_touch_input;
     uint32_t clock_revision;
 } shutdown_context_t;
 static shutdown_context_t s_shutdown;
@@ -162,6 +170,56 @@ static uint32_t shutdown_remaining(int64_t deadline) {
     int64_t left=deadline-esp_timer_get_time();
     return left>0 ? (uint32_t)(left/1000) : 0;
 }
+
+static void park_shutdown_peripherals(shutdown_context_t *state, uint32_t timeout_ms)
+{
+    /* Leave time for the panel's 120 ms sleep-in delay and for the final
+     * PMIC command even if the GUI or touch controller is slow to respond. */
+    if (timeout_ms < 280 || !lvgl_port_lock(30)) {
+        ESP_LOGW(TAG, "peripheral park skipped; PMIC power-off remains available");
+        return;
+    }
+    state->peripherals_parked = true;
+    state->restore_render = s_board.display_ready && !s_power.render_paused;
+    state->restore_touch = s_board.touch_ready && !s_board.touch_sleeping;
+    if (state->restore_render) {
+        lv_timer_t *refresh = lv_display_get_refr_timer(s_power.display);
+        if (refresh) lv_timer_pause(refresh);
+        lv_display_enable_invalidation(s_power.display, false);
+    }
+    state->restore_touch_input = app_touch_set_shutdown_paused(true);
+    const esp_err_t error = aether_board_park_peripherals(&s_board);
+    lvgl_port_unlock();
+    if (error != ESP_OK) ESP_LOGW(TAG, "peripheral park incomplete: %s; requesting PMIC power-off", esp_err_to_name(error));
+    else ESP_LOGI(TAG, "shutdown peripherals parked: PA, display and touch");
+}
+
+static esp_err_t restore_shutdown_peripherals(shutdown_context_t *state)
+{
+    if (!state->peripherals_parked) return ESP_OK;
+    if (!lvgl_port_lock(30)) return ESP_ERR_TIMEOUT;
+
+    esp_err_t error = ESP_OK;
+    if (state->restore_touch) error = aether_board_set_touch_sleep(&s_board, false);
+    if (state->restore_render) {
+        const esp_err_t panel_error = aether_board_set_display_sleep(&s_board, false);
+        if (error == ESP_OK) error = panel_error;
+    }
+    if (error == ESP_OK) {
+        if (state->restore_render) {
+            lv_display_enable_invalidation(s_power.display, true);
+            lv_timer_t *refresh = lv_display_get_refr_timer(s_power.display);
+            if (refresh) { lv_timer_resume(refresh); lv_timer_ready(refresh); }
+            lv_obj_invalidate(lv_display_get_screen_active(s_power.display));
+            lv_display_trigger_activity(s_power.display);
+        }
+        if (state->restore_touch_input) (void)app_touch_set_shutdown_paused(false);
+        state->peripherals_parked = false;
+    }
+    lvgl_port_unlock();
+    return error;
+}
+
 static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage,uint32_t timeout_ms) {
     shutdown_context_t *state=context;
     const int64_t deadline=esp_timer_get_time()+(int64_t)timeout_ms*1000;
@@ -246,9 +304,14 @@ static esp_err_t prepare_shutdown(void *context,app_power_shutdown_stage_t stage
         }
         return ESP_OK;
     }
+    if (stage == APP_POWER_SHUTDOWN_POWER_OFF) {
+        park_shutdown_peripherals(state, timeout_ms);
+        return ESP_OK;
+    }
     if(stage==APP_POWER_SHUTDOWN_CANCEL) {
         if(!state->active) return ESP_OK;
-        esp_err_t error=ESP_OK;
+        esp_err_t error=restore_shutdown_peripherals(state);
+        if(error!=ESP_OK) return error;
         if(state->storage_gate) {
             error=aether_storage_cancel_shutdown(s_storage,shutdown_remaining(deadline));
             if(error==ESP_OK) state->storage_gate=false;
@@ -343,7 +406,11 @@ static esp_err_t init_nvs(void)
     return err;
 }
 
-enum { BOOT_LOGO_WIDTH = 432, BOOT_LOGO_HEIGHT = 203, BOOT_LOGO_MIN_VISIBLE_MS = 2500 };
+enum {
+    BOOT_LOGO_WIDTH = 432, BOOT_LOGO_HEIGHT = 203,
+    BOOT_LOGO_MIN_VISIBLE_MS = 2500, BOOT_LOGO_ANIMATION_MS = 680,
+    BOOT_LOGO_START_SCALE = 232,
+};
 extern const uint8_t boot_logo_data[] asm("_binary_boot_logo_rgb565_start");
 static const lv_image_dsc_t boot_logo = {
     .header = {
@@ -385,6 +452,11 @@ static esp_err_t complete_boot_refresh(lv_display_t *display)
     return ESP_OK;
 }
 
+static void boot_logo_scale(void *object, int32_t scale)
+{
+    lv_image_set_scale(object, (uint32_t)scale);
+}
+
 static esp_err_t present_boot_frame(lv_display_t *display, int64_t *logo_on_us)
 {
     lv_obj_t *screen = lv_display_get_screen_active(display);
@@ -393,13 +465,24 @@ static esp_err_t present_boot_frame(lv_display_t *display, int64_t *logo_on_us)
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_t *logo = lv_image_create(screen);
     lv_image_set_src(logo, &boot_logo);
+    lv_image_set_scale(logo, BOOT_LOGO_START_SCALE);
     lv_obj_center(logo);
 
     /* The initialized panel is blank until its entire first frame is ready. */
     esp_err_t error = complete_boot_refresh(display);
     if (error == ESP_OK) {
         error = esp_lcd_panel_disp_on_off(s_board.display, true);
-        if (error == ESP_OK) *logo_on_us = esp_timer_get_time();
+        if (error == ESP_OK) {
+            *logo_on_us = esp_timer_get_time();
+            lv_anim_t animation;
+            lv_anim_init(&animation);
+            lv_anim_set_var(&animation, logo);
+            lv_anim_set_exec_cb(&animation, boot_logo_scale);
+            lv_anim_set_values(&animation, BOOT_LOGO_START_SCALE, LV_SCALE_NONE);
+            lv_anim_set_duration(&animation, BOOT_LOGO_ANIMATION_MS);
+            lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
+            lv_anim_start(&animation);
+        }
     }
     return error;
 }
@@ -480,6 +563,7 @@ static void wait_for_logo_interval(int64_t logo_on_us)
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "reset reason=%d", (int)esp_reset_reason());
     const int64_t app_start_us = esp_timer_get_time();
     const esp_err_t display_err = aether_board_init_display(&s_board);
     if (display_err != ESP_OK) {
@@ -583,6 +667,7 @@ void app_main(void)
     app_audio_system_set_media_control(remote_media_control, NULL);
     ESP_ERROR_CHECK(aether_usb_msc_init(s_storage));
     aether_usb_msc_set_vbus_query(usb_vbus_present,&s_board);
+    app_theme_init();
 
     /* Services above initialize while the logo is already lit. Only wait for
      * the remainder before enabling automatic dimming or blanking the panel. */
@@ -594,6 +679,7 @@ void app_main(void)
     app_pc_remote_init(s_bluetooth, &s_power, s_board.imu_ready, media_flash_busy);
     app_displacement_init(&s_power, s_board.imu_ready);
     app_power_set_persistence_guard(&s_power, media_flash_busy, NULL);
+    app_power_set_standby_audio_guard(&s_power, standby_audio_busy, s_audio_player);
     const esp_err_t uac_error = aether_usb_audio_init();
     if (uac_error == ESP_OK) {
         const esp_err_t route_error = app_audio_system_set_usb_audio(true);

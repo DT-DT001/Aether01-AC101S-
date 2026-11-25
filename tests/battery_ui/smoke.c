@@ -1,4 +1,5 @@
 #include "app_ui_internal.h"
+#include "app_screen.h"
 #include "app_battery.h"
 #include <assert.h>
 #include <stdio.h>
@@ -89,8 +90,11 @@ int main(int argc,char **argv)
     lv_obj_t *bolt=find(ui.screen,LV_SYMBOL_CHARGE);
     assert(bolt&&!lv_obj_has_flag(bolt,LV_OBJ_FLAG_HIDDEN));
     lv_obj_t *badge=lv_obj_get_parent(charge),*title=find(ui.screen,"反应力小游戏");
-    lv_area_t b,t;lv_obj_get_coords(badge,&b);lv_obj_get_coords(title,&t);
-    assert(b.x1==422&&b.x2==461&&t.x2<b.x1);
+    lv_area_t b,t,outer;
+    lv_obj_get_coords(badge,&b);lv_obj_get_coords(title,&t);
+    lv_obj_get_coords(lv_obj_get_parent(badge), &outer);
+    assert(outer.x2 == 479 - APP_HEADER_SIDE_INSET && b.x2 < outer.x2 &&
+           lv_obj_get_width(badge) == 40 && t.x2 < b.x1);
     assert(lv_obj_get_width(lv_obj_get_child(ui.screen,0))==48);capture(display,argv[1],"battery-charging");
     fresh();advance(200);unsigned before=flushes;advance(2000);assert(flushes==before);
 

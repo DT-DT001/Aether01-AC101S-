@@ -1,6 +1,7 @@
 #include "app_ui_internal.h"
 #include "app_audio_system.h"
 #include "app_display_metrics.h"
+#include "app_display_sync.h"
 #include "freertos/semphr.h"
 #include <assert.h>
 #include <stdio.h>
@@ -25,6 +26,19 @@ static int64_t now_us;
 static const char *output;
 static unsigned video_starts,video_stops,video_releases,nes_starts,nes_stops,nes_releases;
 static unsigned media_release_posts,user_exit_arms;
+static bool nes_viewport_enabled;
+bool app_display_sync_present_nes(lv_obj_t *image, const uint16_t *pixels,
+    uint16_t width, uint16_t height)
+{
+    assert(image&&pixels&&width==384&&height==336&&nes_viewport_enabled);
+    return false; /* Exercise the software-composed fallback. */
+}
+void app_display_sync_set_nes_viewport(lv_display_t *display,const lv_area_t *area)
+{
+    assert(display==lv_display_get_default());
+    nes_viewport_enabled=area!=NULL;
+    if(area) assert(area->x1==48&&area->y1==96&&area->x2==431&&area->y2==431);
+}
 esp_err_t app_io_release_media(app_io_handle_t io){assert(io);++media_release_posts;return ESP_OK;}
 void app_ui_set_user_key_exit(app_ui_t *ui,bool armed){assert(ui);if(armed)++user_exit_arms;}
 static unsigned seek_attempts,seek_resets,seek_busy,volume_updates,volume_commits;
@@ -225,9 +239,9 @@ static void test_errors(app_ui_t *ui)
 }
 static void test_nes(app_ui_t *ui)
 {
-    app_open_nes_path(ui,"/sdcard/ROMs/全屏测试.nes");deliver(ui,ESP_OK);assert(ui->media_active&&!touch_enabled&&user_exit_arms);fixture(384,336,true);nes_callback(pixels,384,336,1,nes_context);nes.emulation_fps_x100=5980;nes.render_fps_x100=3000;advance(220);
+    app_open_nes_path(ui,"/sdcard/ROMs/全屏测试.nes");deliver(ui,ESP_OK);assert(ui->media_active&&!touch_enabled&&user_exit_arms&&nes_viewport_enabled);fixture(384,336,true);nes_callback(pixels,384,336,1,nes_context);nes.emulation_fps_x100=5980;nes.render_fps_x100=3000;advance(220);
     lv_obj_t *image=ui->app_obj[0];lv_area_t viewport=area(image);
-    assert(viewport.x1==48&&viewport.y1==72&&viewport.x2==431&&viewport.y2==407);
+    assert(viewport.x1==48&&viewport.y1==96&&viewport.x2==431&&viewport.y2==431);
     assert(lv_image_get_src_width(image)==384&&lv_image_get_src_height(image)==336);
     assert(lv_image_get_inner_align(image)==LV_IMAGE_ALIGN_CENTER&&!lv_image_get_antialias(image));
     capture(ui,"nes-playing");
@@ -238,7 +252,7 @@ static void test_nes(app_ui_t *ui)
     sleeping=true;advance(700);assert(lv_display_get_inactive_time(NULL)>500);
     sleeping=false;nes.external_buttons=0;
     nes.state=AETHER_NES_PAUSED;advance(220);assert(hidden(ui->app_obj[1])&&hidden(ui->app_obj[2]));capture(ui,"nes-paused");nes.state=AETHER_NES_RUNNING;advance(220);
-    nes.state=AETHER_NES_ERROR;nes.last_error=ESP_ERR_NOT_SUPPORTED;strlcpy(nes.detail,"Unsupported mapper test error",sizeof(nes.detail));advance(220);assert(!ui->media_active&&ui->touch_restore_pending&&strstr(lv_label_get_text(ui->app_obj[1]),"Unsupported mapper"));capture(ui,"nes-error");
+    nes.state=AETHER_NES_ERROR;nes.last_error=ESP_ERR_NOT_SUPPORTED;strlcpy(nes.detail,"Unsupported mapper test error",sizeof(nes.detail));advance(220);assert(!ui->media_active&&!nes_viewport_enabled&&ui->touch_restore_pending&&strstr(lv_label_get_text(ui->app_obj[1]),"Unsupported mapper"));capture(ui,"nes-error");
     unsigned stops=nes_stops,releases=nes_releases;send_click(ui,"返回");assert(nes_stops==stops+1&&nes_releases==releases+1);touch_enabled=true;
     nes_error=ESP_FAIL;app_open_nes_path(ui,"/sdcard/ROMs/test.nes");deliver(ui,ESP_OK);assert(!ui->media_active&&!ui->media_started);nes_error=ESP_OK;
     app_open_nes_path(ui,"/sdcard/ROMs/test.nes");deliver(ui,ESP_OK);nes.state=AETHER_NES_STOPPED;advance(220);assert(!ui->media_active&&!ui->timer);

@@ -301,6 +301,16 @@ static void show_alarm(lv_event_t *event)
     ui->page_back = app_open_clock;
 }
 
+static void show_stopwatch(lv_event_t *event)
+{
+    app_open_stopwatch(lv_event_get_user_data(event));
+}
+
+static void show_countdown(lv_event_t *event)
+{
+    app_open_countdown(lv_event_get_user_data(event));
+}
+
 void app_open_clock(app_ui_t *ui)
 {
     lv_obj_t *content = app_ui_begin_page(ui, "时钟与日期");
@@ -321,7 +331,9 @@ void app_open_clock(app_ui_t *ui)
     lv_obj_set_style_border_width(face, 1, 0);
     ui->app_obj[0] = app_ui_add_text(face, "--:--:--", LV_ALIGN_TOP_LEFT, 18, 5, 0x90E5D8, &lv_font_montserrat_48);
     ui->app_obj[1] = app_ui_add_text(face, "等待 RTC…", LV_ALIGN_BOTTOM_LEFT, 21, -10, 0xB9C8E1, app_ui_chinese_font());
-    action(face, LV_SYMBOL_BELL, 334, 23, 54, show_alarm, ui);
+    action(face, "闹钟", 232, 23, 50, show_alarm, ui);
+    action(face, "秒表", 288, 23, 50, show_stopwatch, ui);
+    action(face, "倒计时", 344, 23, 54, show_countdown, ui);
     page->fields[0] = clock_field(content, "年", 0, 110, 2000, 100, ui);
     page->fields[1] = clock_field(content, "月", 140, 110, 1, 12, ui);
     page->fields[2] = clock_field(content, "日", 280, 110, 1, 31, ui);

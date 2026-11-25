@@ -1,4 +1,5 @@
 #include "app_gps.h"
+#include "app_service_task.h"
 #ifdef AETHER_GPS_DIAGNOSTIC
 #include "app_gps_diagnostic.h"
 #endif
@@ -406,7 +407,7 @@ esp_err_t app_gps_init(app_power_t *power)
     }
     if (error == ESP_OK) {
         s_status = (app_gps_status_t){.available = true, .state = APP_GPS_OFF, .pps_age_ms = UINT32_MAX};
-        if (xTaskCreate(gps_worker, "gps", 6144, NULL, 4, &s_task) != pdPASS) {
+        if (app_create_service_task(gps_worker, "gps", 6144, NULL, 4, &s_task) != pdPASS) {
             s_task = NULL;
             error = ESP_ERR_NO_MEM;
         }

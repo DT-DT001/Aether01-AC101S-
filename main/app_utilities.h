@@ -7,6 +7,7 @@
 
 enum { APP_NOTE_COUNT = 4, APP_NOTE_CHARACTERS = 300, APP_NOTE_CAPACITY = 1201 };
 enum { APP_ALARM_SLOTS = 6, APP_ALARM_NO_SLOT = APP_ALARM_SLOTS };
+enum { APP_COUNTDOWN_MAX_SECONDS = 24 * 60 * 60 - 1 };
 
 typedef struct {
     bool configured, enabled;
@@ -20,6 +21,14 @@ typedef struct {
     uint8_t ringing_slot, ringing_count;
     esp_err_t save_error;
 } app_alarm_snapshot_t;
+
+typedef enum { APP_COUNTDOWN_IDLE, APP_COUNTDOWN_RUNNING, APP_COUNTDOWN_PAUSED, APP_COUNTDOWN_FINISHED } app_countdown_state_t;
+
+typedef struct {
+    app_countdown_state_t state;
+    unsigned duration_seconds, remaining_seconds;
+    bool ringing;
+} app_countdown_snapshot_t;
 
 typedef struct {
     bool ready, pending;
@@ -38,6 +47,12 @@ esp_err_t app_alarm_remove_slot(unsigned slot);
 esp_err_t app_alarm_preview(unsigned tone);
 void app_alarm_cancel_preview(void);
 void app_alarm_dismiss(void);
+void app_countdown_get(app_countdown_snapshot_t *out);
+esp_err_t app_countdown_start(unsigned seconds);
+void app_countdown_pause(void);
+void app_countdown_resume(void);
+void app_countdown_reset(void);
+void app_countdown_dismiss(void);
 void app_note_get_status(unsigned note, app_note_status_t *out);
 esp_err_t app_note_read(unsigned note, char out[APP_NOTE_CAPACITY]);
 esp_err_t app_note_save(unsigned note, const char *text);
@@ -48,6 +63,8 @@ void app_weather_get(app_weather_snapshot_t *out);
 void app_weather_refresh(bool manual);
 esp_err_t app_weather_select_city(unsigned city);
 void app_open_alarm(app_ui_t *ui);
+void app_open_stopwatch(app_ui_t *ui);
+void app_open_countdown(app_ui_t *ui);
 void app_open_notes(app_ui_t *ui);
 void app_open_calendar(app_ui_t *ui);
 void app_open_weather(app_ui_t *ui);

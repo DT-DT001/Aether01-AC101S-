@@ -15,9 +15,13 @@
 #include "app_audio_system.h"
 #include "app_display_metrics.h"
 #include "app_home.h"
+#include "app_media_image.h"
+#include "app_motion_filter.h"
 #include "app_otg_control.h"
 #include "app_telemetry.h"
 #include "app_text_input.h"
+#include "app_theme.h"
+#include "app_wallpaper_store.h"
 #include "app_ui_internal.h"
 #include "app_utilities.h"
 #include "esp_heap_caps.h"
@@ -31,14 +35,20 @@
 #include "app_ui_selftest_files.h"
 #include "app_ui_selftest_nes.h"
 
-enum { ROUNDS = 8, DRAWER_BACK_ROUND = 2, PAGE_TIMEOUT_MS = 5000, POLL_MS = 40 };
+#ifndef AETHER_UI_SELFTEST_ROUNDS
+#define AETHER_UI_SELFTEST_ROUNDS 8
+#endif
+#ifndef AETHER_UI_SELFTEST_SILENT
+#define AETHER_UI_SELFTEST_SILENT 0
+#endif
+enum { ROUNDS = AETHER_UI_SELFTEST_ROUNDS, DRAWER_BACK_ROUND = 2, PAGE_TIMEOUT_MS = 5000, POLL_MS = 40 };
 static const char *const TAG = "ui_selftest";
 static const uint32_t external_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 
 typedef enum {
     CLOCK, WEATHER, CALENDAR, NOTES, MUSIC, READER, VIDEO, FILES, GAMES, NES,
     RECORDER, SETTINGS, MOTION, PRESSURE, DISPLACEMENT,
-    REMOTE, OBS, INTERCOM, GPS, CAMERA, GALLERY,
+    REMOTE, OBS, INTERCOM, GPS, CAMERA, GALLERY, CALCULATOR, THEME,
 } route_id_t;
 
 typedef struct {
@@ -60,7 +70,7 @@ static const route_t routes[] = {
     [NES] = {"nes-picker", "选择 NES 游戏", "NES 游戏"},
     [RECORDER] = {"recorder", "录音机", "录音"},
     [SETTINGS] = {"settings", "设置", "设置"},
-    [MOTION] = {"motion", "运动与姿态", "运动"},
+    [MOTION] = {"motion", "姿态", "姿态"},
     [PRESSURE] = {"barometer", "气压与高度", "气压高度"},
     [DISPLACEMENT] = {"displacement", "短程位移", "位移测量"},
     [REMOTE] = {"pc-remote", "空中飞鼠", "空中飞鼠"},
@@ -69,6 +79,8 @@ static const route_t routes[] = {
     [GPS] = {"gps", "卫星定位", "定位"},
     [CAMERA] = {"usb-camera", "USB 摄像头", "USB 摄像头"},
     [GALLERY] = {"gallery", "图库", "图库"},
+    [CALCULATOR] = {"calculator", "计算器", "计算器"},
+    [THEME] = {"theme", "主题", "主题"},
 };
 
 typedef struct {
@@ -78,7 +90,11 @@ typedef struct {
 } nested_route_t;
 
 static const nested_route_t nested_routes[] = {
-    {CLOCK, LV_SYMBOL_BELL, {"alarm", "闹钟", NULL}},
+    {CLOCK, "闹钟", {"alarm", "闹钟", NULL}},
+    {CLOCK, "秒表", {"stopwatch", "秒表", NULL}},
+    {CLOCK, "倒计时", {"countdown", "倒计时", NULL}},
+    {MOTION, "水平仪", {"spirit-level", "水平仪", NULL}},
+    {THEME, "从 TF 卡选择", {"wallpaper-picker", "选择壁纸", NULL}},
     {SETTINGS, "Wi-Fi", {"wifi", "Wi-Fi 网络", NULL}},
     {SETTINGS, "蓝牙", {"bluetooth", "蓝牙", NULL}},
     {SETTINGS, "NES 按键映射", {"nes-keymap", "NES 键盘映射", NULL}},
@@ -168,9 +184,10 @@ static heap_sample_t psram_sample(void)
 
 static void report_memory(unsigned round, const char *scope, const char *id, heap_sample_t before)
 {
-    /* Some storage workers acknowledge cancellation asynchronously. Always
-     * sample back at the desktop after a short, fixed settling window. */
-    pause_ms(100);
+    /* Keep per-route samples after the cleanup gate. Also allow asynchronous
+     * storage cancellations to settle before the round and endurance samples. */
+    if (ROUNDS <= 8 || !strcmp(scope, "round") || round <= 2 ||
+        round == ROUNDS / 2 || round == ROUNDS) pause_ms(100);
     const heap_sample_t after = psram_sample();
     ESP_LOGI(TAG, "HEAP round=%u scope=%s id=%s free_before=%" PRIu32 " free_after=%" PRIu32
              " delta=%" PRId32 " blocks_before=%" PRIu32 " blocks_after=%" PRIu32,
@@ -321,6 +338,8 @@ static bool open_drawer_tile(probe_t *probe, route_id_t id, bool await_io)
 {
     if (!lvgl_port_lock(1000)) return false;
     app_ui_t *ui = probe->ui;
+    app_display_metrics_t drawer_before, drawn;
+    app_display_metrics_get(&drawer_before);
     bool ok = current_page(probe) && ui->home_time && !ui->page_context;
     if (ok) {
         probe->predecessor_key_us = esp_timer_get_time();
@@ -340,7 +359,15 @@ static bool open_drawer_tile(probe_t *probe, route_id_t id, bool await_io)
     lvgl_port_unlock();
     if (!ok) return false;
 
-    pause_ms(120);
+    const int64_t deadline = esp_timer_get_time() + PAGE_TIMEOUT_MS * INT64_C(1000);
+    do {
+        pause_ms(POLL_MS);
+        app_display_metrics_get(&drawn);
+    } while ((drawn.completed_sequence <= drawer_before.submitted_sequence ||
+              drawn.completed_sequence != drawn.submitted_sequence) &&
+             esp_timer_get_time() < deadline);
+    if (drawn.completed_sequence <= drawer_before.submitted_sequence ||
+        drawn.completed_sequence != drawn.submitted_sequence) return false;
     const uint64_t before = completed_regions();
     if (!lvgl_port_lock(1000)) return false;
     lv_obj_t *tile = current_page(probe) ?
@@ -1142,6 +1169,10 @@ static bool test_recordings_back(probe_t *probe)
 
     const bool listing = current_page(probe) && ui->page_back == app_open_recorder &&
         find_label(ui->content, directory, false);
+    if (AETHER_UI_SELFTEST_SILENT) {
+        lvgl_port_unlock();
+        return listing && recordings_header_back(probe, RECORDER);
+    }
     lv_obj_t *viewport = listing ? recordings_viewport(ui->content) : NULL;
     lv_obj_t *fixture = NULL;
     char expected[sizeof(((aether_audio_player_status_t *)0)->path)] = {0};
@@ -1402,6 +1433,38 @@ static void report_sensors(route_id_t id)
     }
 }
 
+static bool tap_game_button(probe_t *probe, const char *caption);
+
+static bool calculator_result_is(probe_t *probe, const char *value, const char *expression)
+{
+    if (!lvgl_port_lock(1000)) return false;
+    lv_obj_t *readout = lv_obj_get_child(probe->ui->content, 0);
+    lv_obj_t *formula = expression ? find_label(readout, expression, false) : NULL;
+    lv_font_glyph_dsc_t glyph;
+    const bool visible_multiply = !expression || (formula &&
+        lv_font_get_glyph_dsc(lv_obj_get_style_text_font(formula, 0), &glyph, 0xD7, 0) &&
+        !glyph.is_placeholder && glyph.box_w > 3);
+    const bool correct = current_page(probe) && find_label(readout, value, false) && visible_multiply;
+    lvgl_port_unlock();
+    return correct;
+}
+
+static bool test_calculator(probe_t *probe)
+{
+    const bool ok = tap_game_button(probe, "7") && tap_game_button(probe, "×") &&
+        tap_game_button(probe, "8") && tap_game_button(probe, "=") &&
+        calculator_result_is(probe, "56", "7 × 8 =") &&
+        tap_game_button(probe, "科学") && tap_game_button(probe, "C") &&
+        tap_game_button(probe, "3") && tap_game_button(probe, "0") &&
+        tap_game_button(probe, "sin") && calculator_result_is(probe, "0.5", NULL) &&
+        tap_game_button(probe, "进制") && tap_game_button(probe, "1") &&
+        tap_game_button(probe, "5") && tap_game_button(probe, "BIN") &&
+        calculator_result_is(probe, "1111", NULL) && tap_game_button(probe, "HEX") &&
+        calculator_result_is(probe, "F", NULL);
+    ESP_LOGI(TAG, "CHECK calculator three modes and multiply glyph=%s", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool test_routes(probe_t *probe, unsigned round)
 {
     for (unsigned i = 0; i < probe->route_count; i++) {
@@ -1417,11 +1480,12 @@ static bool test_routes(probe_t *probe, unsigned round)
             pause_ms(160);
             report_sensors((route_id_t)i);
         }
-        const bool stress_music = i == MUSIC && (round == 1 || round == ROUNDS / 2 || round == ROUNDS);
+        const bool stress_music = !AETHER_UI_SELFTEST_SILENT && i == MUSIC &&
+            (round == 1 || round == ROUNDS / 2 || round == ROUNDS);
         const bool music_ok = !stress_music || test_music(probe);
-        const bool actions_ok = music_ok && (round != 1 ||
+        const bool actions_ok = music_ok && (i != CALCULATOR || test_calculator(probe)) && (round != 1 ||
             ((i != NOTES || test_notes_keyboard(probe)) &&
-             (i != VIDEO || test_video(probe)) &&
+             (i != VIDEO || AETHER_UI_SELFTEST_SILENT || test_video(probe)) &&
              (i != RECORDER || test_recordings_back(probe)) &&
              (i != SETTINGS || test_settings_top(probe, "drawer")) &&
              (i != GALLERY || test_gallery(probe))));
@@ -1631,12 +1695,67 @@ static bool test_bluetooth_modes(probe_t *probe, const route_t *parent)
     return true;
 }
 
+static bool test_countdown_controls(probe_t *probe)
+{
+    if (!lvgl_port_lock(1000)) return false;
+    lv_obj_t *hours = current_page(probe) ? find_class(probe->ui->content, &lv_dropdown_class) : NULL;
+    unsigned fields = 0;
+    if (hours) {
+        lv_obj_t *picker = lv_obj_get_parent(hours);
+        for (uint32_t i = 0; i < lv_obj_get_child_count(picker); ++i) {
+            lv_obj_t *field = lv_obj_get_child(picker, (int32_t)i);
+            if (!lv_obj_check_type(field, &lv_dropdown_class)) continue;
+            lv_dropdown_set_selected(field, fields++ == 2 ? 30 : 0);
+            lv_obj_send_event(field, LV_EVENT_VALUE_CHANGED, NULL);
+        }
+    }
+    lvgl_port_unlock();
+    if (fields != 3) return false;
+    app_countdown_snapshot_t state;
+    const bool started = tap_game_button(probe, "开始");
+    const bool paused = started && tap_game_button(probe, "暂停");
+    app_countdown_get(&state);
+    const bool pause_state = state.state == APP_COUNTDOWN_PAUSED &&
+        state.remaining_seconds > 0 && state.remaining_seconds <= 30;
+    const bool resumed = paused && tap_game_button(probe, "继续");
+    app_countdown_get(&state);
+    const bool resume_state = state.state == APP_COUNTDOWN_RUNNING;
+    const bool reset = resumed && tap_game_button(probe, "复位");
+    app_countdown_get(&state);
+    const bool reset_state = state.state == APP_COUNTDOWN_IDLE;
+    if (!reset_state) app_countdown_reset();
+    return started && paused && pause_state && resumed && resume_state && reset && reset_state;
+}
+
+static bool page_has_label(probe_t *probe, const char *label)
+{
+    if (!lvgl_port_lock(1000)) return false;
+    const bool found = current_page(probe) && find_label(probe->ui->content, label, false);
+    lvgl_port_unlock();
+    return found;
+}
+
 static bool test_nested_routes(probe_t *probe, unsigned round)
 {
     for (unsigned i = 0; i < sizeof(nested_routes) / sizeof(nested_routes[0]); i++) {
         const nested_route_t *test = &nested_routes[i];
         const heap_sample_t heap_before = psram_sample();
         if (!open_drawer_tile(probe, test->parent, true)) return false;
+        bool level_zeroed = false;
+        if (round == 1 && test->parent == MOTION) {
+            for (unsigned attempt = 0; attempt < 15 && !level_zeroed; ++attempt) {
+                app_telemetry_snapshot_t sample;
+                app_telemetry_get(&sample);
+                float reference[4];
+                const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+                if (sample.imu_error == ESP_OK && !sample.gyro_calibrating &&
+                    sample.imu_updated_ms && now - sample.imu_updated_ms <= 250 &&
+                    app_motion_level_reference(sample.imu.accel_mps2, reference)) {
+                    level_zeroed = tap_game_button(probe, "姿态归零");
+                }
+                if (!level_zeroed) pause_ms(POLL_MS);
+            }
+        }
         const uint64_t before = completed_regions();
         if (!click_label(probe, test->button)) {
             ESP_LOGE(TAG, "FAIL nested=%s missing route button", test->page.id);
@@ -1647,8 +1766,36 @@ static bool test_nested_routes(probe_t *probe, unsigned round)
             ESP_LOGE(TAG, "FAIL nested=%s open/render", test->page.id);
             return false;
         }
+        if (level_zeroed) {
+            bool centered = false;
+            for (unsigned attempt = 0; attempt < 10 && !centered; ++attempt) {
+                centered = page_has_label(probe, "已水平");
+                if (!centered) pause_ms(POLL_MS);
+            }
+            ESP_LOGI(TAG, "CHECK IMU shared pose/level zero=%s", centered ? "PASS" : "FAIL");
+            if (!centered) return false;
+        } else if (round == 1 && test->parent == MOTION) {
+            ESP_LOGI(TAG, "SKIP IMU shared zero: stable face-up sample unavailable");
+        }
         if (round == 1 && !test_game_controls(probe, &test->page)) {
             ESP_LOGE(TAG, "FAIL nested=%s input controls", test->page.id);
+            return false;
+        }
+        if (!strcmp(test->page.id, "stopwatch")) {
+            if (!tap_game_button(probe, "开始") || !tap_game_button(probe, "计次") ||
+                !page_has_label(probe, "01") || !tap_game_button(probe, "暂停") ||
+                !tap_game_button(probe, "复位") || !page_has_label(probe, "00:00:00") ||
+                !page_has_label(probe, "开始")) {
+                ESP_LOGE(TAG, "FAIL stopwatch start/lap/pause/reset");
+                return false;
+            }
+        }
+        if (!strcmp(test->page.id, "countdown") && !test_countdown_controls(probe)) {
+            ESP_LOGE(TAG, "FAIL countdown start/pause/resume/reset");
+            return false;
+        }
+        if (round == 1 && !strcmp(test->page.id, "wallpaper-picker") && !test_gallery(probe)) {
+            ESP_LOGE(TAG, "FAIL wallpaper picker preview");
             return false;
         }
         const bool verify_bluetooth = !strcmp(test->page.id, "bluetooth") &&
@@ -1704,6 +1851,166 @@ static bool keep_music_preferences(void *context)
     return true;
 }
 
+typedef struct {
+    TaskHandle_t caller;
+    app_ui_t *ui;
+    bool ok;
+} mic_probe_t;
+
+static void mic_probe_task(void *context)
+{
+    mic_probe_t *probe = context;
+    probe->ok = selftest_microphone(probe->ui);
+    xTaskNotifyGive(probe->caller);
+    vTaskDelete(NULL);
+}
+
+static bool test_microphone_internal(app_ui_t *ui)
+{
+    /* The IRAM-safe bus requires internal I2C receive buffers. Use the same
+     * internal stack class as the recorder rather than the UI probe's PSRAM. */
+    mic_probe_t probe = {.caller = xTaskGetCurrentTaskHandle(), .ui = ui};
+    if (xTaskCreate(mic_probe_task, "mic_probe", 4096, &probe, 2, NULL) != pdPASS)
+        return false;
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return probe.ok;
+}
+
+enum { TEST_WALLPAPER_WIDTH = 32, TEST_WALLPAPER_HEIGHT = 48, TEST_WALLPAPER_PIXEL = 0x47AF };
+
+typedef struct {
+    TaskHandle_t caller;
+    uint16_t width, height;
+    bool empty, ok;
+} wallpaper_verify_t;
+
+static void wallpaper_verify_task(void *context)
+{
+    wallpaper_verify_t *verify = context;
+    app_wallpaper_store_t store;
+    uint16_t *pixels, width, height;
+    const esp_err_t result = app_wallpaper_store_open(&store, &pixels, &width, &height);
+    bool ok = result == ESP_OK;
+    if (verify->empty) ok = ok && !pixels;
+    else {
+        ok = ok && pixels && width == verify->width && height == verify->height;
+        for (unsigned i = 0; ok && i < (unsigned)width * height; ++i)
+            ok = pixels[i] == TEST_WALLPAPER_PIXEL;
+    }
+    free(pixels);
+    verify->ok = ok;
+    xTaskNotifyGive(verify->caller);
+    vTaskDelete(NULL);
+}
+
+static bool verify_wallpaper_bank(uint16_t width, uint16_t height)
+{
+    wallpaper_verify_t verify = {
+        .caller = xTaskGetCurrentTaskHandle(), .width = width, .height = height, .empty = !width,
+    };
+    if (xTaskCreate(wallpaper_verify_task, "verify_wallpaper", 4096, &verify, 2, NULL) != pdPASS)
+        return false;
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return verify.ok;
+}
+
+static esp_err_t wait_wallpaper_save(void)
+{
+    const int64_t deadline = esp_timer_get_time() + INT64_C(10000000);
+    do {
+        pause_ms(POLL_MS);
+        if (!lvgl_port_lock(POLL_MS)) continue;
+        const esp_err_t status = app_theme_write_status();
+        lvgl_port_unlock();
+        if (status != ESP_ERR_NOT_FINISHED) return status;
+    } while (esp_timer_get_time() < deadline);
+    return ESP_ERR_TIMEOUT;
+}
+
+static bool load_wallpaper_fixture(app_ui_t *ui, app_media_image_t *image)
+{
+    static const char root[] = AETHER_STORAGE_MOUNT_POINT;
+    enum { ROW_BYTES = TEST_WALLPAPER_WIDTH * 3, FILE_BYTES = 54 + ROW_BYTES * TEST_WALLPAPER_HEIGHT };
+    _Static_assert(ROW_BYTES % 4 == 0, "BMP fixture row alignment");
+    if (!aether_media_fs_path_ready(ui->storage, root) || app_io_usb_storage_blocked(ui->io)) {
+        uint16_t *pixels = malloc(TEST_WALLPAPER_WIDTH * TEST_WALLPAPER_HEIGHT * sizeof(*pixels));
+        if (!pixels) return false;
+        for (unsigned i = 0; i < TEST_WALLPAPER_WIDTH * TEST_WALLPAPER_HEIGHT; ++i)
+            pixels[i] = TEST_WALLPAPER_PIXEL;
+        *image = (app_media_image_t){pixels, TEST_WALLPAPER_WIDTH, TEST_WALLPAPER_HEIGHT};
+        ESP_LOGI(TAG, "SKIP wallpaper TF scaling: card unavailable");
+        return true;
+    }
+    aether_media_fs_lease_t lease = {0};
+    if (aether_media_fs_acquire(ui->storage, root, &lease) != ESP_OK) return false;
+    char directory[64], name[92];
+    snprintf(directory, sizeof(directory), "%s/.aether-wallpaper-%08" PRIx32,
+             root, (uint32_t)esp_timer_get_time());
+    snprintf(name, sizeof(name), "%s/fit.bmp", directory);
+    const uint32_t generation = aether_media_fs_generation(ui->storage, name);
+    const bool created = mkdir(directory, 0777) == 0;
+    const int fd = created ? open(name, O_WRONLY | O_CREAT | O_EXCL, 0666) : -1;
+    static const uint8_t header[54] = {
+        [0] = 'B', [1] = 'M', [2] = FILE_BYTES & 255, [3] = FILE_BYTES >> 8,
+        [10] = 54, [14] = 40, [18] = TEST_WALLPAPER_WIDTH, [22] = TEST_WALLPAPER_HEIGHT,
+        [26] = 1, [28] = 24,
+    };
+    uint8_t row[ROW_BYTES];
+    for (unsigned x = 0; x < ROW_BYTES; x += 3) {
+        row[x] = 0x78;
+        row[x + 1] = 0xF4;
+        row[x + 2] = 0x40;
+    }
+    bool written = fd >= 0 && write(fd, header, sizeof(header)) == sizeof(header);
+    for (unsigned y = 0; written && y < TEST_WALLPAPER_HEIGHT; ++y)
+        written = write(fd, row, sizeof(row)) == sizeof(row);
+    if (fd >= 0 && close(fd) != 0) written = false;
+    const atomic_bool cancelled = false;
+    const esp_err_t decoded = written ? app_media_image_read(ui->storage, name, generation, &cancelled,
+        APP_WALLPAPER_SIZE, APP_WALLPAPER_SIZE, true, image) : ESP_FAIL;
+    bool cleaned = false;
+    if (created && aether_media_fs_available(&lease) &&
+        aether_media_fs_generation(ui->storage, name) == generation) {
+        const bool removed = fd < 0 || unlink(name) == 0;
+        cleaned = removed && rmdir(directory) == 0;
+    }
+    aether_media_fs_release(&lease);
+    const bool ok = decoded == ESP_OK && image->width == 320 && image->height == 480 && cleaned;
+    ESP_LOGI(TAG, "%s wallpaper TF scaling %ux%u -> %ux%u source_removed=%u",
+             ok ? "PASS" : "FAIL", TEST_WALLPAPER_WIDTH, TEST_WALLPAPER_HEIGHT,
+             image->width, image->height, cleaned);
+    return ok;
+}
+
+static bool test_wallpaper_store(app_ui_t *ui)
+{
+    if (!lvgl_port_lock(1000)) return false;
+    const bool available = app_theme_wallpaper_available();
+    const bool has_personal_wallpaper = app_theme_wallpaper() != NULL;
+    lvgl_port_unlock();
+    if (!available || has_personal_wallpaper) {
+        ESP_LOGI(TAG, "SKIP wallpaper Flash round trip partition=%u existing=%u",
+                 available, has_personal_wallpaper);
+        return available;
+    }
+    if (!verify_wallpaper_bank(0, 0)) return false;
+    app_media_image_t image = {0};
+    if (!load_wallpaper_fixture(ui, &image)) { free(image.pixels); return false; }
+    if (!lvgl_port_lock(1000)) { free(image.pixels); return false; }
+    const esp_err_t submit = app_theme_write_wallpaper(image.pixels, image.width, image.height);
+    lvgl_port_unlock();
+    if (submit != ESP_OK) { free(image.pixels); return false; }
+    const bool stored = wait_wallpaper_save() == ESP_OK;
+    const bool readback = stored && verify_wallpaper_bank(image.width, image.height);
+    if (!lvgl_port_lock(1000)) return false;
+    const esp_err_t clear = app_theme_write_wallpaper(NULL, 0, 0);
+    lvgl_port_unlock();
+    const bool cleared = clear == ESP_OK && wait_wallpaper_save() == ESP_OK && verify_wallpaper_bank(0, 0);
+    ESP_LOGI(TAG, "%s wallpaper Flash store=%u load=%u cleared=%u",
+             readback && cleared ? "PASS" : "FAIL", stored, readback, cleared);
+    return readback && cleared;
+}
+
 static void test_task(void *context)
 {
     probe_t probe = {.ui = context, .route_count = app_home_app_count()};
@@ -1741,12 +2048,14 @@ static void test_task(void *context)
     const heap_sample_t baseline = psram_sample();
     pause_ms(1200);
     report_memory(0, "idle", "desktop", baseline);
+    unsigned rounds_passed = 0;
     for (unsigned round = 1; ok && round <= ROUNDS; round++) {
         const heap_sample_t round_before = psram_sample();
         ok = test_routes(&probe, round) && test_nested_routes(&probe, round);
         const bool internal_ok = heap_caps_check_integrity(internal_caps, false);
         const bool external_ok = heap_caps_check_integrity(external_caps, false);
         ok = ok && internal_ok && external_ok;
+        if (ok) ++rounds_passed;
         ESP_LOGI(TAG, "ROUND %u heap_internal_ok=%u heap_psram_ok=%u internal_free=%u psram_free=%u",
                  round, internal_ok, external_ok, (unsigned)heap_caps_get_free_size(internal_caps),
                  (unsigned)heap_caps_get_free_size(external_caps));
@@ -1758,19 +2067,21 @@ static void test_task(void *context)
     report_memory(0, "idle", "desktop-after-cycles", final_active);
     report_weather_probe();
     if (ok) {
-        ok = idle_media(probe.ui);
-        if (ok) ok = selftest_microphone(probe.ui) && selftest_files(probe.ui);
-        else ESP_LOGE(TAG, "FAIL microphone idle gate not ready");
+        const bool mic_ok = idle_media(probe.ui) && test_microphone_internal(probe.ui);
+        const bool files_ok = selftest_files(probe.ui);
+        const bool nes_ok = idle_media(probe.ui) && selftest_nes(probe.ui);
+        const bool wallpaper_ok = (ROUNDS != 0 && ROUNDS < 100) || test_wallpaper_store(probe.ui);
+        ok = mic_ok && files_ok && nes_ok && wallpaper_ok;
     }
-    if (ok) ok = selftest_nes(probe.ui);
     app_display_metrics_get(&end_display);
     const uint32_t drops = end_display.dropped_regions - start_display.dropped_regions;
     const uint32_t timeouts = end_display.flush_wait_timeouts - start_display.flush_wait_timeouts;
-    ok = ok && probe.drawer_home_clicked && probe.drawer_back_passed == probe.route_count &&
+    ok = ok && (ROUNDS < DRAWER_BACK_ROUND ||
+                (probe.drawer_home_clicked && probe.drawer_back_passed == probe.route_count)) &&
         !probe.failed_actions && !drops && !timeouts && !end_display.flush_stalled;
-    ESP_LOGI(TAG, "SUMMARY result=%s routes=%u subpages=%u media_passed=%u media_skipped=%u actions_failed=%u lcd_regions=%" PRIu64
+    ESP_LOGI(TAG, "SUMMARY result=%s rounds=%u routes=%u subpages=%u media_passed=%u media_skipped=%u actions_failed=%u lcd_regions=%" PRIu64
              " dropped_regions=%" PRIu32 " dma_timeouts=%" PRIu32 " stack_min=%u drawer_back_passed=%u drawer_home_clicked=%u",
-             ok ? "PASS" : "FAIL", probe.routes_passed, probe.nested_passed,
+             ok ? "PASS" : "FAIL", rounds_passed, probe.routes_passed, probe.nested_passed,
              probe.media_passed, probe.media_skipped, probe.failed_actions,
              end_display.completed_sequence - start_display.completed_sequence,
              drops, timeouts, (unsigned)uxTaskGetStackHighWaterMark(NULL), probe.drawer_back_passed,

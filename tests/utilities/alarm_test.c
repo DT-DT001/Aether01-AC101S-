@@ -11,7 +11,8 @@
 typedef int portMUX_TYPE;
 typedef int TaskHandle_t;
 typedef int nvs_handle_t;
-typedef struct { bool audio_ready; } aether_board_t;
+typedef struct { bool audio_ready; void *audio; } aether_board_t;
+typedef struct { esp_err_t rtc_error; pcf85063_time_t rtc; } app_telemetry_snapshot_t;
 
 #define EXT_RAM_BSS_ATTR
 #define PORTMUX_INITIALIZER 0
@@ -22,6 +23,11 @@ typedef struct { bool audio_ready; } aether_board_t;
 enum { NVS_READONLY, NVS_READWRITE };
 
 static const aether_board_t board = {.audio_ready = true};
+static unsigned power_fixture, *s_power = &power_fixture;
+static app_telemetry_snapshot_t telemetry = {.rtc_error = ESP_FAIL};
+static int64_t now_us;
+static unsigned wakes, playback, last_tone;
+static esp_err_t playback_error;
 static bool running = true;
 static bool s_city_pending;
 static esp_err_t s_city_error;
@@ -35,6 +41,19 @@ static void (*during_commit)(void);
 static unsigned notifications;
 
 static bool power_running(void) { return running; }
+static int64_t esp_timer_get_time(void) { return now_us; }
+static void app_telemetry_get(app_telemetry_snapshot_t *out) { *out = telemetry; }
+static esp_err_t app_power_wake(unsigned *power) { assert(power == s_power); ++wakes; return ESP_OK; }
+static esp_err_t app_alarm_audio_play(void *audio, unsigned tone, bool (*current)(void *), void *context)
+{
+    (void)audio;
+    assert(current(context));
+    ++playback;
+    last_tone = tone;
+    return playback_error;
+}
+void app_alarm_dismiss(void);
+void app_countdown_dismiss(void);
 static void xTaskNotifyGive(TaskHandle_t task) { assert(task); ++notifications; }
 unsigned app_weather_city_count(void) { return 1; }
 
@@ -229,6 +248,73 @@ static void test_real_occurrences_and_preview(void)
     assert(!collect_due_alarms(&rtc));
 }
 
+static void expect_countdown(app_countdown_state_t state, unsigned remaining, bool ringing)
+{
+    app_countdown_snapshot_t snapshot;
+    app_countdown_get(&snapshot);
+    assert(snapshot.state == state && snapshot.remaining_seconds == remaining && snapshot.ringing == ringing);
+}
+
+static void test_countdown_and_alert(void)
+{
+    assert(app_countdown_start(0) == ESP_ERR_INVALID_ARG);
+    assert(app_countdown_start(APP_COUNTDOWN_MAX_SECONDS + 1) == ESP_ERR_INVALID_ARG);
+    expect_countdown(APP_COUNTDOWN_IDLE, 300, false);
+    assert(app_countdown_start(3) == ESP_OK);
+    int64_t ring_started = 0, next_tone = 0;
+    now_us = 850000;
+    app_countdown_pause();
+    expect_countdown(APP_COUNTDOWN_PAUSED, 3, false);
+    now_us = 5000000;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    assert(wakes == 0 && playback == 0);
+    app_countdown_resume();
+    expect_countdown(APP_COUNTDOWN_RUNNING, 3, false);
+    now_us = 7149999;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    expect_countdown(APP_COUNTDOWN_RUNNING, 1, false);
+    assert(wakes == 0 && playback == 0);
+    now_us = 7150000;
+    app_countdown_pause(); /* A tap just after the deadline must not lose the alert. */
+    playback_error = ESP_ERR_INVALID_STATE;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    assert(wakes == 1 && playback == 1 && last_tone == 1 && next_tone == 7650);
+    expect_countdown(APP_COUNTDOWN_FINISHED, 0, true);
+    assert(app_alarm_preview(3) == ESP_ERR_INVALID_STATE);
+    now_us = 7650000;
+    playback_error = ESP_OK;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    assert(wakes == 1 && playback == 2 && next_tone == 9650);
+    now_us = 37150000;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    expect_countdown(APP_COUNTDOWN_FINISHED, 0, false);
+    assert(wakes == 1 && playback == 2);
+    app_countdown_reset();
+    expect_countdown(APP_COUNTDOWN_IDLE, 3, false);
+
+    assert(app_alarm_set_slot(1, 5, 10, true, 3) == ESP_OK);
+    assert(app_countdown_start(1) == ESP_OK);
+    telemetry = (app_telemetry_snapshot_t){ESP_OK, {.year = 2027, .month = 1, .day = 3, .hour = 5, .minute = 10}};
+    now_us += 1000000;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    expect_ring(1, 1, 3);
+    expect_countdown(APP_COUNTDOWN_FINISHED, 0, true);
+    assert(wakes == 2 && playback == 3 && last_tone == 3);
+    app_alarm_dismiss();
+    now_us = next_tone * 1000;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    assert(wakes == 2 && playback == 4 && last_tone == 1);
+    app_countdown_dismiss();
+    expect_countdown(APP_COUNTDOWN_FINISHED, 0, false);
+    assert(app_countdown_start(1) == ESP_OK);
+    running = false;
+    now_us += 1000000;
+    process_clock_alerts(now_us, &ring_started, &next_tone);
+    expect_countdown(APP_COUNTDOWN_FINISHED, 0, false);
+    assert(wakes == 2 && playback == 4 && app_countdown_start(1) == ESP_ERR_INVALID_STATE);
+    running = true;
+}
+
 int main(void)
 {
     aether_board_t fixture = board;
@@ -236,7 +322,8 @@ int main(void)
     s_service = 1;
     test_persistence();
     test_real_occurrences_and_preview();
+    test_countdown_and_alert();
     assert(notifications > 0 && !s_lock);
-    puts("alarm service: 6 slots, migration, save retry/revision, RTC midnight, coincident alarms and preview cancellation passed");
+    puts("alarm/countdown service: persistence, RTC rollover, monotonic pause/resume, wake, tone retry, coexisting alerts and shutdown passed");
     return 0;
 }

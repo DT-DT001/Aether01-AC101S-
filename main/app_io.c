@@ -339,7 +339,8 @@ static esp_err_t scan_gallery_root(app_io_handle_t io, const char *root, gallery
 
 static esp_err_t gallery_catalog(app_io_handle_t io, const app_io_request_t *q, app_io_result_t *r)
 {
-    if (q->path[0] || q->offset) return ESP_ERR_INVALID_ARG;
+    const bool tf_only = q->path[0] != '\0';
+    if (q->offset || (tf_only && strcmp(q->path, AETHER_STORAGE_MOUNT_POINT))) return ESP_ERR_INVALID_ARG;
     static const char *const roots[] = {AETHER_STORAGE_MOUNT_POINT, AETHER_USB_STORAGE_MOUNT_POINT};
     const size_t limit = q->limit && q->limit < CATALOG_MAX ? q->limit : CATALOG_MAX;
     gallery_path_t *directories = heap_caps_malloc(GALLERY_MAX_DIRS * sizeof(*directories), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -347,7 +348,8 @@ static esp_err_t gallery_catalog(app_io_handle_t io, const app_io_request_t *q, 
     size_t capacity = 0;
     bool read_root = false;
     esp_err_t first_error = ESP_OK;
-    for (unsigned i = 0; i < sizeof(roots) / sizeof(roots[0]); ++i) {
+    const unsigned root_count = tf_only ? 1U : sizeof(roots) / sizeof(roots[0]);
+    for (unsigned i = 0; i < root_count; ++i) {
         if (!request_current(io, r) || app_io_usb_storage_blocked(io)) { first_error = ESP_ERR_INVALID_STATE; break; }
         const char *root = roots[i];
         if (!aether_media_fs_path_ready(io->storage, root)) continue;

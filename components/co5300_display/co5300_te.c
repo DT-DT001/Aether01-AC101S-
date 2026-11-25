@@ -15,7 +15,7 @@ static struct {
     bool handler_added, waiting, closing;
     unsigned publishers;
     uint32_t cancel_sequence, timeout_edges;
-    int64_t last_edge_us, retry_after_us;
+    int64_t retry_after_us;
     co5300_te_metrics_t metrics;
 } s_te;
 
@@ -28,11 +28,11 @@ static void te_rising(void *argument)
     SemaphoreHandle_t signal = !s_te.closing ? s_te.signal : NULL;
     if (!signal) { portEXIT_CRITICAL_ISR(&s_lock); return; }
     ++s_te.publishers;
-    if (s_te.last_edge_us && now > s_te.last_edge_us) {
-        const int64_t period = now - s_te.last_edge_us;
+    if (s_te.metrics.last_edge_us && now > s_te.metrics.last_edge_us) {
+        const int64_t period = now - s_te.metrics.last_edge_us;
         s_te.metrics.last_period_us = period > UINT32_MAX ? UINT32_MAX : (uint32_t)period;
     }
-    s_te.last_edge_us = now;
+    s_te.metrics.last_edge_us = now;
     ++s_te.metrics.edges;
     portEXIT_CRITICAL_ISR(&s_lock);
     xSemaphoreGiveFromISR(signal, &wake);
@@ -82,7 +82,7 @@ void co5300_display_cancel_te(esp_lcd_panel_io_handle_t io)
     if (matches) {
         ++s_te.cancel_sequence;
         s_te.retry_after_us = 0;
-        s_te.last_edge_us = 0;
+        s_te.metrics.last_edge_us = 0;
         s_te.metrics.last_period_us = 0; /* Do not report the sleep gap as a panel period. */
     }
     SemaphoreHandle_t signal = matches ? s_te.signal : NULL;

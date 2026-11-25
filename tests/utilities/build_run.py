@@ -9,11 +9,12 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
 parser.add_argument("--lvgl-cache", type=Path)
+parser.add_argument("--output", type=Path)
 parser.add_argument("--layout-only", action="store_true", help="Run calendar and touch-to-talk checks")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 test = root / "tests/utilities"
-out = root / ("build/host_utilities_layout" if args.layout_only else "build/host_utilities_ui")
+out = args.output or root / ("build/host_utilities_layout" if args.layout_only else "build/host_utilities_ui")
 out.mkdir(parents=True, exist_ok=True)
 lvgl = root / "managed_components/lvgl__lvgl"
 
@@ -52,11 +53,13 @@ for source in [*sorted((lvgl / "src").rglob("*.c")),
 shutil.copyfile(root / "main/app_utilities.h", out / "app_utilities.h")
 shutil.copyfile(root / "main/app_intercom.h", out / "app_intercom.h")
 for source in [root / "main/apps/app_utilities.c", root / "main/apps/app_wifi.c", root / "main/apps/app_intercom.c",
+               root / "main/apps/app_calculator.c", root / "main/apps/app_clock_tools.c",
                root / "main/ui/app_text_input.c"]:
     copy = out / source.name
     shutil.copyfile(source, copy)
     schedule(copy, copy.stem + ".o", True)
 for source in [root / "main/app_weather_data.c", root / "main/app_tools_math.c",
+               root / "main/apps/app_calc_modes.c",
                root / "main/app_text.c", root / "main/app_pinyin.c", root / "main/app_pinyin_swipe.c",
                test / "ui_smoke.c"]:
     schedule(source, source.stem + ".o", True)

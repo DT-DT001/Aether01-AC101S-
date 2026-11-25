@@ -8,6 +8,11 @@
 #include "app_intercom.h"
 #include "app_utilities.h"
 #include "aether_recorder.h"
+#ifdef ESP_PLATFORM
+#include "app_theme.h"
+#else
+#define app_theme_background(value) (value)
+#endif
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -213,7 +218,7 @@ lv_obj_t *app_ui_new_screen(app_ui_t *ui)
     ui->shutdown_overlay = NULL;
     lv_obj_t *screen = lv_obj_create(NULL);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x101321), 0);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(app_theme_background(0x101321)), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(screen, app_ui_chinese_font(), 0);
     ui->screen = screen;
@@ -228,7 +233,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_set_size(back, 48, 44);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET);
     lv_obj_set_style_radius(back, 14, 0);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x232842), 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(app_theme_background(0x232842)), 0);
     lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, ui);
     app_ui_add_text(back, LV_SYMBOL_LEFT, LV_ALIGN_CENTER, 0, 0, 0xBFD7FF,
                     &lv_font_montserrat_20);
@@ -243,7 +248,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_set_size(content, 448, 394);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, -14);
     lv_obj_set_style_radius(content, 24, 0);
-    lv_obj_set_style_bg_color(content, lv_color_hex(0x10192A), 0);
+    lv_obj_set_style_bg_color(content, lv_color_hex(app_theme_background(0x10192A)), 0);
     lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_pad_all(content, 20, 0);
     lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);

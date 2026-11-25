@@ -15,7 +15,7 @@ ui=(root/'main/ui/app_ui.c').read_text(encoding='utf-8')
 back=ui[ui.index('static bool navigate('):ui.index('static bool request_home(')]
 back+=ui[ui.index('bool app_ui_go_back('):ui.index('void app_ui_set_user_key_exit(')]
 header=ui[ui.index('lv_obj_t *app_ui_begin_page('):ui.index('static void shutdown_notice_close(')]
-source=out/'common_header.c';source.write_text('#include "app_ui_internal.h"\n#include "app_battery.h"\n#include "app_screen.h"\n'+back+header,encoding='utf-8')
+source=out/'common_header.c';source.write_text('#include "app_ui_internal.h"\n#include "app_battery.h"\n#include "app_screen.h"\n#define app_theme_background(color) (color)\n'+back+header,encoding='utf-8')
 flags=[compiler,'-std=c11','-O1','-g','-Wall','-Wextra','-Werror',sanitizer,
        '-ffunction-sections','-fdata-sections','-DLV_CONF_INCLUDE_SIMPLE','-DLV_CONF_SUPPRESS_DEFINE_CHECK=1',
        '-DLV_FONT_MONTSERRAT_20=1','-D_DEFAULT_SOURCE',*['-I'+str(p) for p in [

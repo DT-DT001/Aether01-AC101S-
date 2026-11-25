@@ -85,6 +85,10 @@ QSPI remains 40MHz. A 480×480 RGB565 pixel payload alone requires at least 23.0
 
 This is not an ESP32-S31 deep-sleep GPIO wake. The power-on chain is `PCF85063 → board routing → TG29 → DCDC2/ESP_3V3 → ESP32-S31 cold boot`. While running, PCF85063 and TG29 use separate GPIO4 and GPIO5 inputs, so their sources are not multiplexed on one MCU pin.
 
+Software shutdown verifies sensor sleep and disables USB output. It then attempts to drive PA_CTRL low, park touch, and put the display to sleep before asserting reset and disabling AVDD_EN. The display VBAT and amplifier PVDD are both tied to VSYS, which USB can continue supplying. TG29 REG27[0] shuts down the regulated outputs, retaining the RTCLDO used by the RTC. ALDO2 stays powered until that command so the sensors cannot clamp the shared system I²C bus. A peripheral preparation error still permits TG29 shutdown. If the TG29 command fails, firmware restores the display and touch.
+
+Verify battery-only and USB-connected shutdown separately. Measure battery current and the DCDC2, ALDO2, ALDO4, CLDO1, CLDO3 and VSYS voltages after shutdown, then confirm cold boots via the power key and RTC alarm. Firmware acknowledgments and register readbacks do not establish physical rail voltages.
+
 ## I2C addresses
 
 The three buses use three explicitly selected hardware controllers; no controller is auto-assigned:

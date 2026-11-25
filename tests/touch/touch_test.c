@@ -355,8 +355,29 @@ static int test_stale_report(void)
     return 0;
 }
 
+static int test_shutdown_input_pause(void)
+{
+    reset();
+    CHECK(!app_touch_set_shutdown_paused(true));
+    CHECK(app_touch_add(&display, &touch, &power));
+    CHECK(sample().state == LV_INDEV_STATE_PRESSED);
+    CHECK(app_touch_set_shutdown_paused(true) && !fake_indev.enabled && resets == 1);
+    CHECK(!app_touch_set_shutdown_paused(true) && !fake_indev.enabled && resets == 1);
+    (void)app_touch_set_shutdown_paused(false);
+    CHECK(fake_indev.enabled && sample().state == LV_INDEV_STATE_RELEASED);
+    point_count = 0;
+    ++source_sequence;
+    CHECK(sample().state == LV_INDEV_STATE_RELEASED);
+    point_count = 1;
+    ++source_sequence;
+    CHECK(sample().state == LV_INDEV_STATE_PRESSED);
+    puts("PASS shutdown input pause preserves ownership and consumes held contact during rollback");
+    return 0;
+}
+
 int main(void)
 {
     return test_initialization() || test_errors() || test_wake_gesture() || test_coordinate_bounds() ||
-           test_independent_wake() || test_exclusive_input_and_fallback() || test_stale_report();
+           test_independent_wake() || test_exclusive_input_and_fallback() || test_stale_report() ||
+           test_shutdown_input_pause();
 }

@@ -19,6 +19,7 @@ struct app_ui {
     lv_timer_t *timer;
     lv_obj_t *shutdown_overlay;
     atomic_bool storage_resume_pending;
+    atomic_bool screen_suspended;
     bool shutdown_failure_shown;
 };
 const lv_font_t *app_ui_chinese_font_size(unsigned);

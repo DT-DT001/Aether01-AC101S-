@@ -20,6 +20,7 @@ subprocess.run([
     "-I" + str(root / "tests/reader_ui"), "-I" + str(lvgl), "-I" + str(root / "main"),
     "-I" + str(root / "components/co5300_display/include"),
     str(root / "main/app_display_metrics.c"), str(root / "main/app_display_sync.c"),
+    str(root / "components/co5300_display/co5300_stream.c"),
     str(test / "staged_lvgl_test.c"), *map(str, objects), "-Wl,--gc-sections", "-lm", "-o", str(binary),
 ], check=True)
 subprocess.run([str(binary)], check=True)

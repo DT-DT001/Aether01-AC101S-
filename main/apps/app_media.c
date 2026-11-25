@@ -3,6 +3,7 @@
 #include "app_catalog_ui.h"
 #include "app_touch.h"
 #include "app_audio_system.h"
+#include "app_display_sync.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -532,6 +533,7 @@ static void nes_frame_cb(const uint16_t *pixels, uint16_t width,
 static void nes_cleanup(app_ui_t *ui)
 {
     ui->media_active = false;
+    app_display_sync_set_nes_viewport(lv_obj_get_display(ui->screen), NULL);
     app_frames_set_active(ui->frames, false);
     if (ui->app_obj[0]) lv_image_set_src(ui->app_obj[0], NULL);
     if (ui->nes) {
@@ -559,6 +561,7 @@ static void nes_status_timer(lv_timer_t *timer)
     } else if (status.state == AETHER_NES_ERROR) {
         if (ui->media_started) {
             ui->media_active = false;
+            app_display_sync_set_nes_viewport(lv_obj_get_display(ui->screen), NULL);
             app_frames_set_active(ui->frames, false);
             ui->media_started = false;
             ui->touch_restore_pending = true;
@@ -593,11 +596,17 @@ static void nes_loaded(app_ui_t *ui, const app_io_result_t *result)
     ui->touch_restore_pending = false;
     app_frames_set_active(ui->frames, true);
     app_frames_set_refresh_image(ui->frames, ui->app_obj[0]);
+    app_frames_set_direct_presenter(ui->frames, app_display_sync_present_nes);
+    lv_obj_update_layout(ui->app_obj[0]);
+    lv_area_t viewport;
+    lv_obj_get_coords(ui->app_obj[0], &viewport);
+    app_display_sync_set_nes_viewport(lv_obj_get_display(ui->app_obj[0]), &viewport);
     if (ui->touch_indev) app_touch_set_enabled(ui->touch_indev, false);
     app_ui_set_timer(ui, nes_status_timer, 200);
     esp_err_t err = aether_nes_start(ui->nes, ui->app_path, nes_frame_cb, ui);
     if (err != ESP_OK) {
         ui->media_active = false;
+        app_display_sync_set_nes_viewport(lv_obj_get_display(ui->screen), NULL);
         ui->media_started = false;
         app_frames_set_active(ui->frames, false);
         ui->touch_restore_pending = true;
@@ -621,7 +630,9 @@ void app_open_nes_path(app_ui_t *ui, const char *path)
     lv_image_set_inner_align(ui->app_obj[0], LV_IMAGE_ALIGN_CENTER);
     lv_image_set_antialias(ui->app_obj[0], false);
     lv_obj_remove_flag(ui->app_obj[0], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_center(ui->app_obj[0]);
+    /* Keep the same frame size and give the top-to-bottom OLED scan 24 more
+     * rows of transfer lead after the line-zero TE edge. */
+    lv_obj_align(ui->app_obj[0], LV_ALIGN_CENTER, 0, 24);
     ui->app_obj[1] = app_ui_add_text(ui->screen, "正在加载ROM…",
                                      LV_ALIGN_TOP_LEFT, 20, 84, 0xFFCA5C,
                                      app_ui_chinese_font());

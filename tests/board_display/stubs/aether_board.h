@@ -26,3 +26,4 @@ esp_err_t esp_lcd_touch_exit_sleep(esp_lcd_touch_handle_t);
 esp_err_t aether_board_set_display_sleep(aether_board_t *, bool);
 esp_err_t aether_board_set_display_brightness(aether_board_t *, uint8_t);
 esp_err_t aether_board_set_touch_sleep(aether_board_t *, bool);
+esp_err_t aether_board_park_peripherals(aether_board_t *);

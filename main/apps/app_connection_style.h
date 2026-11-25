@@ -1,6 +1,11 @@
 #pragma once
 
 #include "app_ui_internal.h"
+#ifdef ESP_PLATFORM
+#include "app_theme.h"
+#else
+#define app_theme_background(value) (value)
+#endif
 
 enum {
     CONNECTION_PANEL = 0x172336,
@@ -16,7 +21,7 @@ enum {
 static inline void app_connection_card_style(lv_obj_t *card)
 {
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(card, lv_color_hex(CONNECTION_PANEL), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(app_theme_background(CONNECTION_PANEL)), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(CONNECTION_BORDER), 0);
@@ -29,7 +34,7 @@ static inline void app_connection_button_style(lv_obj_t *button, bool primary)
     lv_obj_set_style_radius(button, 12, 0);
     lv_obj_set_style_shadow_width(button, 0, 0);
     lv_obj_set_style_pad_all(button, 0, 0);
-    lv_obj_set_style_bg_color(button, lv_color_hex(primary ? CONNECTION_BLUE : CONNECTION_CONTROL), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(app_theme_background(primary ? CONNECTION_BLUE : CONNECTION_CONTROL)), 0);
     lv_obj_set_style_bg_color(button, lv_color_hex(0x355C82), LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(button, lv_color_hex(0x283244), LV_STATE_DISABLED);
     lv_obj_set_style_recolor_opa(button, LV_OPA_TRANSP, LV_STATE_DISABLED);

@@ -22,7 +22,8 @@ esp_err_t ac101s_audio_stop(ac101s_audio_handle_t h){assert(h==(void*)2);++stops
 void aether_nes_port_set_active(aether_nes_handle_t h){assert(h==worker_arg);}
 int aether_nes_port_run(void){aether_nes_handle_t h=worker_arg;if(save_failure){h->persistence_error=ESP_FAIL;strlcpy(h->detail,"save failed; old backup retained",sizeof(h->detail));}if(run_return_stop)atomic_store(&h->stop_requested,true);return 0;}
 esp_err_t aether_nes_port_shutdown(void){++port_stops;return port_stop_error;}
-int xTaskCreate(void(*fn)(void*),const char*n,unsigned stack,void*a,unsigned pri,void*out){assert(!strcmp(n,"nes")&&stack==12288&&pri==7&&!out);worker=fn;worker_arg=a;return pdPASS;}
+int xTaskCreatePinnedToCore(void(*fn)(void*),const char*n,unsigned stack,void*a,unsigned pri,void*out,int core)
+{assert(!strcmp(n,"nes")&&stack==12288&&pri==7&&!out&&core==1);worker=fn;worker_arg=a;return pdPASS;}
 void vTaskDelete(void *t){assert(!t);}
 void vTaskDelay(uint32_t t){ticks+=t;}
 TickType_t xTaskGetTickCount(void){return ticks;}

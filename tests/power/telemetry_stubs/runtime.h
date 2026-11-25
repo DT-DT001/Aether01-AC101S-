@@ -8,6 +8,7 @@
 #define ESP_ERR_NOT_FOUND 0x105
 typedef uint32_t TickType_t;
 typedef int BaseType_t;
+typedef void *TaskHandle_t;
 typedef pthread_mutex_t portMUX_TYPE;
 #define portMUX_INITIALIZER_UNLOCKED PTHREAD_MUTEX_INITIALIZER
 #define portENTER_CRITICAL(p) pthread_mutex_lock(p)
@@ -35,6 +36,7 @@ esp_err_t qmi8658a_set_gyro_bias(void *, const float[3]);
 esp_err_t dps368_read(void *, dps368_sample_t *);
 esp_err_t dps368_set_sleep(void *, bool);
 esp_err_t pcf85063_get_time(void *, pcf85063_time_t *);
+esp_err_t pcf85063_get_time_with_timeout(void *, pcf85063_time_t *, int);
 TickType_t xTaskGetTickCount(void);
 void vTaskDelay(TickType_t);
 BaseType_t xTaskCreate(void (*)(void *), const char *, unsigned, void *, unsigned, void *);

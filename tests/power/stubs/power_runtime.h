@@ -39,7 +39,7 @@ typedef void *dps368_handle_t;
 typedef struct { float accel_mps2[3], gyro_dps[3]; } qmi8658a_sample_t;
 typedef struct { float pressure_pa, temperature_c; } dps368_sample_t;
 typedef struct { unsigned value; } pcf85063_time_t;
-typedef struct { bool display_sleeping; bool touch_ready; tg29_handle_t pmic;
+typedef struct { bool display_ready, display_sleeping, touch_ready, touch_sleeping; tg29_handle_t pmic;
     qmi8658a_handle_t imu; dps368_handle_t barometer; bool imu_ready, barometer_ready;
     void *audio; bool audio_ready;
 } aether_board_t;

@@ -24,9 +24,10 @@ static uint8_t from_bcd(uint8_t value)
     return (uint8_t)(((value >> 4) * 10U) + (value & 0x0F));
 }
 
-static esp_err_t read_regs(pcf85063_handle_t handle, uint8_t reg, uint8_t *data, size_t len)
+static esp_err_t read_regs(pcf85063_handle_t handle, uint8_t reg, uint8_t *data, size_t len,
+                           int timeout_ms)
 {
-    return i2c_master_transmit_receive(handle->i2c_dev, &reg, 1, data, len, PCF85063_TIMEOUT_MS);
+    return i2c_master_transmit_receive(handle->i2c_dev, &reg, 1, data, len, timeout_ms);
 }
 
 esp_err_t pcf85063_new(i2c_master_bus_handle_t bus, pcf85063_handle_t *out_handle)
@@ -46,7 +47,7 @@ esp_err_t pcf85063_new(i2c_master_bus_handle_t bus, pcf85063_handle_t *out_handl
     }
 
     uint8_t control1 = 0;
-    err = read_regs(handle, PCF85063_REG_CONTROL1, &control1, 1);
+    err = read_regs(handle, PCF85063_REG_CONTROL1, &control1, 1, PCF85063_TIMEOUT_MS);
     if (err != ESP_OK) {
         i2c_master_bus_rm_device(handle->i2c_dev);
         free(handle);
@@ -65,11 +66,13 @@ esp_err_t pcf85063_del(pcf85063_handle_t handle)
     return err;
 }
 
-esp_err_t pcf85063_get_time(pcf85063_handle_t handle, pcf85063_time_t *time)
+esp_err_t pcf85063_get_time_with_timeout(pcf85063_handle_t handle, pcf85063_time_t *time,
+                                        int timeout_ms)
 {
-    ESP_RETURN_ON_FALSE(handle && time, ESP_ERR_INVALID_ARG, TAG, "invalid argument");
+    if (!handle || !time || timeout_ms < 0) return ESP_ERR_INVALID_ARG;
     uint8_t data[7];
-    ESP_RETURN_ON_ERROR(read_regs(handle, PCF85063_REG_SECONDS, data, sizeof(data)), TAG, "read time");
+    const esp_err_t error = read_regs(handle, PCF85063_REG_SECONDS, data, sizeof(data), timeout_ms);
+    if (error != ESP_OK) return error;
     time->oscillator_stopped = (data[0] & 0x80) != 0;
     time->second = from_bcd(data[0] & 0x7F);
     time->minute = from_bcd(data[1] & 0x7F);
@@ -78,6 +81,13 @@ esp_err_t pcf85063_get_time(pcf85063_handle_t handle, pcf85063_time_t *time)
     time->weekday = data[4] & 0x07;
     time->month = from_bcd(data[5] & 0x1F);
     time->year = (uint16_t)(2000 + from_bcd(data[6]));
+    return ESP_OK;
+}
+
+esp_err_t pcf85063_get_time(pcf85063_handle_t handle, pcf85063_time_t *time)
+{
+    ESP_RETURN_ON_FALSE(handle && time, ESP_ERR_INVALID_ARG, TAG, "invalid argument");
+    ESP_RETURN_ON_ERROR(pcf85063_get_time_with_timeout(handle, time, PCF85063_TIMEOUT_MS), TAG, "read time");
     return ESP_OK;
 }
 

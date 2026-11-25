@@ -9,6 +9,10 @@
 void app_display_rounder(lv_area_t *area);
 /* LVGL owner only. Does not replace the port flush or IO completion callback. */
 esp_err_t app_display_sync_attach(lv_display_t *display, esp_lcd_panel_io_handle_t io);
+/* LVGL owner only. NULL disables the NES viewport timing probe. */
+void app_display_sync_set_nes_viewport(lv_display_t *display, const lv_area_t *area);
+bool app_display_sync_present_nes(lv_obj_t *image, const uint16_t *pixels,
+                                  uint16_t width, uint16_t height);
 /* Call from the existing background telemetry task. Rate-limited TE frequency
  * and cached fallback errors are printed here, never in the GUI flush path.
  * Reads only driver/POD snapshots and does not acquire the LVGL lock.

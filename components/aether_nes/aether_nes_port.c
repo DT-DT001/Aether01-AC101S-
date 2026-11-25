@@ -114,7 +114,7 @@ static inline uint16_t rgb888_to_565(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((r & 0xF8U) << 8) | ((g & 0xFCU) << 3) | (b >> 3));
 }
 
-static void write_audio_frame(void)
+void osd_output_audio(void)
 {
     if (!s_active || !s_audio_callback || atomic_load(&s_active->paused)) {
         return;
@@ -165,7 +165,6 @@ void osd_emulated_frame(int drawn)
     ++s_active->emulated_frames;
     if (!drawn) ++s_active->skipped_frames;
     portEXIT_CRITICAL(&s_active->lock);
-    write_audio_frame();
 }
 
 void osd_frame_begin(void)

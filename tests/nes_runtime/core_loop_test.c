@@ -14,7 +14,7 @@ static mmc_t mmc;
 static mapintf_t mapper;
 static unsigned waits, frames, blits, input_calls, scanlines, gui_ticks;
 static unsigned expected_frames, initial_ticks;
-static unsigned drawn_mask;
+static unsigned drawn_mask, audio_frames, expected_blits;
 static bool pause_case;
 static unsigned ticks_per_audio_frame, current_skips, maximum_skips, stop_at_frame;
 static bool pause_during_run;
@@ -45,9 +45,16 @@ void osd_emulated_frame(int drawn)
 {
     assert(frames < expected_frames);
     if (drawn && frames < 32) drawn_mask |= 1U << frames;
+    expected_blits += !!drawn;
     current_skips = drawn ? 0 : current_skips + 1;
     if (current_skips > maximum_skips) maximum_skips = current_skips;
     ++frames;
+}
+void osd_output_audio(void)
+{
+    assert(audio_frames + 1 == frames);
+    assert(blits == expected_blits); /* Complete frame is visible before the PCM sink blocks. */
+    ++audio_frames;
     /* Actual production loop; the PCM output clock is replaced by a sink
      * consuming one NTSC frame in one (or two overloaded) 60Hz tick periods. */
     atomic_fetch_add(&nofrendo_ticks,ticks_per_audio_frame);
@@ -58,6 +65,7 @@ void osd_frame_end(void) {}
 void osd_getinput(void)
 {
     ++input_calls;
+    assert(audio_frames == frames);
     if (stop_at_frame && frames == stop_at_frame) nes_poweroff();
     if (pause_during_run && frames == 100) { pause_during_run=false; nes_togglepause(); }
 }
@@ -94,6 +102,7 @@ static void run(unsigned tick_base, unsigned ticks, bool autoframeskip,
     apu.process = fake_process;
     mmc.intf = &mapper;
     waits = frames = blits = input_calls = scanlines = gui_ticks = drawn_mask = 0;
+    audio_frames = expected_blits = 0;
     expected_frames = expected;
     initial_ticks = ticks;
     pause_case = paused;
@@ -116,6 +125,7 @@ static void run_backpressure(unsigned sink_ticks, unsigned tick_base, bool pause
     machine->apu=&apu;machine->mmc=&mmc;machine->autoframeskip=true;
     apu.process=fake_process;mmc.intf=&mapper;
     waits=frames=blits=input_calls=scanlines=gui_ticks=drawn_mask=0;
+    audio_frames=expected_blits=0;
     current_skips=maximum_skips=0;
     expected_frames=3600;initial_ticks=3;pause_case=false;
     ticks_per_audio_frame=sink_ticks;pause_during_run=pause;stop_at_frame=stop_frame;
@@ -146,6 +156,6 @@ int main(void)
     run_backpressure(2,0,false,0); /* Sustained slow core/output still presents. */
     run_backpressure(1,0,true,0); /* Paused wall time does not become long skip debt. */
     run_backpressure(2,0,false,200); /* Stop/input works on an undisplayed frame. */
-    puts("NES production core loop: idle/skip/audio hook/pause/tick-wrap + 3600-frame I2S backpressure/slow-frame/no-video-starvation/stop passed");
+    puts("NES production core loop: frame published before audio, idle/skip/pause/tick-wrap + 3600-frame I2S backpressure/slow-frame/no-video-starvation/stop passed");
     return 0;
 }

@@ -1,6 +1,11 @@
 #pragma once
 
 #include <app_ui_internal.h>
+#ifdef ESP_PLATFORM
+#include "app_theme.h"
+#else
+#define app_theme_background(value) (value)
+#endif
 
 enum {
     INSTRUMENT_PANEL = 0x1A2438,
@@ -21,7 +26,7 @@ static inline lv_obj_t *instrument_card(lv_obj_t *parent, int x, int y, int widt
     lv_obj_set_pos(card, x, y);
     lv_obj_set_size(card, width, height);
     lv_obj_set_style_radius(card, 16, 0);
-    lv_obj_set_style_bg_color(card, lv_color_hex(INSTRUMENT_PANEL), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(app_theme_background(INSTRUMENT_PANEL)), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(INSTRUMENT_BORDER), 0);
@@ -33,7 +38,7 @@ static inline void instrument_button_style(lv_obj_t *button, uint32_t color)
 {
     lv_obj_set_style_radius(button, 14, 0);
     lv_obj_set_style_shadow_width(button, 0, 0);
-    lv_obj_set_style_bg_color(button, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(app_theme_background(color)), 0);
     lv_obj_set_style_bg_color(button, lv_color_hex(0x38699B), LV_STATE_PRESSED);
 }
 

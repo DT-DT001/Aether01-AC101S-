@@ -10,6 +10,7 @@ struct app_ui {
     lv_timer_t *timer;
     void *page_context;
     void (*page_cleanup)(app_ui_t *);
+    void (*page_back)(app_ui_t *);
 };
 bool app_power_is_sleeping(const app_power_t *);
 const lv_font_t *app_ui_chinese_font(void);

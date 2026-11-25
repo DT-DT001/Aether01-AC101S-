@@ -17,6 +17,7 @@ PARTITION_TABLE_AT = 0x8000
 PARTITION_TABLE_SIZE = 0xC00
 STORAGE_START = 0x850000
 FLASH_END = 0x4000000
+WALLPAPER_START = 0x3F00000
 EXTENSION_START = 0x900000
 EXTENSION_SIZE = 0x300000
 HEADER = struct.Struct('<4s9I')
@@ -71,6 +72,7 @@ def check_partition_table(data):
     if len(data) != PARTITION_TABLE_SIZE:
         raise ValueError('Incomplete partition table read')
     storage = None
+    wallpaper = None
     for start in range(0, len(data), PARTITION_ROW.size):
         row = data[start:start + PARTITION_ROW.size]
         if row.startswith(PARTITION_MD5):
@@ -85,12 +87,20 @@ def check_partition_table(data):
             if storage is not None:
                 raise ValueError('Duplicate live storage partition')
             storage = kind, subtype, address, count, flags
+        elif name == b'wallpaper':
+            if wallpaper is not None:
+                raise ValueError('Duplicate live wallpaper partition')
+            wallpaper = kind, subtype, address, count, flags
         elif address < EXTENSION_START + EXTENSION_SIZE and address + count > EXTENSION_START:
             raise ValueError('Another partition overlaps the dictionary region')
     else:
         raise ValueError('Missing live partition table checksum')
-    if storage != (1, 0x81, STORAGE_START, FLASH_END - STORAGE_START, 0):
+    storage_end = FLASH_END if wallpaper is None else WALLPAPER_START
+    if wallpaper is not None and wallpaper != (1, 0x40, WALLPAPER_START, FLASH_END - WALLPAPER_START, 0):
+        raise ValueError('Unsupported live AC101S wallpaper partition layout')
+    if storage != (1, 0x81, STORAGE_START, storage_end - STORAGE_START, 0):
         raise ValueError('Unsupported live AC101S storage partition layout')
+    return storage_end
 
 
 class Device:
@@ -127,7 +137,8 @@ class Device:
 
 
 def preflight(device, folder):
-    check_partition_table(device.read(PARTITION_TABLE_AT, PARTITION_TABLE_SIZE, folder / 'table.bin'))
+    storage_end = check_partition_table(
+        device.read(PARTITION_TABLE_AT, PARTITION_TABLE_SIZE, folder / 'table.bin'))
     head = device.read(EXTENSION_START, SECTOR, folder / 'header.bin')
     old = b''
     if head != b'\xFF' * SECTOR:
@@ -144,7 +155,7 @@ def preflight(device, folder):
     expected.write_bytes(old + b'\xFF' * (EXTENSION_SIZE - len(old)))
     try:
         device.run('verify-flash', '--flash-size', '64MB', hex(STORAGE_START), str(blank),
-                   hex(EXTENSION_START - SECTOR), str(blank), hex(FLASH_END - SECTOR), str(blank),
+                   hex(EXTENSION_START - SECTOR), str(blank), hex(storage_end - SECTOR), str(blank),
                    hex(EXTENSION_START), str(expected))
     except RuntimeError as error:
         raise RuntimeError(f'Cannot establish an unused or known dictionary bank. No bytes written.\n{error}') from error

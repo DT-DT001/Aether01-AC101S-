@@ -59,6 +59,10 @@ void osd_setsound(void (*process)(void *, int)) { process_audio = process; }
 void osd_emulated_frame(int drawn)
 {
     (void)drawn;
+    ++frames;
+}
+void osd_output_audio(void)
+{
     int16_t samples[800];
     assert(process_audio);
     process_audio(samples, 800);
@@ -67,7 +71,6 @@ void osd_emulated_frame(int drawn)
         if (!audio_samples) first_sample = samples[i];
         ++audio_samples;
     }
-    ++frames;
 }
 void osd_frame_begin(void) {}
 void osd_frame_end(void) {}

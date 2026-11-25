@@ -36,11 +36,23 @@ esp_err_t co5300_display_new(const co5300_display_config_t *config,
 esp_err_t co5300_display_set_sleep(esp_lcd_panel_io_handle_t io, bool sleeping);
 
 typedef struct {
+    uint16_t x_start, y_start, x_end, y_end; /* Exclusive ends. */
+} co5300_window_t;
+
+/* Serialize against every panel command for the full stream. Supply an
+ * even-aligned exact window on the first strip, then NULL to continue it.
+ * The caller holds the RGB565 wire-order strip immutable until color-done.
+ * A strip fits one bus transaction and generates one color-done callback. */
+esp_err_t co5300_display_write_rgb565_strip(esp_lcd_panel_io_handle_t io,
+    const co5300_window_t *first_window, const void *pixels, size_t bytes);
+
+typedef struct {
     bool available;
     gpio_num_t pin;
     esp_err_t setup_error;
     uint32_t edges, waits, synced, timeouts, cancelled, fallback_frames;
     uint32_t last_wait_us, max_wait_us, last_period_us;
+    int64_t last_edge_us;
 } co5300_te_metrics_t;
 /** Wait for a new rising TE edge in task context. timeout_ms must be <=100.
  * TIMEOUT/NOT_SUPPORTED permit unsynchronized fallback; never call from ISR.

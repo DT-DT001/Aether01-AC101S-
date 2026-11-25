@@ -1,3 +1,5 @@
 #pragma once
 #define AETHER_GPIO_LCD_AVDD_EN 17
 #define AETHER_GPIO_LCD_RST 15
+#define AETHER_GPIO_TOUCH_RST 16
+#define AETHER_GPIO_PA_ENABLE 42

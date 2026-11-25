@@ -4,8 +4,11 @@
 
 #undef AETHER_STORAGE_MOUNT_POINT
 #define AETHER_STORAGE_MOUNT_POINT "photos"
-void app_open_gallery(app_ui_t *);
+#include "../../main/app_media_image.c"
 #include "../../main/apps/app_gallery.c"
+#include "../../main/apps/app_theme.c"
+
+void verify_wallpaper_faults(void);
 
 extern const lv_font_t font_16, font_24;
 static uint16_t draw_buffer[480 * 40];
@@ -21,6 +24,8 @@ static void (*worker)(void *);
 static void *worker_arg;
 
 static unsigned fixture_root(const char *path) { return !strncmp(path, "usbphotos", 9); }
+bool aether_media_fs_safe_path(const char *path)
+{ return !strncmp(path, "photos/", 7) || !strncmp(path, "usbphotos/", 10); }
 bool aether_media_fs_path_ready(aether_storage_handle_t storage, const char *path)
 { assert(storage); return mounted[fixture_root(path)]; }
 uint32_t aether_media_fs_generation(aether_storage_handle_t storage, const char *path)
@@ -88,43 +93,49 @@ lv_obj_t *app_ui_add_text(lv_obj_t *parent, const char *text, lv_align_t align,
 static void header_back(lv_event_t *event)
 {
     app_ui_t *ui = lv_event_get_user_data(event);
-    if (lv_obj_get_parent(lv_event_get_current_target_obj(event)) == ui->screen && ui->page_back)
-        ui->page_back(ui);
+    if (lv_obj_get_parent(lv_event_get_current_target_obj(event)) != ui->screen || !ui->page_back) return;
+    if (!ui->page_can_exit || ui->page_can_exit(ui, ui->page_back)) ui->page_back(ui);
 }
 lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
 {
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
     if (ui->page_cleanup) { ui->page_cleanup(ui); ui->page_cleanup = NULL; }
     ui->page_back = NULL;
+    ui->page_can_exit = NULL;
     ++ui->page_generation;
     ui->io_complete = NULL;
     lv_obj_t *old = ui->screen;
     ui->screen = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x101321), 0);
+    lv_obj_set_style_bg_color(ui->screen, lv_color_hex(app_theme_background(0x101321)), 0);
     lv_obj_t *back = lv_button_create(ui->screen);
     lv_obj_set_size(back, 48, 44);
     lv_obj_set_pos(back, 14, 12);
+    lv_obj_set_style_bg_color(back, lv_color_hex(app_theme_background(0x232842)), 0);
     lv_obj_add_event_cb(back, header_back, LV_EVENT_CLICKED, ui);
     app_ui_add_text(back, LV_SYMBOL_LEFT, LV_ALIGN_CENTER, 0, 0, 0xBFD7FF, &lv_font_montserrat_16);
     app_ui_add_text(ui->screen, title, LV_ALIGN_TOP_MID, 0, 20, 0xEAF2FF, &font_24);
     ui->content = lv_obj_create(ui->screen);
     lv_obj_set_size(ui->content, 448, 394);
     lv_obj_align(ui->content, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_set_style_bg_color(ui->content, lv_color_hex(app_theme_background(0x10192A)), 0);
+    lv_obj_set_style_border_width(ui->content, 0, 0);
     lv_obj_set_style_pad_all(ui->content, 20, 0);
     lv_obj_set_style_radius(ui->content, 24, 0);
     lv_screen_load(ui->screen);
-    if (old) lv_obj_delete(old);
+    if (old) lv_obj_delete_async(old);
     return ui->content;
 }
 void app_ui_set_timer(app_ui_t *ui, lv_timer_cb_t callback, uint32_t period)
 { ui->timer = lv_timer_create(callback, period, ui); }
+void app_ui_clear_timer(app_ui_t *ui)
+{ if (ui->timer) lv_timer_pause(ui->timer); }
 void app_ui_request_io_ex(app_ui_t *ui, const app_io_request_t *candidate,
                           void (*complete)(app_ui_t *, const app_io_result_t *))
 {
     assert(!ui->io_complete);
     request = *candidate;
     assert(request.operation == APP_IO_CATALOG && request.filter == APP_IO_IMAGES &&
-           request.limit == GALLERY_CATALOG_LIMIT && request.offset == 0 && !request.path[0]);
+           request.limit == GALLERY_CATALOG_LIMIT && request.offset == 0);
     ++catalog_queries;
     ui->io_complete = complete;
 }
@@ -191,6 +202,118 @@ static void tap(lv_obj_t *object)
 }
 
 static void previous_page(app_ui_t *ui) { assert(ui); ++previous_page_calls; }
+
+static void test_wallpaper_upscale(app_ui_t *ui)
+{
+    static const struct {
+        const char *path;
+        uint16_t width, height, fitted_width, fitted_height;
+    } cases[] = {
+        {"photos/wallpaper-wide.bmp", 3, 2, 480, 320},
+        {"photos/wallpaper-tall.bmp", 2, 3, 320, 480},
+        {"photos/wallpaper-tiny.bmp", 1, 1, 480, 480},
+    };
+    static const uint16_t colors[] = {0xf800, 0x07e0, 0x001f, 0xffff, 0x0000, 0x07ff};
+    atomic_bool cancelled = false;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const char *path = cases[i].path;
+        const uint32_t generation = generations[0];
+        app_media_image_t image;
+        assert(app_media_image_read(ui->storage, path, generation, &cancelled, 480, 480, false, &image) == ESP_OK);
+        assert(!leases && image.width == cases[i].width && image.height == cases[i].height);
+        assert(!memcmp(image.pixels, colors, image.width * image.height * sizeof(uint16_t)));
+        free(image.pixels);
+        assert(app_media_image_read(ui->storage, path, generation, &cancelled, 480, 480, true, &image) == ESP_OK);
+        assert(!leases && image.width == cases[i].fitted_width && image.height == cases[i].fitted_height);
+        for (unsigned y = 0; y < image.height; ++y) {
+            const unsigned source_y = y * cases[i].height / image.height;
+            for (unsigned x = 0; x < image.width; ++x) {
+                const unsigned source_x = x * cases[i].width / image.width;
+                assert(image.pixels[y * image.width + x] == colors[source_y * cases[i].width + source_x]);
+            }
+        }
+        free(image.pixels);
+    }
+    puts("PASS wallpaper resize: tiny, landscape and portrait BMPs scale proportionally with every pixel checked and normal Gallery dimensions preserved");
+}
+
+static void test_theme(app_ui_t *ui, lv_display_t *display)
+{
+    verify_wallpaper_faults();
+    app_theme_init();
+    assert(app_theme_wallpaper_available() && !app_theme_wallpaper());
+    const uint32_t base = 0x101321;
+    assert(app_theme_background(base) == base && app_theme_color(base) == base);
+    app_open_theme(ui);
+    theme_page_t *theme = ui->page_context;
+    assert(lv_obj_has_state(theme->swatches[0], LV_STATE_CHECKED));
+    snapshot(display, "theme-default.ppm");
+    tap(theme->swatches[3]);
+    assert(theme->saving && app_theme_write_status() == ESP_ERR_NOT_FINISHED);
+    assert(app_theme_background(base) == base);
+    run_worker();
+    advance(60);
+    theme = ui->page_context;
+    assert(lv_obj_has_state(theme->swatches[3], LV_STATE_CHECKED));
+    assert(lv_color_eq(lv_obj_get_style_bg_color(theme->swatches[3], 0), lv_color_hex(palettes[3].accent)));
+    assert(app_theme_background(base) != base && app_theme_color(base) != base);
+    nvs_handle_t nvs;
+    uint8_t saved = 0;
+    assert(nvs_open("appearance", NVS_READONLY, &nvs) == ESP_OK);
+    assert(nvs_get_u8(nvs, "palette", &saved) == ESP_OK && saved == 3);
+    nvs_close(nvs);
+
+    mounted[0] = true;
+    test_wallpaper_upscale(ui);
+    tap(theme->pick);
+    gallery_page_t *picker = ui->page_context;
+    assert(picker->wallpaper && picker->media.sources == 1 && !strcmp(request.path, "photos"));
+    strlcpy(fixtures[0].path, "photos/portrait.bmp", sizeof(fixtures[0].path));
+    strlcpy(fixtures[1].path, "photos/wallpaper-wide.bmp", sizeof(fixtures[1].path));
+    finish_catalog(ui, 2, 2);
+    advance(50);
+    tap(picker->rows.rows[0]);
+    assert(picker->job && picker->job->wallpaper);
+    run_worker();
+    advance(60);
+    assert(picker->pixels && picker->descriptor.header.w == 300 && picker->descriptor.header.h == 480);
+    assert(lv_image_get_scale(picker->image) < LV_SCALE_NONE);
+    assert(!lv_obj_has_state(picker->apply, LV_STATE_DISABLED));
+    tap(picker->newer);
+    run_worker();
+    advance(60);
+    assert(picker->pixels && picker->descriptor.header.w == 480 && picker->descriptor.header.h == 320);
+    tap(picker->older);
+    run_worker();
+    advance(60);
+    assert(picker->pixels && picker->descriptor.header.w == 300 && picker->descriptor.header.h == 480);
+    snapshot(display, "theme-picker-preview.ppm");
+    tap(picker->apply);
+    assert(picker->saving && !picker->pixels && !app_theme_wallpaper());
+    mounted[0] = false;
+    ++generations[0];
+    advance(60);
+    assert(picker->saving && picker->viewer);
+    run_worker();
+    advance(60);
+    theme = ui->page_context;
+    const lv_image_dsc_t *source = app_theme_wallpaper();
+    assert(source && source->header.w == 300 && source->header.h == 480);
+    assert(!lv_obj_has_state(theme->clear, LV_STATE_DISABLED));
+    snapshot(display, "theme-installed.ppm");
+
+    lv_obj_t *old_page = lv_obj_create(NULL);
+    lv_obj_t *old_view = app_theme_wallpaper_view(old_page);
+    assert(old_view && lv_image_get_src(old_view) == source);
+    tap(theme->clear);
+    assert(theme->saving);
+    run_worker();
+    advance(60);
+    assert(!app_theme_wallpaper() && source->data && lv_image_get_src(old_view) == source);
+    lv_obj_delete(old_page);
+    assert(lv_mem_test() == LV_RESULT_OK);
+    puts("PASS theme UI: asynchronous palette, TF-only picker, portrait aspect fit, ejection during save, and lifetime-safe wallpaper clear");
+}
 
 int main(void)
 {
@@ -307,7 +430,9 @@ int main(void)
         advance(35);
         assert(lv_mem_test() == LV_RESULT_OK);
     }
+    test_theme(&ui, display);
     app_ui_begin_page(&ui, "桌面");
+    advance(30);
     lv_indev_delete(pointer);
     lv_display_delete(display);
     lv_deinit();

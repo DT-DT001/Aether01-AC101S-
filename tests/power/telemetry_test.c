@@ -20,6 +20,7 @@ static atomic_bool measurement_requested;
 static atomic_uint measurement_samples, measurement_pauses;
 static atomic_int measurement_last_error;
 static atomic_uint measurement_first_ms, measurement_last_ms;
+static atomic_uint measurement_max_gap_ms, timed_rtc_reads;
 static esp_err_t quiesce_result;
 static atomic_bool finish_worker;
 static _Thread_local bool is_worker;
@@ -148,6 +149,13 @@ esp_err_t dps368_read(void *h, dps368_sample_t *s)
 }
 esp_err_t pcf85063_get_time(void *h, pcf85063_time_t *s)
 { (void)h; atomic_fetch_add(&rtc_reads, 1); s->value = 123; return ESP_OK; }
+esp_err_t pcf85063_get_time_with_timeout(void *h, pcf85063_time_t *s, int timeout_ms)
+{
+    assert(is_worker && timeout_ms == 8);
+    vTaskDelay((TickType_t)timeout_ms);
+    if (atomic_fetch_add(&timed_rtc_reads, 1) == 0) return ESP_ERR_TIMEOUT;
+    return pcf85063_get_time(h, s);
+}
 static bool request_measurement(void)
 { assert(is_worker); return atomic_load(&measurement_requested); }
 static void consume_measurement(const app_telemetry_snapshot_t *sample)
@@ -163,6 +171,8 @@ static void consume_measurement(const app_telemetry_snapshot_t *sample)
     const unsigned previous = atomic_exchange(&measurement_last_ms, sample->imu_updated_ms);
     if (previous == sample->imu_updated_ms) return;
     if (!atomic_load(&measurement_samples)) atomic_store(&measurement_first_ms, sample->imu_updated_ms);
+    else if (sample->imu_updated_ms - previous > atomic_load(&measurement_max_gap_ms))
+        atomic_store(&measurement_max_gap_ms, sample->imu_updated_ms - previous);
     atomic_fetch_add(&measurement_samples, 1);
 }
 static void await_samples(unsigned count)
@@ -399,6 +409,14 @@ int main(void)
     uint32_t span = atomic_load(&measurement_last_ms) - atomic_load(&measurement_first_ms);
     assert(span >= 4U * (measured - 1) && span <= 9U * (measured - 1));
     assert(atomic_load(&measurement_last_error) == ESP_OK);
+    const unsigned measuring_diagnostics = atomic_load(&display_diagnostic_polls);
+    for (unsigned elapsed = 0; elapsed < 1500 && atomic_load(&timed_rtc_reads) < 2; ++elapsed) vTaskDelay(1);
+    assert(atomic_load(&timed_rtc_reads) >= 2);
+    assert(atomic_load(&measurement_max_gap_ms) < 80);
+    assert(atomic_load(&display_diagnostic_polls) == measuring_diagnostics);
+    app_telemetry_get(&snap);
+    assert(snap.rtc_error == ESP_OK);
+    puts("PASS measurement keeps the IMU cadence through an 8ms RTC timeout/retry, leaves diagnostics deferred and preserves clock data");
     app_telemetry_get(&snap);
     assert(snap.imu_error == ESP_ERR_NOT_FINISHED);
     atomic_store(&no_new_imu_frame, true);

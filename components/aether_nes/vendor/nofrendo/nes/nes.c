@@ -336,28 +336,9 @@ static void nes_renderframe(bool draw_flag)
 
 static void system_video(bool draw)
 {
-   /* TODO: hack */
-   if (false == draw)
-   {
-      gui_frame(false);
-      /* Input/stop/hot-unplug must still be serviced under sustained overload.
-         Otherwise automatic frameskip can avoid the input path forever. */
-      osd_getinput();
-      return;
-   }
-
-   /* blit the NES screen to our video surface */
-//   vid_blit(nes.vidbuf, 0, (NES_SCREEN_HEIGHT - NES_VISIBLE_HEIGHT) / 2,
-//            0, 0, NES_SCREEN_WIDTH, NES_VISIBLE_HEIGHT);
-
-   /* overlay our GUI on top of it */
-   gui_frame(true);
-
-   /* blit to screen */
-   vid_flush();
-
-   /* grab input */
-   osd_getinput();
+   gui_frame(draw);
+   if (draw)
+      vid_flush();
 }
 
 /* main emulation loop */
@@ -417,10 +398,13 @@ void nes_emulate(void)
          frames_to_render--;
          osd_frame_begin();
          nes_renderframe(draw);
-         /* Sound advances with emulation, never with successful screen blits.
-          * Otherwise frameskip also skips APU time and causes audible stalls. */
          osd_emulated_frame(draw);
+         /* Publish the completed pixels before a potentially blocking PCM
+          * write so the renderer can meet the next panel refresh deadline. */
          system_video(draw);
+         /* Keep the APU and controls advancing even when video is skipped. */
+         osd_output_audio();
+         osd_getinput();
          osd_frame_end();
       }
       else

@@ -27,6 +27,10 @@ typedef struct {
 esp_err_t pcf85063_new(i2c_master_bus_handle_t bus, pcf85063_handle_t *out_handle);
 esp_err_t pcf85063_del(pcf85063_handle_t handle);
 esp_err_t pcf85063_get_time(pcf85063_handle_t handle, pcf85063_time_t *time);
+/** Read time using a nonnegative I2C timeout in milliseconds.
+ * The RTC layer does not log read failures. */
+esp_err_t pcf85063_get_time_with_timeout(pcf85063_handle_t handle, pcf85063_time_t *time,
+                                        int timeout_ms);
 esp_err_t pcf85063_set_time(pcf85063_handle_t handle, const pcf85063_time_t *time);
 
 #ifdef __cplusplus

@@ -174,6 +174,25 @@ static bool uniform(const uint16_t *pixels, size_t count, uint16_t value)
     return true;
 }
 
+static app_frames_handle_t direct_frames;
+static unsigned direct_calls;
+static bool direct_stable, direct_enabled;
+static bool test_direct_present(lv_obj_t *image, const uint16_t *pixels,
+    uint16_t width, uint16_t height)
+{
+    if (++direct_calls == 1) {
+        direct_stable = width == 4 && height == 4 && !last_mutex->locked &&
+            (const uint8_t *)pixels == image->source->data && uniform(pixels,16,13);
+        for (uint16_t value = 20; value <= 30; ++value) {
+            uint16_t next[16];
+            fill(next,16,value);
+            app_frames_push(direct_frames,next,4,4);
+            direct_stable = direct_stable && uniform(pixels,16,13);
+        }
+    }
+    return direct_enabled;
+}
+
 int test_startup_rollback(void)
 {
     reset(0);
@@ -254,6 +273,17 @@ int test_copy_latest_front(void)
     display.refresh(&refresh);
     CHECK(image.updates==1&&image.invalidations==2&&!display.activity&&cache_drops==2);
     CHECK(uniform((const uint16_t *)image.source->data,16,12));
+    app_frames_set_direct_presenter(frames,test_direct_present);
+    direct_frames=frames;direct_enabled=true;direct_calls=0;
+    fill(source,16,13);
+    app_frames_push(frames,source,4,4);
+    display.refresh(&refresh);
+    CHECK(direct_stable&&direct_calls==1&&image.invalidations==2);
+    CHECK(uniform((const uint16_t *)image.source->data,16,13));
+    direct_enabled=false;
+    display.refresh(&refresh);
+    CHECK(direct_calls==2&&image.invalidations==3);
+    CHECK(uniform((const uint16_t *)image.source->data,16,30)); /* Latest frame still composes. */
     lv_event_t deleted={.user_data=image.delete_context,.target=&image};
     image.on_delete(&deleted);
     CHECK(!display.refresh&&!image.on_delete);

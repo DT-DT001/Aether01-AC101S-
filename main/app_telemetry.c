@@ -1,4 +1,5 @@
 #include "app_telemetry.h"
+#include "app_service_task.h"
 #include "app_display_metrics.h"
 #include "app_display_sync.h"
 #include "app_gyro_calibration.h"
@@ -14,6 +15,7 @@
 /* The QMI8658A generates a new six-axis frame about every 4.46 ms. */
 #define MEASUREMENT_IMU_PERIOD_MS 5U
 #define MEASUREMENT_IMU_RETRY_MS 2U
+#define MEASUREMENT_RTC_TIMEOUT_MS 8
 enum {
     GYRO_COUNTDOWN_MS = 2000U,
     GYRO_SAMPLE_MS = 5000U,
@@ -419,14 +421,6 @@ static void telemetry_task(void *argument)
         void (*measurement_consumer)(const app_telemetry_snapshot_t *) = s_measurement_consumer;
         app_telemetry_snapshot_t next = s_snapshot;
         portEXIT_CRITICAL(&s_lock);
-        if ((int32_t)(now - media_due) >= 0) {
-            portENTER_CRITICAL(&s_lock);
-            void (*probe)(void *) = s_media_probe;
-            void *context = s_media_probe_context;
-            portEXIT_CRITICAL(&s_lock);
-            if (!paused && !suspended && probe) probe(context);
-            media_due = now + 5000;
-        }
         if (paused) {
             /* The shutdown coordinator now owns and verifies the sensors. */
             sleeping_sensors = 0;
@@ -450,11 +444,23 @@ static void telemetry_task(void *argument)
             due_imu = due_baro = now;
             previous_suspend = suspended;
         }
-        if (!suspended) app_display_sync_poll_diagnostics(board->display_io);
         const uint32_t parked_sensors = sleeping_sensors | uncertain_sensors;
         const bool can_sample_imu = !suspended && !(parked_sensors & APP_TELEMETRY_IMU);
         const bool measurement = can_sample_imu && measurement_consumer &&
             measurement_requested && measurement_requested();
+        /* Console writes and auxiliary application work can block longer
+         * than a valid motion sample interval. Run them between sessions. */
+        if (!measurement && !suspended) {
+            if ((int32_t)(now - media_due) >= 0) {
+                portENTER_CRITICAL(&s_lock);
+                void (*probe)(void *) = s_media_probe;
+                void *context = s_media_probe_context;
+                portEXIT_CRITICAL(&s_lock);
+                if (probe) probe(context);
+                media_due = now + 5000;
+            }
+            app_display_sync_poll_diagnostics(board->display_io);
+        }
         bool sampling_started = false;
         const bool gyro_sampling = can_sample_imu && prepare_gyro_calibration(
             board->imu, &gyro_job, now, measurement, &sampling_started);
@@ -469,7 +475,7 @@ static void telemetry_task(void *argument)
         }
         previous_generation = generation;
 
-        if (warm_imu && (int32_t)(now - warm_until) >= 0) {
+        if (warm_imu && !measurement && (int32_t)(now - warm_until) >= 0) {
             warm_imu = false;
             if (still_reads) {
                 ESP_LOGI("imu", "stationary samples=%u/%u raw_rms_mdps=%d corrected_rms_mdps=%d",
@@ -480,12 +486,11 @@ static void telemetry_task(void *argument)
         const bool sample_imu = can_sample_imu &&
             (measurement || warm_imu || gyro_sampling || (interest & APP_TELEMETRY_IMU));
         const bool read_imu = sample_imu && (int32_t)(now - due_imu) >= 0;
-        bool waiting_for_frame = false;
         esp_err_t imu_error = ESP_ERR_NOT_FINISHED;
         if (read_imu) {
             imu_error = board->imu_ready
                 ? qmi8658a_read_fresh(board->imu, &next.imu) : ESP_ERR_NOT_FOUND;
-            waiting_for_frame = imu_error == ESP_ERR_NOT_FINISHED;
+            const bool waiting_for_frame = imu_error == ESP_ERR_NOT_FINISHED;
             if (!waiting_for_frame) next.imu_error = imu_error;
             if (imu_error == ESP_OK) {
                 next.imu_updated_ms = uptime_ms();
@@ -508,6 +513,12 @@ static void telemetry_task(void *argument)
                 due_imu = uptime_ms() + (measurement ? MEASUREMENT_IMU_RETRY_MS : 5U);
             else if (imu_error == ESP_OK && measurement) due_imu = now + MEASUREMENT_IMU_PERIOD_MS;
             else due_imu = uptime_ms() + (imu_error == ESP_OK ? 20U : 2000U);
+            if (measurement) {
+                const esp_err_t cached_error = next.imu_error;
+                next.imu_error = imu_error;
+                measurement_consumer(&next);
+                next.imu_error = cached_error;
+            }
         }
         if (gyro_sampling &&
             collect_gyro_sample(board->imu, &gyro_job, imu_error, &next.imu, uptime_ms())) {
@@ -515,7 +526,7 @@ static void telemetry_task(void *argument)
             next.imu_error = ESP_ERR_NOT_FINISHED;
             due_imu = uptime_ms();
         }
-        if (!suspended && !(parked_sensors & APP_TELEMETRY_BAROMETER) &&
+        if (!measurement && !suspended && !(parked_sensors & APP_TELEMETRY_BAROMETER) &&
             (interest & APP_TELEMETRY_BAROMETER) && (int32_t)(now - due_baro) >= 0) {
             dps368_sample_t reading;
             const esp_err_t error = board->barometer_ready
@@ -538,10 +549,18 @@ static void telemetry_task(void *argument)
             }
         }
         if ((int32_t)(now - due_rtc) >= 0) {
-            next.rtc_error = board->rtc_ready
-                ? pcf85063_get_time(board->rtc, &next.rtc) : ESP_ERR_NOT_FOUND;
-            if (next.rtc_error == ESP_OK) next.rtc_updated_ms = uptime_ms();
-            due_rtc = uptime_ms() + (next.rtc_error == ESP_OK ? 1000 : 2000);
+            esp_err_t rtc_error = ESP_ERR_NOT_FOUND;
+            if (board->rtc_ready) {
+                rtc_error = measurement
+                    ? pcf85063_get_time_with_timeout(board->rtc, &next.rtc, MEASUREMENT_RTC_TIMEOUT_MS)
+                    : pcf85063_get_time(board->rtc, &next.rtc);
+            }
+            if (rtc_error == ESP_OK) next.rtc_updated_ms = uptime_ms();
+            /* Keep a recent valid clock through transient bus contention.
+             * Readers already expire RTC data older than three seconds. */
+            if (!measurement || rtc_error != ESP_ERR_TIMEOUT) next.rtc_error = rtc_error;
+            const unsigned retry_ms = measurement ? 250U : 2000U;
+            due_rtc = uptime_ms() + (rtc_error == ESP_OK ? 1000U : retry_ms);
         }
         portENTER_CRITICAL(&s_lock);
         next.gyro_calibrating = gyro_calibration_active(s_gyro_calibration.phase);
@@ -555,12 +574,8 @@ static void telemetry_task(void *argument)
             s_snapshot.rtc_updated_ms = next.rtc_updated_ms;
         }
         portEXIT_CRITICAL(&s_lock);
-        if (consumer) consumer(suspended ? NULL : &next);
-        if (measurement && read_imu) {
-            if (waiting_for_frame) next.imu_error = ESP_ERR_NOT_FINISHED;
-            measurement_consumer(&next);
-        }
-        if ((int32_t)(now - health_due) >= 0) {
+        if (consumer && !measurement) consumer(suspended ? NULL : &next);
+        if (!measurement && (int32_t)(now - health_due) >= 0) {
             const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
             ESP_LOGI("health", "heap internal=%u min=%u largest=%u psram=%u telemetry_stack_min=%u dma=%u dma_min=%u dma_largest=%u",
                      (unsigned)heap_caps_get_free_size(internal_caps),
@@ -611,7 +626,7 @@ esp_err_t app_telemetry_start(aether_board_t *board)
     s_started = true;
     s_imu_available = board->imu_ready && board->imu;
     portEXIT_CRITICAL(&s_lock);
-    if (xTaskCreate(telemetry_task, "telemetry", 4096, board, 3, NULL) != pdPASS) {
+    if (app_create_service_task(telemetry_task, "telemetry", 4096, board, 3, NULL) != pdPASS) {
         portENTER_CRITICAL(&s_lock);
         s_started = false;
         s_imu_available = false;

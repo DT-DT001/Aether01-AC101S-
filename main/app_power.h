@@ -26,7 +26,7 @@ typedef enum {
 /** Called by the power task without the LVGL lock. BEGIN must gate new work
  * and request cancellation promptly; FINALIZE must finish file/storage cleanup
  * within timeout_ms. CANCEL restores the gate/storage after an aborted attempt.
- * Only BEGIN, FINALIZE and CANCEL are passed to this callback. No stage may
+ * POWER_OFF runs after persistence and before requesting PMIC power-off. No stage may
  * wait indefinitely. A missing hook deliberately prevents software power-off. */
 typedef esp_err_t (*app_power_shutdown_hook_t)(void *context,
     app_power_shutdown_stage_t stage, uint32_t timeout_ms);
@@ -51,6 +51,8 @@ typedef struct {
     void *screen_hook_context;
     void *awake_pm_lock;
     bool awake_pm_lock_held;
+    bool (*standby_audio_busy)(void *);
+    void *standby_audio_context;
     uint32_t timeout_seconds;
     uint8_t brightness;
     uint8_t applied_brightness;
@@ -100,6 +102,8 @@ uint8_t app_power_get_brightness(const app_power_t *manager);
 /** Snapshot of the actual asynchronous persistence/display result. */
 esp_err_t app_power_get_status(const app_power_t *manager, app_power_status_t *status);
 void app_power_set_persistence_guard(app_power_t *manager, bool (*busy)(void *), void *context);
+/** Keep CPU and codec clocks available for a live player while the panel is off. */
+void app_power_set_standby_audio_guard(app_power_t *manager, bool (*busy)(void *), void *context);
 /** Install once during initialization; replacing an active hook is rejected. */
 esp_err_t app_power_set_shutdown_hook(app_power_t *manager,
     app_power_shutdown_hook_t hook, void *context);

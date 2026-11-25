@@ -5,8 +5,16 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#define RECORDING_FIXTURE "/sdcard/Recordings/standby.wav"
+static const char *recording_fixture;
+static FILE *player_fopen(const char *path, const char *mode)
+{
+    return fopen(recording_fixture && !strcmp(path, RECORDING_FIXTURE) ? recording_fixture : path, mode);
+}
 #define PLAYER_LOG_TEST
+#define fopen player_fopen
 #include "../../components/aether_audio_player/aether_audio_player.c"
+#undef fopen
 
 struct test_task { pthread_t thread; void (*run)(void *); void *argument; };
 int64_t esp_timer_get_time(void)
@@ -65,6 +73,7 @@ static atomic_bool have_saved_eq;
 static atomic_bool fail_commit;
 static atomic_uint failed_commits;
 static atomic_bool hold_codec_write, codec_write_entered, fail_codec_stop;
+static atomic_bool hold_codec_start, codec_start_entered, hold_acquire, acquire_entered;
 static atomic_uint codec_stop_calls;
 static atomic_bool capture_first_pcm;
 static atomic_int first_pcm;
@@ -123,12 +132,35 @@ BaseType_t xSemaphoreGive(SemaphoreHandle_t m) { return pthread_mutex_unlock(m) 
 void vSemaphoreDelete(SemaphoreHandle_t m) { assert(pthread_mutex_destroy(m) == 0); free(m); }
 const char *esp_err_to_name(esp_err_t e) { (void)e; return "error"; }
 uint32_t esp_random(void) { return 77; }
+static void block_if_held(atomic_bool *hold, atomic_bool *entered)
+{
+    if (!*hold) return;
+    *entered = true;
+    const TickType_t started = xTaskGetTickCount();
+    while (*hold) {
+        assert(xTaskGetTickCount() - started < 3000);
+        vTaskDelay(1);
+    }
+}
 esp_err_t aether_storage_acquire(aether_storage_handle_t s, uint32_t timeout)
-{ (void)s; (void)timeout; if (!inserted) return ESP_ERR_INVALID_STATE; ++leases; return ESP_OK; }
+{
+    (void)s; (void)timeout;
+    block_if_held(&hold_acquire, &acquire_entered);
+    if (!inserted) return ESP_ERR_INVALID_STATE;
+    ++leases;
+    return ESP_OK;
+}
 void aether_storage_release(aether_storage_handle_t s) { (void)s; assert(leases > 0); --leases; }
 bool aether_storage_card_inserted(aether_storage_handle_t s) { (void)s; return inserted; }
 esp_err_t ac101s_audio_start(ac101s_audio_handle_t a, int volume, float gain)
-{ (void)a; assert(volume == 100 && gain == 24); assert(!codec_on); codec_on = true; ++starts; return ESP_OK; }
+{
+    (void)a;
+    assert(volume == 100 && gain == 24 && !codec_on);
+    block_if_held(&hold_codec_start, &codec_start_entered);
+    codec_on = true;
+    ++starts;
+    return ESP_OK;
+}
 esp_err_t ac101s_audio_stop(ac101s_audio_handle_t a) { (void)a;++codec_stop_calls;if(fail_codec_stop)return ESP_FAIL;codec_on=false;return ESP_OK; }
 esp_err_t ac101s_audio_write(ac101s_audio_handle_t a, void *data, size_t bytes)
 {
@@ -139,14 +171,7 @@ esp_err_t ac101s_audio_write(ac101s_audio_handle_t a, void *data, size_t bytes)
     for (size_t i = 0; i < bytes / 2; ++i) if (samples[i]) any = true;
     if (any) ++nonsilent;
     ++writes;
-    if (hold_codec_write) {
-        codec_write_entered = true;
-        const TickType_t started = xTaskGetTickCount();
-        while (hold_codec_write) {
-            assert(xTaskGetTickCount() - started < 3000);
-            vTaskDelay(1);
-        }
-    }
+    block_if_held(&hold_codec_write, &codec_write_entered);
     vTaskDelay(2);
     return ESP_OK;
 }
@@ -790,20 +815,7 @@ static void test_recording_resume_isolation(void)
     player.status.duration_ms = fixture.duration_ms;
     remember_position_locked(&player);
     assert(player.resume_dirty);
-    player.status.state = AETHER_AUDIO_PLAYING;
-    aether_audio_player_set_screen_suspended(&player, true);
-    assert(!controls(&player).pause);
-    player.status.state = AETHER_AUDIO_PAUSED;
-    player.pause_requested = true;
-    aether_audio_player_set_screen_suspended(&player, true);
-    aether_audio_player_set_screen_suspended(&player, false);
-    assert(controls(&player).pause);
-    player.status.state = AETHER_AUDIO_STARTING;
-    player.pause_requested = false;
-    aether_audio_player_set_screen_suspended(&player, true);
-    assert(controls(&player).pause);
-    aether_audio_player_set_screen_suspended(&player, false);
-    assert(!controls(&player).pause);
+    assert(!recording_path(player.status.path));
     const music_resume_t song = player.resume;
     save_preferences(&player, true);
     assert(!player.resume_dirty);
@@ -811,11 +823,7 @@ static void test_recording_resume_isolation(void)
     const unsigned initial_commits = commits;
     for (size_t i = 0; i < sizeof(recordings) / sizeof(recordings[0]); ++i) {
         strcpy(player.status.path, recordings[i]);
-        player.status.state = AETHER_AUDIO_PLAYING;
-        aether_audio_player_set_screen_suspended(&player, true);
-        assert(controls(&player).pause);
-        aether_audio_player_set_screen_suspended(&player, false);
-        assert(!controls(&player).pause);
+        assert(recording_path(player.status.path));
         remember_position_locked(&player);
         assert(!player.resume_dirty);
         assert(aether_audio_player_get_resume_path(&player, remembered, sizeof(remembered)) == ESP_OK);
@@ -828,7 +836,113 @@ static void test_recording_resume_isolation(void)
     assert(!memcmp(&player.resume, &song, sizeof(song)));
     assert(pthread_mutex_destroy(&player.state_lock) == 0);
     puts("PASS recording auditions preserve the song bookmark and saved legacy recordings are ignored");
-    puts("PASS only active music continues through standby; paused music, pending music and recording auditions are parked");
+}
+
+static void wait_flag(atomic_bool *flag)
+{
+    for (unsigned i = 0; i < 1000 && !*flag; ++i) vTaskDelay(1);
+    assert(*flag);
+}
+
+static void wait_pcm(unsigned previous_writes)
+{
+    for (unsigned i = 0; i < 1000 && writes <= previous_writes; ++i) vTaskDelay(1);
+    assert(writes > previous_writes);
+}
+
+static void test_playback_standby(void)
+{
+    char first[] = "/tmp/aether_music_resume_standby1_XXXXXX";
+    char second[] = "/tmp/aether_music_resume_standby2_XXXXXX";
+    int fd = mkstemp(first);
+    assert(fd >= 0 && close(fd) == 0);
+    fd = mkstemp(second);
+    assert(fd >= 0 && close(fd) == 0);
+    write_resume_wav(first, 48000 * 6);
+    write_resume_wav(second, 48000 * 6);
+
+    aether_audio_player_handle_t h;
+    assert(aether_audio_player_new((void *)1, (void *)2, &h) == ESP_OK);
+    assert(aether_audio_player_set_repeat(h, AETHER_AUDIO_REPEAT_LIST) == ESP_OK);
+    const char *tracks[] = {first, second};
+    assert(aether_audio_player_set_playlist(h, tracks, 2) == ESP_OK);
+
+    /* Sleep winning the first codec start cannot leak even one PCM block. */
+    unsigned before = writes;
+    codec_start_entered = false;
+    hold_codec_start = true;
+    assert(aether_audio_player_select(h, 0) == ESP_OK);
+    wait_flag(&codec_start_entered);
+    aether_audio_player_set_screen_suspended(h, true);
+    hold_codec_start = false;
+    aether_audio_player_status_t current = wait_state(h, AETHER_AUDIO_PAUSED);
+    assert(!current.position_ms && writes == before && !codec_on);
+    aether_audio_player_set_screen_suspended(h, false);
+    current = wait_state(h, AETHER_AUDIO_PLAYING);
+    wait_pcm(before);
+
+    /* Park the next song while it opens, then enter timed standby at STARTING. */
+    acquire_entered = false;
+    hold_acquire = true;
+    assert(aether_audio_player_seek(h, current.duration_ms) == ESP_OK);
+    wait_flag(&acquire_entered);
+    current = wait_state(h, AETHER_AUDIO_STARTING);
+    assert(!strcmp(current.path, second));
+    aether_audio_player_set_screen_suspended(h, true);
+    before = writes;
+    hold_acquire = false;
+    current = wait_state(h, AETHER_AUDIO_PLAYING);
+    assert(!strcmp(current.path, second));
+    wait_pcm(before);
+    assert(aether_audio_player_seek(h, 1250) == ESP_OK);
+    for (unsigned i = 0; i < 1000; ++i) {
+        assert(aether_audio_player_get_status(h, &current) == ESP_OK);
+        if (!current.seeking && current.position_ms > 1250) break;
+        vTaskDelay(1);
+    }
+    assert(current.position_ms > 1250 && current.state == AETHER_AUDIO_PLAYING);
+    aether_audio_player_set_screen_suspended(h, false);
+
+    /* A user's pause remains independent of screen power. */
+    assert(aether_audio_player_set_paused(h, true) == ESP_OK);
+    current = wait_state(h, AETHER_AUDIO_PAUSED);
+    before = writes;
+    aether_audio_player_set_screen_suspended(h, true);
+    aether_audio_player_set_screen_suspended(h, false);
+    vTaskDelay(20);
+    assert(writes == before && !codec_on);
+    assert(aether_audio_player_set_paused(h, false) == ESP_OK);
+    wait_pcm(before);
+    assert(aether_audio_player_stop_wait(h, 1000) == ESP_OK);
+
+    aether_audio_player_set_screen_suspended(h, true);
+    before = starts;
+    assert(aether_audio_player_select(h, 0) == ESP_OK);
+    current = wait_state(h, AETHER_AUDIO_PAUSED);
+    assert(!current.position_ms && starts == before);
+    assert(aether_audio_player_stop_wait(h, 1000) == ESP_OK);
+    aether_audio_player_set_screen_suspended(h, false);
+
+    /* Play an actual WAV via the recorder's canonical preview path. */
+    recording_fixture = first;
+    assert(aether_audio_player_play(h, RECORDING_FIXTURE, 65) == ESP_OK);
+    wait_state(h, AETHER_AUDIO_PLAYING);
+    aether_audio_player_set_screen_suspended(h, true);
+    current = wait_state(h, AETHER_AUDIO_PAUSED);
+    before = writes;
+    vTaskDelay(20);
+    assert(writes == before && !codec_on);
+    aether_audio_player_set_screen_suspended(h, false);
+    wait_pcm(before);
+    assert(aether_audio_player_get_status(h, &current) == ESP_OK && !strcmp(current.path, RECORDING_FIXTURE));
+    assert(aether_audio_player_del(h) == ESP_OK);
+    recording_fixture = NULL;
+    assert(unlink(first) == 0 && unlink(second) == 0 && !leases && !codec_on);
+    assert(task_count == 1 && pthread_join(tasks[0]->thread, NULL) == 0);
+    free(tasks[0]);
+    task_count = 0;
+    puts("PASS real player tracks/seek continue through screen-off, including standby during automatic next-track open");
+    puts("PASS fresh/paused music and recording previews park without writing PCM and retain wake semantics");
 }
 
 static bool cancel_mp3(void *context) { return *(bool *)context; }
@@ -902,6 +1016,7 @@ int main(void)
     test_player();
     test_music_resume();
     test_recording_resume_isolation();
+    test_playback_standby();
     puts("All player host regressions passed.");
     return 0;
 }

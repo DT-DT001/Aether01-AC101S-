@@ -16,8 +16,10 @@
 #include <string.h>
 
 static bool keyboard_present, screen_sleeping;
+static int64_t mono_us;
 static char notes[APP_NOTE_COUNT][APP_NOTE_CAPACITY];
 static app_alarm_snapshot_t alarm_state;
+static app_countdown_snapshot_t countdown_state = {.duration_seconds = 300, .remaining_seconds = 300};
 static app_alarm_slot_t alarm_slots[APP_ALARM_SLOTS];
 static unsigned previews, preview_tone, preview_cancels;
 static esp_err_t preview_error;
@@ -143,6 +145,23 @@ const char *app_alarm_tone_name(unsigned tone)
     return names[tone];
 }
 void app_alarm_dismiss(void) { alarm_state.ringing = false; }
+int64_t esp_timer_get_time(void) { return mono_us; }
+void app_countdown_get(app_countdown_snapshot_t *out) { *out = countdown_state; }
+esp_err_t app_countdown_start(unsigned seconds)
+{
+    assert(seconds && seconds <= APP_COUNTDOWN_MAX_SECONDS);
+    countdown_state = (app_countdown_snapshot_t){APP_COUNTDOWN_RUNNING, seconds, seconds, false};
+    return ESP_OK;
+}
+void app_countdown_pause(void) { countdown_state.state = APP_COUNTDOWN_PAUSED; }
+void app_countdown_resume(void) { countdown_state.state = APP_COUNTDOWN_RUNNING; }
+void app_countdown_reset(void)
+{
+    countdown_state.state = APP_COUNTDOWN_IDLE;
+    countdown_state.remaining_seconds = countdown_state.duration_seconds;
+    countdown_state.ringing = false;
+}
+void app_countdown_dismiss(void) { countdown_state.ringing = false; }
 void app_note_get_status(unsigned note, app_note_status_t *out)
 {
     assert(note < APP_NOTE_COUNT);
@@ -230,7 +249,6 @@ static void close_page(app_ui_t *ui)
 
 lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
 {
-    (void)title;
     close_page(ui);
     lv_obj_t *old = ui->screen;
     ui->screen = lv_obj_create(NULL);
@@ -241,9 +259,13 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     lv_obj_t *content = lv_obj_create(ui->screen);
     lv_obj_set_size(content, 448, 394);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, -14);
+    if (!strcmp(title, "计算器") || !strcmp(title, "秒表") || !strcmp(title, "倒计时"))
+        lv_obj_set_style_pad_all(content, 20, 0);
     ui->content = content;
     return content;
 }
+
+void app_open_clock(app_ui_t *ui) { app_ui_begin_page(ui, "时钟与日期"); }
 
 lv_obj_t *app_ui_add_text(lv_obj_t *parent, const char *text, lv_align_t align,
                           int32_t x, int32_t y, uint32_t color, const lv_font_t *font)
@@ -308,6 +330,7 @@ static void press_key(lv_obj_t *keyboard, const char *key)
 
 static void advance(unsigned ms)
 {
+    mono_us += (int64_t)ms * 1000;
     lv_tick_inc(ms);
     lv_timer_handler();
 }
@@ -426,6 +449,239 @@ static bool visible_label(lv_obj_t *root, const char *text)
 {
     lv_obj_t *label = find_label(root, text);
     return label && lv_obj_is_visible(label);
+}
+
+static void calculator_keys(lv_obj_t *readout, const char *keys)
+{
+    for (; *keys; ++keys) {
+        uint32_t key = (uint8_t)*keys;
+        lv_obj_send_event(readout, LV_EVENT_KEY, &key);
+    }
+}
+
+static void check_keypad_bounds(lv_obj_t *keypad, unsigned count)
+{
+    lv_obj_update_layout(lv_obj_get_screen(keypad));
+    assert(lv_obj_get_child_count(keypad) == count);
+    for (unsigned i = 0; i < count; ++i) {
+        lv_obj_t *button = lv_obj_get_child(keypad, i);
+        lv_area_t bounds, caption;
+        lv_obj_get_coords(button, &bounds);
+        lv_obj_get_coords(lv_obj_get_child(button, 0), &caption);
+        assert(bounds.x1 > 20 && bounds.x2 < 460 && bounds.y1 > 110 && bounds.y2 < 456);
+        assert(caption.x1 >= bounds.x1 && caption.x2 <= bounds.x2 &&
+               caption.y1 >= bounds.y1 && caption.y2 <= bounds.y2);
+    }
+}
+
+static void test_calculator_ui(app_ui_t *ui, lv_display_t *display)
+{
+    lv_indev_t *input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(input, display);
+    lv_indev_set_read_cb(input, alarm_pointer_read);
+    lv_group_t *group = lv_group_create();
+    lv_group_set_default(group);
+    app_open_calculator(ui);
+    lv_obj_update_layout(ui->screen);
+    lv_obj_t *readout = lv_obj_get_child(ui->content, 0);
+    lv_obj_t *formula = lv_obj_get_child(readout, 0);
+    lv_obj_t *result = lv_obj_get_child(readout, 1);
+    lv_obj_t *keypad = lv_obj_get_child(ui->content, -1);
+    assert(lv_group_get_focused(group) == readout);
+    check_keypad_bounds(keypad, 24);
+    for (unsigned i = 0; i < 24; ++i) {
+        lv_obj_t *button = lv_obj_get_child(keypad, i);
+        lv_area_t area;
+        lv_obj_get_coords(button, &area);
+        assert(lv_obj_get_height(button) == 39 && lv_obj_get_width(button) == 99);
+        assert(area.x1 > 20 && area.x2 < 460 && area.y1 > 110 && area.y2 < 456);
+    }
+    const unsigned touch[] = {9, 19, 21, 23, 23}; /* 8 + 0 = = */
+    for (unsigned i = 0; i < sizeof(touch) / sizeof(touch[0]); ++i)
+        alarm_tap(input, lv_obj_get_child(keypad, touch[i]));
+    assert(strcmp(lv_label_get_text(result), "8") == 0);
+    const struct { const char *keys, *expected; } cases[] = {
+        {"C.1+.2=", "0.3"}, {"C8-3=", "5"}, {"C2+3*4=", "20"}, {"C2+==", "6"},
+        {"C8/0=", "计算错误"}, {"9", "9"}, {"C200+10%=", "220"}, {"C200*10%=", "20"},
+        {"C123456789012345", "123456789012"}, {"C.1.2", "0.12"},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        calculator_keys(readout, cases[i].keys);
+        assert(strcmp(lv_label_get_text(result), cases[i].expected) == 0);
+    }
+    alarm_tap(input, lv_obj_get_child(keypad, 20)); /* change sign */
+    assert(!strcmp(lv_label_get_text(result), "-0.12"));
+    alarm_tap(input, lv_obj_get_child(keypad, 3)); /* backspace */
+    assert(!strcmp(lv_label_get_text(result), "-0.1"));
+    alarm_tap(input, lv_obj_get_child(keypad, 1)); /* CE */
+    assert(!strcmp(lv_label_get_text(result), "0"));
+    lv_obj_t *multiply = find_label(keypad, "×");
+    lv_font_glyph_dsc_t cross;
+    assert(multiply && lv_font_get_glyph_dsc(lv_obj_get_style_text_font(multiply, 0), &cross, 0xD7, 0));
+    assert(!cross.is_placeholder && cross.box_w > 3 && cross.box_h > 3);
+    calculator_keys(readout, "C7");
+    alarm_click(input, keypad, "×");
+    calculator_keys(readout, "8=");
+    assert(!strcmp(lv_label_get_text(result), "56") && !strcmp(lv_label_get_text(formula), "7 × 8 ="));
+    lv_obj_update_layout(ui->screen);
+    lv_area_t upper, lower;
+    lv_obj_get_coords(formula, &upper);
+    lv_obj_get_coords(result, &lower);
+    assert(upper.y2 < lower.y1);
+    assert(lv_font_get_glyph_dsc(lv_obj_get_style_text_font(formula, 0), &cross, 0xD7, 0));
+    assert(!cross.is_placeholder && cross.box_w > 3);
+
+    alarm_click(input, ui->content, "科学");
+    check_keypad_bounds(keypad, 35);
+    calculator_keys(readout, "C30");
+    alarm_click(input, keypad, "sin");
+    assert(!strcmp(lv_label_get_text(result), "0.5"));
+    alarm_click(input, keypad, "2nd");
+    alarm_click(input, keypad, "asin");
+    assert(!strcmp(lv_label_get_text(result), "30"));
+    alarm_click(input, keypad, "2nd");
+    alarm_click(input, keypad, "DEG");
+    calculator_keys(readout, "C");
+    alarm_click(input, keypad, "pi");
+    alarm_click(input, keypad, "cos");
+    assert(!strcmp(lv_label_get_text(result), "-1"));
+    calculator_keys(readout, "C2^10=");
+    assert(!strcmp(lv_label_get_text(result), "1024"));
+    calculator_keys(readout, "C5");
+    alarm_click(input, keypad, "n!");
+    assert(!strcmp(lv_label_get_text(result), "120"));
+    calculator_keys(readout, "C0");
+    alarm_click(input, keypad, "log");
+    assert(!strcmp(lv_label_get_text(result), "计算错误"));
+    calculator_keys(readout, "42");
+    assert(!strcmp(lv_label_get_text(result), "42"));
+
+    alarm_click(input, ui->content, "进制");
+    check_keypad_bounds(keypad, 30);
+    lv_obj_t *radix = lv_obj_get_child(ui->content, -2);
+    calculator_keys(readout, "255");
+    alarm_click(input, radix, "HEX");
+    assert(!strcmp(lv_label_get_text(result), "FF"));
+    alarm_click(input, radix, "OCT");
+    assert(!strcmp(lv_label_get_text(result), "377"));
+    alarm_click(input, radix, "BIN");
+    assert(!strcmp(lv_label_get_text(result), "11111111"));
+    assert(lv_obj_has_state(lv_obj_get_parent(find_label(keypad, "2")), LV_STATE_DISABLED));
+    assert(lv_obj_has_state(lv_obj_get_parent(find_label(keypad, "F")), LV_STATE_DISABLED));
+    alarm_click(input, radix, "32 位");
+    alarm_click(input, radix, "64 位");
+    assert(visible_label(radix, "8 位"));
+    alarm_click(input, radix, "HEX");
+    calculator_keys(readout, "+1=");
+    assert(!strcmp(lv_label_get_text(result), "0"));
+    calculator_keys(readout, "ff&f=");
+    assert(!strcmp(lv_label_get_text(result), "F"));
+    alarm_click(input, keypad, "NOT");
+    assert(!strcmp(lv_label_get_text(result), "F0"));
+    calculator_keys(readout, ">4=");
+    assert(!strcmp(lv_label_get_text(result), "F"));
+    alarm_click(input, keypad, "AC");
+    alarm_click(input, radix, "8 位");
+    alarm_click(input, radix, "16 位");
+    alarm_click(input, radix, "32 位");
+    calculator_keys(readout, "FFFFFFFFFFFFFFFF");
+    alarm_click(input, radix, "BIN");
+    const char *binary = lv_label_get_text(result);
+    assert(strlen(binary) == 65 && binary[32] == '\n');
+    for (unsigned i = 0; i < 65; ++i) if (i != 32) assert(binary[i] == '1');
+    lv_obj_update_layout(ui->screen);
+    lv_obj_get_coords(result, &lower);
+    assert(lv_area_get_height(&lower) >= 2 * lv_font_montserrat_16.line_height);
+    alarm_click(input, ui->content, "标准");
+    assert(!strcmp(lv_label_get_text(result), "42"));
+    alarm_click(input, ui->content, "进制");
+    assert(strlen(lv_label_get_text(result)) == 65);
+    app_open_calculator(ui);
+    readout = lv_obj_get_child(ui->content, 0);
+    assert(!strcmp(lv_label_get_text(lv_obj_get_child(readout, 1)), "0"));
+    lv_indev_delete(input);
+    lv_group_set_default(NULL);
+    lv_group_delete(group);
+    puts("PASS calculator modes, touch and keyboard, real multiplication glyph, scientific functions, radix conversion, logic, word size, and reopen");
+}
+
+static void test_clock_tools_ui(app_ui_t *ui, lv_display_t *display)
+{
+    lv_indev_t *input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(input, display);
+    lv_indev_set_read_cb(input, alarm_pointer_read);
+    app_open_stopwatch(ui);
+    lv_obj_update_layout(ui->screen);
+    assert(ui->page_back == app_open_clock && visible_label(ui->screen, "00:00:00"));
+    alarm_click(input, ui->screen, "开始");
+    advance(1240);
+    assert(visible_label(ui->screen, "00:00:01") && visible_label(ui->screen, ".24"));
+    alarm_tap(input, lv_obj_get_child(ui->content, 1));
+    assert(visible_label(ui->screen, "01") && find_label(ui->screen, "00:00:01.28"));
+    ui->page_back(ui);
+    mono_us += 2000000;
+    app_open_stopwatch(ui);
+    lv_obj_update_layout(ui->screen);
+    assert(visible_label(ui->screen, "00:00:03") && visible_label(ui->screen, "01"));
+    lv_timer_pause(ui->timer);
+    ui->page_suspend(ui, true);
+    advance(5000);
+    assert(visible_label(ui->screen, "00:00:03"));
+    lv_timer_resume(ui->timer);
+    ui->page_suspend(ui, false);
+    advance(0);
+    assert(visible_label(ui->screen, "00:00:08"));
+    alarm_click(input, ui->screen, "暂停");
+    advance(2500);
+    assert(visible_label(ui->screen, "00:00:08") && visible_label(ui->screen, "继续"));
+    alarm_click(input, ui->screen, "复位");
+    assert(visible_label(ui->screen, "00:00:00") && !find_label(ui->screen, "01"));
+
+    app_open_countdown(ui);
+    lv_obj_update_layout(ui->screen);
+    assert(ui->page_back == app_open_clock && visible_label(ui->screen, "00:05:00"));
+    lv_obj_t *picker = lv_obj_get_child(ui->content, 1);
+    lv_obj_t *minute = lv_obj_get_child(picker, 3);
+    lv_obj_t *second = lv_obj_get_child(picker, 5);
+    lv_dropdown_set_selected(minute, 0);
+    lv_obj_send_event(minute, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_t *start = lv_obj_get_parent(find_label(ui->screen, "开始"));
+    assert(lv_obj_has_state(start, LV_STATE_DISABLED));
+    lv_dropdown_set_selected(second, 3);
+    lv_obj_send_event(second, LV_EVENT_VALUE_CHANGED, NULL);
+    assert(!lv_obj_has_state(start, LV_STATE_DISABLED) && visible_label(ui->screen, "00:00:03"));
+    alarm_click(input, ui->screen, "开始");
+    assert(countdown_state.state == APP_COUNTDOWN_RUNNING && countdown_state.duration_seconds == 3);
+    assert(!lv_obj_is_visible(picker));
+    countdown_state.remaining_seconds = 2;
+    advance(150);
+    assert(visible_label(ui->screen, "00:00:02"));
+    alarm_click(input, ui->screen, "暂停");
+    assert(countdown_state.state == APP_COUNTDOWN_PAUSED);
+    ui->page_back(ui);
+    app_open_countdown(ui);
+    lv_obj_update_layout(ui->screen);
+    assert(visible_label(ui->screen, "00:00:02"));
+    alarm_click(input, ui->screen, "继续");
+    assert(countdown_state.state == APP_COUNTDOWN_RUNNING);
+    countdown_state = (app_countdown_snapshot_t){APP_COUNTDOWN_FINISHED, 3, 0, true};
+    advance(160);
+    assert(visible_label(ui->screen, "倒计时结束") && visible_label(ui->screen, "再计一次"));
+    screen_sleeping = true;
+    app_utilities_alarm_ui(ui);
+    assert(!find_label(ui->screen, "关闭"));
+    screen_sleeping = false;
+    app_utilities_alarm_ui(ui);
+    lv_obj_update_layout(ui->screen);
+    assert(popup && visible_label(popup, "倒计时结束"));
+    alarm_click(input, popup, "关闭");
+    assert(!countdown_state.ringing);
+    alarm_click(input, ui->screen, "复位");
+    assert(visible_label(ui->screen, "00:00:03"));
+    lv_indev_delete(input);
+    puts("PASS stopwatch laps, pause/reset, reopen, suspend/resume and countdown controls, continuation, alert dismissal");
 }
 
 typedef struct {
@@ -1081,6 +1337,8 @@ int main(int argc, char **argv)
     lv_display_set_buffers(display, ui_buffer, NULL, sizeof(ui_buffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display, ui_flush);
     app_ui_t ui = {0};
+    test_calculator_ui(&ui, display);
+    test_clock_tools_ui(&ui, display);
     if (argc == 2 && strcmp(argv[1], "--layout-only") == 0) {
         test_calendar_ui(&ui, display);
         test_intercom_ui(&ui, display);

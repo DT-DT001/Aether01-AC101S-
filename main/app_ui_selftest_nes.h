@@ -1,5 +1,6 @@
 #pragma once
 
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -96,9 +97,13 @@ static bool nes_measure_playing(app_ui_t *ui, const char *phase)
     const uint32_t refreshes = display_last.completed_refreshes - display_first.completed_refreshes;
     const uint32_t drops = display_last.dropped_regions - display_first.dropped_regions;
     const uint32_t audio_writes = audio_last.write_calls - audio_first.write_calls;
+    const uint32_t direct = display_last.nes.direct_frames - display_first.nes.direct_frames;
+    const uint32_t direct_timed = display_last.nes.direct_timed_frames - display_first.nes.direct_timed_frames;
+    const uint32_t direct_late = display_last.nes.direct_late_frames - display_first.nes.direct_late_frames;
     ok = ok && last.state == AETHER_NES_RUNNING && display_last.available &&
         emulated * 1000U >= wall_ms * 48U && emulated * 1000U <= wall_ms * 65U &&
         (presented + 1U) * 1000U >= wall_ms * 30U && (refreshes + 1U) * 1000U >= wall_ms * 30U &&
+        direct >= 30U && direct_timed + 1U >= direct && !direct_late &&
         display_last.max_refresh_gap_us <= 85000U && !drops &&
         display_last.flush_wait_timeouts == display_first.flush_wait_timeouts &&
         audio_writes > 0 && last.audio_errors == first.audio_errors &&
@@ -106,11 +111,29 @@ static bool nes_measure_playing(app_ui_t *ui, const char *phase)
     ESP_LOGI("ui_selftest", "%s NES-%s wall_ms=%u emulated=%" PRIu32
         " presented=%" PRIu32 " lcd_refreshes=%" PRIu32 " lcd_max_gap_us=%" PRIu32
         " lcd_drops=%" PRIu32 " audio_writes=%" PRIu32 " te_synced=%" PRIu32 " te_fallback=%" PRIu32
-        " rendered=%" PRIu32 " replaced=%" PRIu32,
+        " rendered=%" PRIu32 " replaced=%" PRIu32
+        " nes_timed=%" PRIu32 " estimated_late=%" PRIu32 " te_to_submit_max_us=%" PRIu32
+        " te_to_dma_max_us=%" PRIu32 " estimated_scan_margin_min_us=%" PRId32,
         ok ? "PASS" : "FAIL", phase, wall_ms, emulated, presented, refreshes,
         display_last.max_refresh_gap_us, drops, audio_writes, te_last.synced - te_first.synced,
         te_last.fallback_frames - te_first.fallback_frames, last.frame_number - first.frame_number,
-        frames_last.replaced_frames - frames_first.replaced_frames);
+        frames_last.replaced_frames - frames_first.replaced_frames,
+        display_last.nes.timed_frames - display_first.nes.timed_frames,
+        display_last.nes.late_frames - display_first.nes.late_frames,
+        display_last.nes.max_te_to_submit_us, display_last.nes.max_te_to_done_us,
+        display_last.nes.min_scan_margin_us);
+    ESP_LOGI("ui_selftest", "NES-phase %s us/frame core=%" PRIu32 " audio_out=%" PRIu32
+        " convert=%" PRIu32 " callback=%" PRIu32 " input=%" PRIu32 " yield=%" PRIu32,
+        phase, last.core_us_per_frame, last.audio_output_us_per_frame,
+        last.video_convert_us_per_frame, last.frame_callback_us_per_frame,
+        last.input_us_per_frame, last.yield_us_per_frame);
+    ESP_LOGI("ui_selftest", "NES-direct %s frames=%" PRIu32 " copy_max_us=%" PRIu32
+        " submit_max_us=%" PRIu32 " wait_max_us=%" PRIu32 " timed=%" PRIu32 " late=%" PRIu32
+        " minimum_margin_us=%" PRId32,
+        phase, direct,
+        display_last.nes.direct_max_copy_us, display_last.nes.direct_max_submit_us,
+        display_last.nes.direct_max_wait_us, direct_timed, direct_late,
+        display_last.nes.direct_min_scan_margin_us);
     return ok;
 }
 
@@ -139,6 +162,54 @@ static bool nes_measure_frozen(app_ui_t *ui, const char *phase, bool screen_off)
     ESP_LOGI("ui_selftest", "%s NES-%s frame_before=%" PRIu32 " frame_after=%" PRIu32,
              ok ? "PASS" : "FAIL", phase, first.emulated_frames, last.emulated_frames);
     return ok;
+}
+
+static esp_err_t nes_wait_media_released(app_ui_t *ui)
+{
+    const int64_t deadline = esp_timer_get_time() + INT64_C(2000000);
+    esp_err_t release_error;
+    do {
+        bool pending;
+        const esp_err_t status = app_io_media_release_status(ui->io, &pending, &release_error);
+        if (status != ESP_OK) return status;
+        if (!pending) return release_error;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    } while (esp_timer_get_time() < deadline);
+    return release_error == ESP_OK ? ESP_ERR_TIMEOUT : release_error;
+}
+
+static void nes_remove_prior_fixture(app_ui_t *ui, const char *current, uint32_t generation,
+                                     const aether_media_fs_lease_t *lease)
+{
+    static const char directory[] = AETHER_STORAGE_MOUNT_POINT "/.aether-nes-00d3687f";
+    static const char previous[] = AETHER_STORAGE_MOUNT_POINT "/.aether-nes-00d3687f/pacing.nes";
+    if (!strcmp(current, previous)) return;
+    struct stat old_info, new_info;
+    if (stat(previous, &old_info) != 0) {
+        if (errno != ENOENT) ESP_LOGW("ui_selftest", "NES prior fixture could not be inspected");
+        return;
+    }
+    bool matched = stat(current, &new_info) == 0 && S_ISREG(old_info.st_mode) && S_ISREG(new_info.st_mode) &&
+                   old_info.st_size > 0 && old_info.st_size == new_info.st_size;
+    if (matched) {
+        FILE *old = fopen(previous, "rb");
+        FILE *fresh = fopen(current, "rb");
+        matched = old && fresh;
+        uint8_t old_bytes[512], new_bytes[512];
+        for (size_t left = (size_t)old_info.st_size; matched && left;) {
+            const size_t chunk = left < sizeof(old_bytes) ? left : sizeof(old_bytes);
+            matched = aether_media_fs_available(lease) && fread(old_bytes, 1, chunk, old) == chunk &&
+                      fread(new_bytes, 1, chunk, fresh) == chunk && !memcmp(old_bytes, new_bytes, chunk);
+            left -= chunk;
+        }
+        if (old && fclose(old) != 0) matched = false;
+        if (fresh && fclose(fresh) != 0) matched = false;
+    }
+    if (matched && aether_media_fs_available(lease) && generation == aether_media_fs_generation(ui->storage, previous) &&
+        unlink(previous) == 0) {
+        if (rmdir(directory) == 0) ESP_LOGI("ui_selftest", "NES prior fixture cleaned");
+        else ESP_LOGW("ui_selftest", "NES prior fixture directory retained: %s", directory);
+    } else ESP_LOGW("ui_selftest", "NES prior fixture retained: %s", previous);
 }
 
 static bool selftest_nes(app_ui_t *ui)
@@ -193,17 +264,26 @@ static bool selftest_nes(app_ui_t *ui)
         lvgl_port_unlock();
         returned = true;
     }
-    const bool stopped = !opened || aether_nes_stop_wait(ui->nes, 2000) == ESP_OK;
+    /* Navigation already queued a close. The IO worker owns the NES stop
+     * barrier until it acknowledges release of the codec and files. */
+    const esp_err_t stop_error = !opened ? ESP_OK : returned ? nes_wait_media_released(ui) :
+                                 aether_nes_stop_wait(ui->nes, 2000);
+    const bool stopped = stop_error == ESP_OK;
     bool cleaned = false;
     if (created && stopped && aether_media_fs_acquire(ui->storage, path, &lease) == ESP_OK) {
         if (generation == aether_media_fs_generation(ui->storage, path)) {
-            const bool removed = !ready || unlink(path) == 0;
-            cleaned = removed && rmdir(directory) == 0;
+            if (ready) nes_remove_prior_fixture(ui, path, generation, &lease);
+            if (aether_media_fs_available(&lease)) {
+                const bool removed = !ready || unlink(path) == 0;
+                cleaned = removed && rmdir(directory) == 0;
+            }
         }
         aether_media_fs_release(&lease);
     }
     const bool ok = initial_ok && frozen_ok && resume_ok && manual_ok && returned && stopped && cleaned;
-    ESP_LOGI("ui_selftest", "%s NES fixture=%u initial=%u frozen=%u resumed=%u manual=%u home=%u stop=%u cleaned=%u",
-             ok ? "PASS" : "FAIL", ready, initial_ok, frozen_ok, resume_ok, manual_ok, returned, stopped, cleaned);
+    ESP_LOGI("ui_selftest", "%s NES fixture=%u initial=%u frozen=%u resumed=%u manual=%u home=%u stop=%u cleaned=%u stop_error=%s",
+             ok ? "PASS" : "FAIL", ready, initial_ok, frozen_ok, resume_ok, manual_ok, returned, stopped, cleaned,
+             esp_err_to_name(stop_error));
+    if (created && !cleaned) ESP_LOGW("ui_selftest", "NES fixture retained: %s", directory);
     return ok;
 }

@@ -1,10 +1,12 @@
 #include "app_display_sync.h"
+#include "app_display_metrics.h"
 #include <stdlib.h>
 #include <inttypes.h>
 #include "co5300_display.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "src/display/lv_display_private.h"
 #ifdef AETHER_VIDEO_DIAGNOSTIC
 #include "freertos/task.h"
 #endif
@@ -41,6 +43,95 @@ static struct {
     uint32_t core_mask, placement_samples;
 #endif
 } s_diagnostics;
+
+/* The active page configures this on the LVGL task. */
+static lv_display_t *s_nes_display;
+static lv_area_t s_nes_area;
+
+void app_display_sync_set_nes_viewport(lv_display_t *display, const lv_area_t *area)
+{
+    s_nes_display = area ? display : NULL;
+    if (area) {
+        s_nes_area = *area;
+        app_display_metrics_nes_reset();
+    }
+    app_display_metrics_nes_arm(NULL, 0, 0, 0);
+}
+
+static void arm_nes_te(lv_display_t *display, esp_lcd_panel_io_handle_t io,
+                       int64_t began, int64_t returned)
+{
+    co5300_te_metrics_t te;
+    if (co5300_display_get_te_metrics(io, &te) == ESP_OK &&
+        te.last_edge_us >= began && te.last_edge_us <= returned) {
+        app_display_metrics_nes_arm(&s_nes_area, te.last_edge_us, te.last_period_us,
+            (uint16_t)lv_display_get_vertical_resolution(display));
+    } else {
+        app_display_metrics_nes_arm(NULL, 0, 0, 0);
+    }
+}
+
+static esp_err_t wait_nes_te(void *ctx)
+{
+    esp_lcd_panel_io_handle_t io = ctx;
+    const int64_t began = esp_timer_get_time();
+    const esp_err_t error = co5300_display_wait_te(io, 35);
+    if (error == ESP_OK) arm_nes_te(s_nes_display, io, began, esp_timer_get_time());
+    return error;
+}
+
+static esp_err_t write_nes_strip(void *ctx, const lv_area_t *first_window,
+                                 const void *pixels, size_t bytes)
+{
+    if (!first_window) return co5300_display_write_rgb565_strip(ctx, NULL, pixels, bytes);
+    const co5300_window_t window = {
+        first_window->x1, first_window->y1, first_window->x2 + 1, first_window->y2 + 1,
+    };
+    return co5300_display_write_rgb565_strip(ctx, &window, pixels, bytes);
+}
+
+static bool has_visible_child(lv_obj_t *parent, lv_obj_t *except)
+{
+    if (!parent) return false;
+    const uint32_t count = lv_obj_get_child_count(parent);
+    for (uint32_t i = 0; i < count; ++i) {
+        lv_obj_t *child = lv_obj_get_child(parent, (int32_t)i);
+        if (child != except && !lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) return true;
+    }
+    return false;
+}
+
+bool app_display_sync_present_nes(lv_obj_t *image, const uint16_t *pixels,
+                                  uint16_t width, uint16_t height)
+{
+    if (!image || !s_nes_display) return false;
+    lv_display_t *display = lv_obj_get_display(image);
+    if (display != s_nes_display || display->inv_p || display->rendering_in_progress ||
+        display->offset_x || display->offset_y || lv_display_get_rotation(display) != LV_DISPLAY_ROTATION_0 ||
+        lv_display_get_screen_prev(display) || lv_display_get_screen_loading(display))
+        return false;
+    lv_obj_t *container = lv_obj_get_parent(image);
+    lv_obj_t *screen = lv_display_get_screen_active(display);
+    if (!container || !screen || lv_obj_get_parent(container) != screen ||
+        lv_obj_has_flag(container, LV_OBJ_FLAG_HIDDEN) || lv_obj_has_flag(image, LV_OBJ_FLAG_HIDDEN) ||
+        has_visible_child(container, image) || has_visible_child(screen, container) ||
+        has_visible_child(lv_display_get_layer_top(display), NULL) ||
+        has_visible_child(lv_display_get_layer_sys(display), NULL))
+        return false;
+
+    lv_area_t coords;
+    lv_obj_get_coords(image, &coords);
+    if (coords.x1 != s_nes_area.x1 || coords.x2 != s_nes_area.x2 ||
+        coords.y1 != s_nes_area.y1 || coords.y2 != s_nes_area.y2 ||
+        width != lv_area_get_width(&coords) || height != lv_area_get_height(&coords))
+        return false;
+
+    portENTER_CRITICAL(&s_diagnostics_lock);
+    esp_lcd_panel_io_handle_t io = s_diagnostics.io;
+    portEXIT_CRITICAL(&s_diagnostics_lock);
+    return io && app_display_metrics_nes_write(display, &coords, pixels,
+        wait_nes_te, write_nes_strip, io) == ESP_OK;
+}
 
 void app_display_sync_poll_diagnostics(esp_lcd_panel_io_handle_t io)
 {
@@ -186,6 +277,16 @@ static void sync_event(lv_event_t *event)
             const esp_err_t error = co5300_display_wait_te(sync->io, 35);
             const int64_t now = esp_timer_get_time();
             if (sync->rendering) sync->frame_te_us += elapsed_us(te_begin, now);
+            if (s_nes_display && s_nes_display == lv_event_get_target(event)) {
+                const lv_area_t *area = lv_event_get_param(event);
+                if (error == ESP_OK && area && area->x1 == s_nes_area.x1 &&
+                    area->x2 == s_nes_area.x2 && area->y1 == s_nes_area.y1 &&
+                    area->y2 <= s_nes_area.y2) {
+                    arm_nes_te(s_nes_display, sync->io, te_begin, now);
+                } else {
+                    app_display_metrics_nes_arm(NULL, 0, 0, 0);
+                }
+            }
             if (error != ESP_OK) {
                 portENTER_CRITICAL(&s_diagnostics_lock);
                 if (sync->diagnostics_generation == s_diagnostics.generation &&
@@ -250,6 +351,8 @@ static void sync_event(lv_event_t *event)
 #endif
         break;
     case LV_EVENT_DELETE:
+        if (s_nes_display && s_nes_display == lv_event_get_target(event))
+            app_display_sync_set_nes_viewport(s_nes_display, NULL);
         portENTER_CRITICAL(&s_diagnostics_lock);
         if (sync->diagnostics_generation == s_diagnostics.generation &&
             sync->io == s_diagnostics.io) {

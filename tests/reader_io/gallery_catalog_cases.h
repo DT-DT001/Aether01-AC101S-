@@ -105,6 +105,10 @@ static void test_gallery_catalog(app_io_handle_t io)
     assert(perform_request(io, &request, &r) == ESP_OK);
     assert(r.count == 1 && r.next_offset == 1 && !r.truncated && !io->media_lease.held);
     app_io_result_free(&r);
+    const app_io_request_t tf_only = {.operation = APP_IO_CATALOG, .filter = APP_IO_IMAGES,
+                                      .path = AETHER_STORAGE_MOUNT_POINT};
+    r = gallery_result(io);
+    assert(perform_request(io, &tf_only, &r) == ESP_ERR_NOT_FOUND && !r.entries && !io->media_lease.held);
     r = gallery_result(io);
     gallery_advance_generation_on_release = true;
     assert(perform_request(io, &request, &r) == ESP_ERR_INVALID_STATE && !io->media_lease.held);

@@ -98,3 +98,33 @@ esp_err_t aether_board_set_touch_sleep(aether_board_t *board, bool sleeping)
     }
     return err;
 }
+
+esp_err_t aether_board_park_peripherals(aether_board_t *board)
+{
+    ESP_RETURN_ON_FALSE(board, ESP_ERR_INVALID_ARG, TAG, "invalid board");
+    /* AW8010 PVDD and the display module's VBAT both come from VSYS.
+     * VSYS can still have USB input when TG29 turns off the system LDOs. */
+    esp_err_t first = gpio_set_level(AETHER_GPIO_PA_ENABLE, 0);
+    if (board->touch_ready) {
+        const esp_err_t sleep = aether_board_set_touch_sleep(board, true);
+        const esp_err_t reset = gpio_set_level(AETHER_GPIO_TOUCH_RST, 0);
+        /* Retain wake/reset recovery even when an I2C reply was lost. */
+        board->touch_sleeping = true;
+        if (first == ESP_OK) first = sleep != ESP_OK ? sleep : reset;
+    }
+    if (board->display_ready) {
+        /* KD021WVOSN009-C003B §6.4: display-off, sleep-in, settle, then
+         * assert reset before disabling the module's analog supply. */
+        esp_err_t err = aether_board_set_display_sleep(board, true);
+        if (err == ESP_OK) {
+            board->display_needs_reinit = true;
+            err = gpio_set_level(AETHER_GPIO_LCD_RST, 0);
+            if (err == ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                err = gpio_set_level(AETHER_GPIO_LCD_AVDD_EN, 0);
+            }
+        }
+        if (first == ESP_OK) first = err;
+    }
+    return first;
+}

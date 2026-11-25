@@ -7,6 +7,21 @@
 #include "lvgl.h"
 
 typedef struct {
+    uint32_t timed_frames;
+    uint32_t late_frames;
+    uint32_t max_te_to_submit_us;
+    uint32_t max_te_to_done_us;
+    int32_t min_scan_margin_us;
+    uint32_t direct_frames;
+    uint32_t direct_timed_frames;
+    uint32_t direct_late_frames;
+    int32_t direct_min_scan_margin_us;
+    uint32_t direct_max_copy_us;
+    uint32_t direct_max_submit_us;
+    uint32_t direct_max_wait_us;
+} app_display_nes_metrics_t;
+
+typedef struct {
     bool available;
     bool active;
     uint32_t completed_refreshes;
@@ -28,6 +43,7 @@ typedef struct {
     uint64_t staging_copied_bytes;
     uint32_t dropped_regions;
     esp_err_t staging_error;
+    app_display_nes_metrics_t nes;
 } app_display_metrics_t;
 
 /* SPI/QSPI, project-pinned LVGL 9.5 only. Call while holding the recursive
@@ -50,3 +66,19 @@ void app_display_metrics_set_active(bool active);
 void app_display_metrics_set_probe_active(bool active);
 #endif
 void app_display_metrics_get(app_display_metrics_t *metrics);
+
+/* LVGL owner only. Track the steady-state NES viewport only when consecutive
+ * flushes cover this exact rectangle after the same TE. Evaluate every strip
+ * at DMA completion against its last row's estimated scan time. */
+void app_display_metrics_nes_reset(void);
+void app_display_metrics_nes_arm(const lv_area_t *area, int64_t edge_us,
+                                 uint32_t period_us, uint16_t panel_rows);
+/* GUI owner only. Prepare the first strip before waiting for TE. The caller
+ * owns the complete packed RGB565 source until this function returns. Only
+ * the permanent staging mirror remains reserved if the DMA stalls. */
+typedef esp_err_t (*app_display_nes_wait_te_fn)(void *ctx);
+typedef esp_err_t (*app_display_nes_strip_fn)(void *ctx, const lv_area_t *first_window,
+                                             const void *pixels, size_t bytes);
+esp_err_t app_display_metrics_nes_write(lv_display_t *display, const lv_area_t *area,
+    const uint16_t *pixels, app_display_nes_wait_te_fn wait_te,
+    app_display_nes_strip_fn write_strip, void *ctx);

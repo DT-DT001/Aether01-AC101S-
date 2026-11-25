@@ -21,12 +21,22 @@ static atomic_bool pause_give,give_gate,release_give;
 static uint8_t pixels[480*20*2];
 static const lv_area_t area={0,0,479,19};
 static void delay(unsigned ms) { struct timespec t={ms/1000,(long)(ms%1000)*1000000};nanosleep(&t,NULL); }
-int64_t esp_timer_get_time(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (int64_t)t.tv_sec*1000000+t.tv_nsec/1000; }
+static atomic_int_fast64_t test_clock_us;
+static void (*before_semaphore_take)(void);
+int64_t esp_timer_get_time(void)
+{
+    const int64_t injected = atomic_load(&test_clock_us);
+    if (injected) return injected;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC,&t);
+    return (int64_t)t.tv_sec*1000000+t.tv_nsec/1000;
+}
 SemaphoreHandle_t xSemaphoreCreateBinary(void)
 { if(fail_semaphore)return NULL;SemaphoreHandle_t s=calloc(1,sizeof(*s));assert(s);++semaphore_live;assert(!pthread_mutex_init(&s->lock,NULL));assert(!pthread_cond_init(&s->ready,NULL));return s; }
 void vSemaphoreDelete(SemaphoreHandle_t s) { --semaphore_live;pthread_cond_destroy(&s->ready);pthread_mutex_destroy(&s->lock);free(s); }
 BaseType_t xSemaphoreTake(SemaphoreHandle_t s,TickType_t ticks)
 {
+    if (before_semaphore_take) before_semaphore_take();
     ++take_calls;pthread_mutex_lock(&s->lock);++s->waiters;
     struct timespec until;clock_gettime(CLOCK_REALTIME,&until);until.tv_nsec+=(long)ticks*1000000;
     until.tv_sec+=until.tv_nsec/1000000000;until.tv_nsec%=1000000000;

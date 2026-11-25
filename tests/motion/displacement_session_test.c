@@ -86,8 +86,17 @@ static void stage_timeouts(void)
 
 static void pending_frames_do_not_integrate(void)
 {
-    start_ready();
     const app_telemetry_snapshot_t no_new_frame = {.imu_error = ESP_ERR_NOT_FINISHED};
+    assert(app_displacement_start() == ESP_OK);
+    now += 99;
+    consume(&no_new_frame);
+    assert(status().state == APP_DISPLACEMENT_WAITING_STILL);
+    now += 1;
+    consume(&no_new_frame);
+    assert(status().state == APP_DISPLACEMENT_INVALID && status().result.fault == APP_DISPLACEMENT_FAULT_GAP);
+    assert(status().result.max_gap_ms == 100 && status().result.samples == 0);
+
+    start_ready();
     unsigned samples = status().result.samples;
     for (unsigned i = 0; i < 3; ++i) {
         now += 2;
@@ -95,9 +104,14 @@ static void pending_frames_do_not_integrate(void)
     }
     assert(status().state == APP_DISPLACEMENT_READY && status().result.samples == samples);
     sample(2.0f, 0);
-    now += 100;
+    samples = status().result.samples;
+    now += 99;
+    consume(&no_new_frame);
+    assert(requested() && status().result.samples == samples);
+    now += 1;
     consume(&no_new_frame);
     assert(status().state == APP_DISPLACEMENT_INVALID && status().result.fault == APP_DISPLACEMENT_FAULT_GAP);
+    assert(status().result.max_gap_ms == 100);
 }
 
 int main(void)
@@ -154,7 +168,7 @@ int main(void)
     assert(status().state == APP_DISPLACEMENT_WAITING_STILL);
     sample(0, 120);
     assert(status().state == APP_DISPLACEMENT_INVALID && status().result.fault == APP_DISPLACEMENT_FAULT_GAP);
-    assert(!requested());
+    assert(!requested() && status().result.max_gap_ms == 120 && status().result.samples == 0);
 
     start_ready();
     consume(NULL);

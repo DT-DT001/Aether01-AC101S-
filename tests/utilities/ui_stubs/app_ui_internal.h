@@ -32,4 +32,6 @@ void app_ui_set_timer(app_ui_t *ui, lv_timer_cb_t callback, uint32_t period);
 void app_ui_label_text(lv_obj_t *label, const char *text);
 void app_ui_label_fmt(lv_obj_t *label, const char *format, ...);
 bool app_ui_input_blocked(const app_ui_t *ui);
+void app_open_clock(app_ui_t *ui);
+void app_open_calculator(app_ui_t *ui);
 void app_ui_media_control_gate(app_ui_t *ui, bool accept, bool clear);

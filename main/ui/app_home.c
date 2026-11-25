@@ -5,6 +5,12 @@
 #include "app_audio_system.h"
 #include "app_telemetry.h"
 #include "app_utilities.h"
+#ifdef ESP_PLATFORM
+#include "app_theme.h"
+#else
+#define app_theme_color(value) (value)
+#define app_theme_background(value) (value)
+#endif
 #include "aether_wifi.h"
 #include "../assets/icons/app_icons.h"
 #include <stdlib.h>
@@ -30,15 +36,17 @@ static const home_app_t apps[] = {
     {&icon_nes, "NES 游戏", 0xBBA8F5, app_open_nes, NULL},
     {NULL, "录音", 0xFF9FAD, app_open_recorder, NULL},
     {&icon_settings, "设置", 0xBCC9E5, app_open_settings, NULL},
-    {&icon_motion, "运动", 0xFFA4CA, app_open_motion, NULL},
+    {NULL, "姿态", 0xFFA4CA, app_open_motion, NULL},
     {&icon_barometer, "气压高度", 0xA0DBFF, app_open_barometer, NULL},
-    {&icon_motion, "位移测量", 0x97DFCE, app_open_displacement, NULL},
+    {NULL, "位移测量", 0x97DFCE, app_open_displacement, NULL},
     {NULL, "空中飞鼠", 0x94D9ED, app_open_pc_remote, NULL},
-    {&icon_video, "OBS 切换", 0xD7B3FF, app_open_obs_switcher, NULL},
+    {NULL, "OBS 切换", 0xD7B3FF, app_open_obs_switcher, LV_SYMBOL_SHUFFLE},
     {&icon_network, "无线对讲", 0x8FDBEC, app_open_intercom, NULL},
     {NULL, "定位", 0x69E4AD, app_open_gps, NULL},
-    {&icon_video, "USB 摄像头", 0x95D9EE, app_open_camera, NULL},
-    {&icon_files, "图库", 0xF5CD91, app_open_gallery, NULL},
+    {NULL, "USB 摄像头", 0x95D9EE, app_open_camera, NULL},
+    {NULL, "图库", 0xF5CD91, app_open_gallery, LV_SYMBOL_IMAGE},
+    {NULL, "计算器", 0x88C8FA, app_open_calculator, NULL},
+    {NULL, "主题", 0xCEACFA, app_open_theme, NULL},
 };
 
 size_t app_home_app_count(void) { return sizeof(apps) / sizeof(apps[0]); }
@@ -241,15 +249,66 @@ static lv_obj_t *air_mouse_icon(lv_obj_t *parent)
     return tile;
 }
 
+static void icon_stroke(lv_obj_t *icon, const lv_point_precise_t *points, unsigned count, uint32_t color)
+{
+    lv_obj_t *edge = lv_line_create(icon);
+    lv_line_set_points(edge, points, count);
+    lv_obj_set_style_line_width(edge, 2, 0);
+    lv_obj_set_style_line_color(edge, lv_color_hex(color), 0);
+    lv_obj_set_style_line_rounded(edge, true, 0);
+    lv_obj_remove_flag(edge, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static lv_obj_t *utility_icon(lv_obj_t *parent, const home_app_t *app)
+{
+    lv_obj_t *icon = shape(parent, 48, 48, 14, 0x292E48);
+    if (app->open == app_open_calculator) {
+        lv_obj_set_pos(shape(icon, 26, 36, 5, app->accent), 11, 6);
+        lv_obj_set_pos(shape(icon, 18, 8, 2, 0x263A58), 15, 10);
+        for (unsigned y = 0; y < 3; ++y)
+            for (unsigned x = 0; x < 3; ++x)
+                lv_obj_set_pos(shape(icon, 4, 4, 1, 0x263A58), 15 + 7 * x, 22 + 6 * y);
+    } else if (app->open == app_open_theme) {
+        lv_obj_set_pos(shape(icon, 23, 23, LV_RADIUS_CIRCLE, 0xA78EF0), 12, 8);
+        lv_obj_set_pos(shape(icon, 21, 21, LV_RADIUS_CIRCLE, 0xFF9EBD), 7, 21);
+        lv_obj_set_pos(shape(icon, 21, 21, LV_RADIUS_CIRCLE, 0x85DDDB), 21, 21);
+    } else if (app->open == app_open_camera) {
+        lv_obj_set_pos(shape(icon, 15, 7, 3, app->accent), 16, 9);
+        lv_obj_set_pos(shape(icon, 34, 24, 5, app->accent), 7, 14);
+        lv_obj_set_pos(shape(icon, 16, 16, LV_RADIUS_CIRCLE, 0x263A58), 16, 18);
+        lv_obj_set_pos(shape(icon, 8, 8, LV_RADIUS_CIRCLE, 0x798CBD), 20, 22);
+    } else if (app->open == app_open_motion) {
+        static const lv_point_precise_t edges[] = {
+            {24, 6}, {39, 14}, {39, 32}, {24, 41}, {9, 32}, {9, 14}, {24, 6},
+        };
+        static const lv_point_precise_t fold[] = {{9, 14}, {24, 23}, {39, 14}};
+        static const lv_point_precise_t axis[] = {{24, 23}, {24, 41}};
+        icon_stroke(icon, edges, sizeof(edges) / sizeof(edges[0]), app->accent);
+        icon_stroke(icon, fold, sizeof(fold) / sizeof(fold[0]), app->accent);
+        icon_stroke(icon, axis, sizeof(axis) / sizeof(axis[0]), app->accent);
+    } else {
+        static const lv_point_precise_t ruler[] = {
+            {8, 32}, {31, 9}, {40, 18}, {17, 41}, {8, 32},
+        };
+        static const lv_point_precise_t ticks[][2] = {
+            {{14, 27}, {18, 31}}, {{20, 21}, {24, 25}}, {{26, 15}, {30, 19}},
+        };
+        icon_stroke(icon, ruler, sizeof(ruler) / sizeof(ruler[0]), app->accent);
+        for (unsigned i = 0; i < sizeof(ticks) / sizeof(ticks[0]); ++i)
+            icon_stroke(icon, ticks[i], 2, app->accent);
+    }
+    return icon;
+}
+
 void app_ui_show_drawer(app_ui_t *ui)
 {
     lv_obj_t *screen = app_ui_new_screen(ui);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x141827), 0);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(app_theme_background(0x141827)), 0);
     status_bar(ui, screen);
     lv_obj_t *home = lv_button_create(screen);
     lv_obj_set_size(home, 50, 42);
     lv_obj_set_pos(home, APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET);
-    lv_obj_set_style_bg_color(home, lv_color_hex(0x242940), 0);
+    lv_obj_set_style_bg_color(home, lv_color_hex(app_theme_background(0x242940)), 0);
     lv_obj_set_style_shadow_width(home, 0, 0);
     app_ui_add_text(home, LV_SYMBOL_HOME, LV_ALIGN_CENTER, 0, 0, 0xD6DDF7, &lv_font_montserrat_20);
     lv_obj_add_event_cb(home, back_to_desktop, LV_EVENT_CLICKED, ui);
@@ -272,8 +331,8 @@ void app_ui_show_drawer(app_ui_t *ui)
         lv_obj_t *tile = lv_button_create(grid);
         lv_obj_set_size(tile, 102, 90);
         lv_obj_set_style_radius(tile, 17, 0);
-        lv_obj_set_style_bg_color(tile, lv_color_hex(0x20253A), 0);
-        lv_obj_set_style_bg_color(tile, lv_color_hex(0x343C5F), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_color(tile, lv_color_hex(app_theme_background(0x20253A)), 0);
+        lv_obj_set_style_bg_color(tile, lv_color_hex(app_theme_background(0x343C5F)), LV_STATE_PRESSED);
         lv_obj_set_style_shadow_width(tile, 0, 0);
         lv_obj_set_style_border_width(tile, 1, 0);
         lv_obj_set_style_border_color(tile, lv_color_hex(0x2B334D), 0);
@@ -294,7 +353,9 @@ void app_ui_show_drawer(app_ui_t *ui)
             icon = gps_icon(tile);
         } else if (apps[i].open == app_open_pc_remote) {
             icon = air_mouse_icon(tile);
-        } else icon = microphone_icon(tile);
+        } else if (apps[i].open == app_open_recorder) {
+            icon = microphone_icon(tile);
+        } else icon = utility_icon(tile, &apps[i]);
         lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
         lv_obj_t *name = app_ui_add_text(tile, apps[i].name, LV_ALIGN_BOTTOM_MID,
                                         0, -10, 0xE2EBFA, app_ui_chinese_font());
@@ -360,9 +421,16 @@ void app_ui_show_home(app_ui_t *ui)
     ui->home_swipe_input = NULL;
     ui->drawer_scroll_y = 0;
     ui->drawer_focus_index = 0;
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x1D2540), 0);
-    lv_obj_set_style_bg_grad_color(screen, lv_color_hex(0x101322), 0);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(app_theme_background(0x1D2540)), 0);
+    lv_obj_set_style_bg_grad_color(screen, lv_color_hex(app_theme_background(0x101322)), 0);
     lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
+#ifdef ESP_PLATFORM
+    if (app_theme_wallpaper_view(screen)) {
+        lv_obj_t *shade = shape(screen, 480, 480, 0, 0x0A101D);
+        lv_obj_center(shade);
+        lv_obj_set_style_bg_opa(shade, LV_OPA_30, 0);
+    }
+#endif
     lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(screen, desktop_swipe, LV_EVENT_PRESSED, ui);
     lv_obj_add_event_cb(screen, desktop_swipe, LV_EVENT_PRESSING, ui);
@@ -375,7 +443,7 @@ void app_ui_show_home(app_ui_t *ui)
     ui->app_obj[HOME_DATE] = app_ui_add_text(screen, "", LV_ALIGN_TOP_MID,
                                            0, 168, 0xD5D6F3, app_ui_chinese_font_size(24));
 
-    lv_obj_t *weather = shape(screen, 392, 116, 24, 0x262D48);
+    lv_obj_t *weather = shape(screen, 392, 116, 24, app_theme_background(0x262D48));
     lv_obj_align(weather, LV_ALIGN_TOP_MID, 0, 237);
     lv_obj_set_style_border_width(weather, 1, 0);
     lv_obj_set_style_border_color(weather, lv_color_hex(0x394361), 0);
@@ -397,7 +465,7 @@ void app_ui_show_home(app_ui_t *ui)
     ui->app_obj[HOME_TEMP] = app_ui_add_text(weather, "--°", LV_ALIGN_RIGHT_MID, -24, 0,
                                             0xF5EFFF, &lv_font_montserrat_48);
     app_ui_add_text(screen, LV_SYMBOL_UP, LV_ALIGN_BOTTOM_MID, 0, -58, 0xB7B8EA, &lv_font_montserrat_20);
-    lv_obj_t *handle = shape(screen, 112, 5, 3, 0x747AA6);
+    lv_obj_t *handle = shape(screen, 112, 5, 3, app_theme_color(0x747AA6));
     lv_obj_align(handle, LV_ALIGN_BOTTOM_MID, 0, -24);
     app_ui_load_screen(screen);
     app_ui_set_timer(ui, update_home, 1000);

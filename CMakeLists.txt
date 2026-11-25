@@ -32,4 +32,15 @@ endif()
 if(CONFIG_BT_BLUEDROID_ENABLED AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
     idf_component_get_property(aether_idf_bt_library bt COMPONENT_LIB)
     target_compile_options(${aether_idf_bt_library} PRIVATE -Wno-error=stringop-truncation)
+    # Keep the installed 8 MiB application slot and adjacent reader/NVS data
+    # compatible. Limit size optimization to the Bluetooth protocol host.
+    get_target_property(aether_bt_sources ${aether_idf_bt_library} SOURCES)
+    get_target_property(aether_bt_source_dir ${aether_idf_bt_library} SOURCE_DIR)
+    foreach(source IN LISTS aether_bt_sources)
+        if(source MATCHES "(^|/)host/bluedroid/(api|bta|btc|stack)/")
+            get_filename_component(source_path "${source}" ABSOLUTE BASE_DIR "${aether_bt_source_dir}")
+            set_property(SOURCE "${source_path}" TARGET_DIRECTORY ${aether_idf_bt_library}
+                         APPEND PROPERTY COMPILE_OPTIONS -Os)
+        endif()
+    endforeach()
 endif()

@@ -4,6 +4,8 @@
 #include "lvgl.h"
 
 typedef struct app_frames *app_frames_handle_t;
+typedef bool (*app_frames_direct_fn)(lv_obj_t *image, const uint16_t *pixels,
+                                     uint16_t width, uint16_t height);
 typedef struct {
     uint32_t received_frames;
     uint32_t presented_frames;
@@ -26,6 +28,9 @@ void app_frames_set_viewport(app_frames_handle_t frames, uint16_t width, uint16_
 /* GUI owner. Adopt queued frames at the display refresh boundary instead of
  * the UI service timer. Pass NULL or deactivate before deleting the image. */
 void app_frames_set_refresh_image(app_frames_handle_t frames, lv_obj_t *image);
+/* GUI owner only. A successful direct presentation suppresses the redundant
+ * LVGL image invalidation. The source remains valid until the call returns. */
+void app_frames_set_direct_presenter(app_frames_handle_t frames, app_frames_direct_fn present);
 void app_frames_present(app_frames_handle_t frames, lv_obj_t *image);
 /* Snapshot of the application-to-LVGL handover, not physical display FPS. */
 esp_err_t app_frames_get_metrics(app_frames_handle_t frames, app_frames_metrics_t *metrics);

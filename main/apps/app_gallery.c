@@ -2,14 +2,14 @@
 #include "app_catalog_ui.h"
 #include "app_scroll_list.h"
 #include "app_text.h"
-#include "app_gallery_format.h"
-#include "aether_image.h"
+#include "app_media_image.h"
+#include "app_theme.h"
+#include "app_wallpaper_store.h"
 #include "aether_media_fs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include "esp_heap_caps.h"
 #include "freertos/task.h"
 #include "src/misc/cache/instance/lv_image_cache.h"
@@ -35,18 +35,20 @@ typedef struct {
     uint32_t generation;
     char path[192];
     esp_err_t error;
-    uint16_t *pixels, width, height;
+    app_media_image_t image;
+    bool wallpaper;
 } gallery_job_t;
 
 typedef struct {
     app_io_entry_t *entries;
     size_t count, selected;
     gallery_media_t media;
-    bool loading;
+    bool loading, wallpaper, saving;
     app_scroll_list_t rows;
     lv_obj_t *source_label, *summary, *refresh;
-    lv_obj_t *viewer, *image, *image_label, *older, *newer;
+    lv_obj_t *viewer, *image, *image_label, *older, *newer, *apply;
     void (*list_back)(app_ui_t *);
+    void (*pending_exit)(app_ui_t *);
     lv_image_dsc_t descriptor;
     uint16_t *pixels;
     gallery_job_t *job;
@@ -69,12 +71,13 @@ static void set_enabled(lv_obj_t *object, bool enables)
     else lv_obj_add_state(object, LV_STATE_DISABLED);
 }
 
-static gallery_media_t gallery_media(app_ui_t *ui)
+static gallery_media_t gallery_media(app_ui_t *ui, bool wallpaper)
 {
     gallery_media_t media = {.exported = app_io_usb_storage_blocked(ui->io),
                              .blocked = app_ui_input_blocked(ui)};
     if (media.exported || media.blocked) return media;
-    for (unsigned i = 0; i < sizeof(gallery_roots) / sizeof(gallery_roots[0]); ++i) {
+    const unsigned root_count = wallpaper ? 1U : sizeof(gallery_roots) / sizeof(gallery_roots[0]);
+    for (unsigned i = 0; i < root_count; ++i) {
         if (aether_media_fs_path_ready(ui->storage, gallery_roots[i])) {
             media.sources |= 1U << i;
             media.generations[i] = aether_media_fs_generation(ui->storage, gallery_roots[i]);
@@ -103,126 +106,21 @@ static bool gallery_selection_ready(app_ui_t *ui, const gallery_page_t *page, co
            aether_media_fs_generation(ui->storage, path) == page->media.generations[source];
 }
 
-static bool read_available(const gallery_job_t *job, const aether_media_fs_lease_t *lease)
-{
-    return !atomic_load(&job->cancelled) &&
-           aether_media_fs_generation(job->storage, job->path) == job->generation &&
-           aether_media_fs_available(lease);
-}
-
-static esp_err_t read_jpeg(FILE *file, size_t bytes, gallery_job_t *job,
-                          const aether_media_fs_lease_t *lease)
-{
-    if (bytes > AETHER_IMAGE_MAX_JPEG_BYTES) return ESP_ERR_INVALID_SIZE;
-    uint8_t *data = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!data) return ESP_ERR_NO_MEM;
-    size_t offset = 0;
-    esp_err_t error = ESP_OK;
-    while (offset < bytes && read_available(job, lease)) {
-        const size_t count = bytes - offset < 32768U ? bytes - offset : 32768U;
-        if (fread(data + offset, 1, count, file) != count) {
-            error = ESP_FAIL;
-            break;
-        }
-        offset += count;
-    }
-    if (error == ESP_OK && !read_available(job, lease)) error = ESP_ERR_INVALID_STATE;
-    aether_image_decoder_t *decoder = NULL;
-    if (error == ESP_OK) error = aether_image_decoder_new(&decoder);
-    if (error == ESP_OK) {
-        error = aether_image_decode_jpeg(decoder, data, bytes, job->pixels,
-                                        GALLERY_IMAGE_WIDTH, GALLERY_IMAGE_HEIGHT,
-                                        &job->width, &job->height);
-    }
-    aether_image_decoder_del(decoder);
-    free(data);
-    return error;
-}
-
-static esp_err_t read_bmp(FILE *file, size_t bytes, gallery_job_t *job,
-                         const aether_media_fs_lease_t *lease)
-{
-    uint8_t header[54];
-    if (bytes < sizeof(header) || fread(header, 1, sizeof(header), file) != sizeof(header))
-        return ESP_ERR_INVALID_RESPONSE;
-    app_gallery_bmp_t bmp;
-    esp_err_t error = app_gallery_bmp_header(header, bytes, &bmp);
-    if (error != ESP_OK) return error;
-    unsigned fit_width = bmp.width < GALLERY_IMAGE_WIDTH ? bmp.width : GALLERY_IMAGE_WIDTH;
-    unsigned fit_height = bmp.height * fit_width / bmp.width;
-    if (fit_height > GALLERY_IMAGE_HEIGHT) {
-        fit_height = GALLERY_IMAGE_HEIGHT;
-        fit_width = bmp.width * fit_height / bmp.height;
-    }
-    if (!fit_width) fit_width = 1;
-    if (!fit_height) fit_height = 1;
-    uint8_t *row = heap_caps_malloc(bmp.stride, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!row) return ESP_ERR_NO_MEM;
-
-    const unsigned x_step = (bmp.width << 16) / fit_width;
-    const unsigned y_step = (bmp.height << 16) / fit_height;
-    unsigned source_y = y_step / 2;
-    for (unsigned y = 0; y < fit_height; ++y, source_y += y_step) {
-        if (!read_available(job, lease)) { error = ESP_ERR_INVALID_STATE; break; }
-        /* Read physical rows forwards even for bottom-up BMPs. */
-        const unsigned offset = bmp.offset + (source_y >> 16) * bmp.stride;
-        if (fseek(file, (long)offset, SEEK_SET) || fread(row, 1, bmp.stride, file) != bmp.stride) {
-            error = ESP_FAIL;
-            break;
-        }
-        const unsigned dest_y = bmp.top_down ? y : fit_height - y - 1;
-        uint16_t *dest = job->pixels + dest_y * fit_width;
-        unsigned source_x = x_step / 2;
-        for (unsigned x = 0; x < fit_width; ++x, source_x += x_step) {
-            const uint8_t *src = row + (source_x >> 16) * bmp.pixel_bytes;
-            dest[x] = (uint16_t)((src[2] >> 3) << 11 | (src[1] >> 2) << 5 | src[0] >> 3);
-        }
-    }
-    free(row);
-    job->width = (uint16_t)fit_width;
-    job->height = (uint16_t)fit_height;
-    return error;
-}
-
 static void job_release(gallery_job_t *job)
 {
     if (atomic_fetch_sub(&job->users, 1) == 1) {
-        free(job->pixels);
+        free(job->image.pixels);
         free(job);
     }
-}
-
-static esp_err_t decode_file(gallery_job_t *job, const aether_media_fs_lease_t *lease)
-{
-    if (!read_available(job, lease)) return ESP_ERR_INVALID_STATE;
-    FILE *file = fopen(job->path, "rb");
-    if (!file) return ESP_ERR_NOT_FOUND;
-    esp_err_t error = ESP_ERR_INVALID_SIZE;
-    const long bytes = fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
-    if (bytes > 0 && fseek(file, 0, SEEK_SET) == 0) {
-        job->pixels = heap_caps_malloc(GALLERY_IMAGE_WIDTH * GALLERY_IMAGE_HEIGHT * sizeof(uint16_t),
-                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        const char *ext = strrchr(job->path, '.');
-        if (!job->pixels) error = ESP_ERR_NO_MEM;
-        else if (ext && !strcasecmp(ext, ".bmp")) error = read_bmp(file, (size_t)bytes, job, lease);
-        else error = read_jpeg(file, (size_t)bytes, job, lease);
-    }
-    fclose(file);
-    return error;
 }
 
 static void image_decode_task(void *arg)
 {
     gallery_job_t *job = arg;
-    aether_media_fs_lease_t lease = {0};
-    if (atomic_load(&job->cancelled)) job->error = ESP_ERR_INVALID_STATE;
-    else {
-        job->error = aether_media_fs_acquire(job->storage, job->path, &lease);
-        if (job->error == ESP_OK) {
-            job->error = decode_file(job, &lease);
-            aether_media_fs_release(&lease);
-        }
-    }
+    job->error = app_media_image_read(job->storage, job->path, job->generation, &job->cancelled,
+                                     job->wallpaper ? APP_WALLPAPER_SIZE : GALLERY_IMAGE_WIDTH,
+                                     job->wallpaper ? APP_WALLPAPER_SIZE : GALLERY_IMAGE_HEIGHT,
+                                     job->wallpaper, &job->image);
     atomic_store(&decode_running, false);
     atomic_store_explicit(&job->done, true, memory_order_release);
     job_release(job);
@@ -251,6 +149,7 @@ static void gallery_close_viewer(app_ui_t *ui, gallery_page_t *page)
         lv_obj_delete(page->viewer);
         page->viewer = NULL;
         page->image = NULL;
+        page->apply = NULL;
         ui->page_back = page->list_back;
         lv_obj_remove_flag(page->rows.viewport, LV_OBJ_FLAG_HIDDEN);
     }
@@ -295,8 +194,10 @@ static size_t adjacent_photo(const gallery_page_t *page, int direction)
 
 static void viewer_controls(gallery_page_t *page)
 {
-    set_enabled(page->older, !page->job && adjacent_photo(page, -1) != SIZE_MAX);
-    set_enabled(page->newer, !page->job && adjacent_photo(page, 1) != SIZE_MAX);
+    const bool ready = !page->job && !page->saving;
+    set_enabled(page->older, ready && adjacent_photo(page, -1) != SIZE_MAX);
+    set_enabled(page->newer, ready && adjacent_photo(page, 1) != SIZE_MAX);
+    if (page->apply) set_enabled(page->apply, ready && page->pixels && app_theme_wallpaper_available());
 }
 
 static void viewer_action(lv_event_t *event)
@@ -304,9 +205,40 @@ static void viewer_action(lv_event_t *event)
     app_ui_t *ui = lv_event_get_user_data(event);
     gallery_page_t *page = ui->page_context;
     const intptr_t action = (intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(event));
-    if (!page || !page->viewer) return;
+    if (!page || !page->viewer || page->saving) return;
     const size_t index = adjacent_photo(page, (int)action);
     if (!page->job && index != SIZE_MAX) gallery_show_image(ui, index);
+}
+
+static bool wallpaper_can_exit(app_ui_t *ui, void (*destination)(app_ui_t *))
+{
+    gallery_page_t *page = ui->page_context;
+    if (!page->saving) return true;
+    page->pending_exit = destination;
+    return false;
+}
+
+static void apply_wallpaper(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    gallery_page_t *page = ui->page_context;
+    if (!page || !page->wallpaper || page->saving || !page->pixels ||
+        !gallery_selection_ready(ui, page, page->entries[page->selected].path)) return;
+    const esp_err_t error = app_theme_write_wallpaper(page->pixels, page->descriptor.header.w,
+                                                      page->descriptor.header.h);
+    if (error != ESP_OK) {
+        app_ui_label_text(page->image_label, error == ESP_ERR_NO_MEM ? "内存不足，无法设置壁纸" : "无法保存壁纸，请重试");
+        return;
+    }
+    /* The writer now owns the decoded buffer. Detach the image before the
+     * UI task polls the writer and transfers or disposes of it. */
+    lv_image_set_src(page->image, NULL);
+    lv_image_cache_drop(&page->descriptor);
+    page->pixels = NULL;
+    page->saving = true;
+    app_ui_label_text(page->image_label, "正在保存壁纸…");
+    viewer_controls(page);
+    lv_timer_set_period(ui->timer, 40);
 }
 
 static void gallery_show_image(app_ui_t *ui, size_t index)
@@ -330,6 +262,10 @@ static void gallery_show_image(app_ui_t *ui, size_t index)
         lv_label_set_long_mode(page->image_label, LV_LABEL_LONG_DOT);
         page->older = gallery_button(page->viewer, LV_SYMBOL_PREV, 240, 307, 72, viewer_action, ui, -1);
         page->newer = gallery_button(page->viewer, LV_SYMBOL_NEXT, 328, 307, 72, viewer_action, ui, 1);
+        if (page->wallpaper) {
+            page->apply = gallery_button(page->viewer, "设为壁纸", 8, 307, 146, apply_wallpaper, ui, 0);
+            lv_obj_set_style_text_font(lv_obj_get_child(page->apply, 0), app_ui_chinese_font(), 0);
+        }
         page->list_back = ui->page_back;
         ui->page_back = gallery_viewer_back;
         lv_obj_stop_scroll_anim(page->rows.viewport);
@@ -348,6 +284,7 @@ static void gallery_show_image(app_ui_t *ui, size_t index)
         atomic_init(&job->cancelled, false);
         atomic_init(&job->done, false);
         job->storage = ui->storage;
+        job->wallpaper = page->wallpaper;
         job->generation = page->media.generations[gallery_source(path)];
         strlcpy(job->path, path, sizeof(job->path));
         if (xTaskCreate(image_decode_task, "gallery", 4096, job, 3, NULL) != pdPASS) {
@@ -371,17 +308,22 @@ static void gallery_present(gallery_page_t *page)
     if (!job || !atomic_load_explicit(&job->done, memory_order_acquire)) return;
     page->job = NULL;
     if (job->error == ESP_OK) {
-        page->pixels = job->pixels;
-        job->pixels = NULL;
+        const uint16_t width = job->image.width, height = job->image.height;
+        page->pixels = job->image.pixels;
+        job->image.pixels = NULL;
         page->descriptor = (lv_image_dsc_t){
             .header = {.magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
-                       .w = job->width, .h = job->height, .stride = job->width * 2U},
-            .data_size = (uint32_t)job->width * job->height * 2U,
+                       .w = width, .h = height, .stride = width * 2U},
+            .data_size = (uint32_t)width * height * 2U,
             .data = (const uint8_t *)page->pixels,
         };
         lv_image_set_src(page->image, &page->descriptor);
-        lv_obj_set_pos(page->image, (GALLERY_IMAGE_WIDTH - job->width) / 2,
-                        (GALLERY_IMAGE_HEIGHT - job->height) / 2);
+        lv_obj_set_pos(page->image, ((int)GALLERY_IMAGE_WIDTH - width) / 2,
+                        ((int)GALLERY_IMAGE_HEIGHT - height) / 2);
+        lv_image_set_pivot(page->image, width / 2, height / 2);
+        const uint32_t scale = LV_MIN(GALLERY_IMAGE_WIDTH * LV_SCALE_NONE / width,
+                                      GALLERY_IMAGE_HEIGHT * LV_SCALE_NONE / height);
+        lv_image_set_scale(page->image, LV_MIN(scale, LV_SCALE_NONE));
         char name[192];
         strlcpy(name, file_name(job->path), sizeof(name));
         app_text_sanitize_utf8(name, strlen(name));
@@ -453,7 +395,7 @@ static void gallery_catalog_ready(app_ui_t *ui, const app_io_result_t *result)
 {
     gallery_page_t *page = ui->page_context;
     page->loading = false;
-    const gallery_media_t current = gallery_media(ui);
+    const gallery_media_t current = gallery_media(ui, page->wallpaper);
     if (!gallery_media_matches(&page->media, &current)) {
         gallery_refresh(ui);
         return;
@@ -504,13 +446,14 @@ static void gallery_refresh(app_ui_t *ui)
     free(page->entries);
     page->entries = NULL;
     page->count = 0;
-    page->media = gallery_media(ui);
+    page->media = gallery_media(ui, page->wallpaper);
     const char *sources = page->media.sources == 3U ? "TF 卡 · USB" :
                           page->media.sources ? gallery_root_names[page->media.sources == 2U] : "";
     app_ui_label_text(page->source_label, sources);
     if (!page->media.sources) {
         const char *status = page->media.exported ? "请先退出 USB 文件传输" :
-            page->media.blocked ? "正在等待存储释放…" : "请插入 TF 卡或 USB 存储";
+            page->media.blocked ? "正在等待存储释放…" :
+            page->wallpaper ? "请插入 TF 卡" : "请插入 TF 卡或 USB 存储";
         app_ui_label_text(page->summary, status);
         catalog_controls(page);
         return;
@@ -522,6 +465,7 @@ static void gallery_refresh(app_ui_t *ui)
         .operation = APP_IO_CATALOG, .filter = APP_IO_IMAGES,
         .limit = GALLERY_CATALOG_LIMIT,
     };
+    if (page->wallpaper) strlcpy(request.path, AETHER_STORAGE_MOUNT_POINT, sizeof(request.path));
     app_ui_request_io_ex(ui, &request, gallery_catalog_ready);
 }
 
@@ -538,7 +482,16 @@ static void gallery_timer(lv_timer_t *timer)
     app_ui_t *ui = lv_timer_get_user_data(timer);
     gallery_page_t *page = ui->page_context;
     if (!page) return;
-    const gallery_media_t current = gallery_media(ui);
+    if (page->saving) {
+        const esp_err_t result = app_theme_write_status();
+        if (result == ESP_ERR_NOT_FINISHED) return;
+        page->saving = false;
+        if (page->pending_exit) { page->pending_exit(ui); return; }
+        if (result == ESP_OK) { app_open_theme(ui); return; }
+        app_ui_label_text(page->image_label, "壁纸保存失败，返回列表后重试");
+        viewer_controls(page);
+    }
+    const gallery_media_t current = gallery_media(ui, page->wallpaper);
     if (!gallery_media_matches(&page->media, &current)) {
         gallery_refresh(ui);
     } else if (page->viewer) {
@@ -547,17 +500,20 @@ static void gallery_timer(lv_timer_t *timer)
     lv_timer_set_period(timer, page->job ? 40 : 250);
 }
 
-void app_open_gallery(app_ui_t *ui)
+static void open_gallery(app_ui_t *ui, bool wallpaper)
 {
-    lv_obj_t *content = app_ui_begin_page(ui, "图库");
+    lv_obj_t *content = app_ui_begin_page(ui, wallpaper ? "选择壁纸" : "图库");
+    if (wallpaper) ui->page_back = app_open_theme;
     gallery_page_t *page = calloc(1, sizeof(*page));
     if (!page) { app_ui_add_text(content, "内存不足", LV_ALIGN_CENTER, 0, 0, 0xFF8888, NULL); return; }
     ui->page_context = page;
     ui->page_cleanup = gallery_cleanup;
+    page->wallpaper = wallpaper;
+    if (wallpaper) ui->page_can_exit = wallpaper_can_exit;
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     app_catalog_panel(content);
     lv_obj_set_style_pad_all(content, 19, 0);
-    app_ui_add_text(content, "全部图片", LV_ALIGN_TOP_LEFT, 2, 1, 0xEAF2FF, app_ui_chinese_font_size(24));
+    app_ui_add_text(content, wallpaper ? "TF 卡图片" : "全部图片", LV_ALIGN_TOP_LEFT, 2, 1, 0xEAF2FF, app_ui_chinese_font_size(24));
     page->source_label = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 3, 33, 0x90C0FF, NULL);
     page->refresh = gallery_button(content, LV_SYMBOL_REFRESH, 354, 3, 54, gallery_action, ui, 0);
     lv_obj_t *list = lv_obj_create(content);
@@ -574,3 +530,6 @@ void app_open_gallery(app_ui_t *ui)
     app_ui_set_timer(ui, gallery_timer, 250);
     gallery_refresh(ui);
 }
+
+void app_open_gallery(app_ui_t *ui) { open_gallery(ui, false); }
+void app_open_wallpaper_picker(app_ui_t *ui) { open_gallery(ui, true); }

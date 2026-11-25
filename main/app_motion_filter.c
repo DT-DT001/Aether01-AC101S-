@@ -4,6 +4,53 @@
 #define G 9.80665f
 #define RAD 0.01745329252f
 #define DEG 57.29577951f
+static bool level_gravity(const float accel[3])
+{
+    const float x = accel[0], y = accel[1], z = accel[2];
+    const float norm_squared = x * x + y * y + z * z;
+    return isfinite(norm_squared) && norm_squared >= 7.8f * 7.8f &&
+           norm_squared <= 11.8f * 11.8f && z > 0.0f;
+}
+
+static void attitude_from_gravity(const float accel[3], float q[4])
+{
+    const float roll = atan2f(accel[1], accel[2]);
+    const float pitch = atan2f(-accel[0], hypotf(accel[1], accel[2]));
+    const float cr = cosf(roll * .5f), sr = sinf(roll * .5f);
+    const float cp = cosf(pitch * .5f), sp = sinf(pitch * .5f);
+    q[0] = cr * cp;
+    q[1] = sr * cp;
+    q[2] = cr * sp;
+    q[3] = -sr * sp;
+}
+
+bool app_motion_level_reference(const float accel[3], float reference[4])
+{
+    if (!level_gravity(accel)) return false;
+    attitude_from_gravity(accel, reference);
+    return true;
+}
+
+bool app_motion_level_angles(const float accel[3], const float reference[4], float *roll, float *pitch)
+{
+    if (!level_gravity(accel)) return false;
+    float x = accel[0], y = accel[1], z = accel[2];
+    if (reference) {
+        const float w = reference[0], qx = reference[1], qy = reference[2], qz = reference[3];
+        /* Rotate the measured gravity into the zero's frame. Yaw about gravity
+         * leaves its direction unchanged, so no integrated gyro is needed. */
+        const float tx = 2 * (qy * z - qz * y);
+        const float ty = 2 * (qz * x - qx * z);
+        const float tz = 2 * (qx * y - qy * x);
+        x += w * tx + qy * tz - qz * ty;
+        y += w * ty + qz * tx - qx * tz;
+        z += w * tz + qx * ty - qy * tx;
+        if (z <= 0.0f) return false;
+    }
+    *roll = atan2f(y, sqrtf(x * x + z * z)) * DEG;
+    *pitch = atan2f(-x, sqrtf(y * y + z * z)) * DEG;
+    return true;
+}
 static float clamp(float v,float lo,float hi) { return v<lo?lo:v>hi?hi:v; }
 static void normalize(float q[4]) {
     float n=sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
@@ -43,9 +90,7 @@ static bool update_attitude(app_motion_filter_t *f,const float a[3],const float 
     if (!use_gyro && !gravity_valid) return false;
     if(!f->initialized || elapsed>250) {
         if(n<0.1f) return false;
-        float roll=atan2f(a[1],a[2]),pitch=atan2f(-a[0],hypotf(a[1],a[2]));
-        float cr=cosf(roll*.5f),sr=sinf(roll*.5f),cp=cosf(pitch*.5f),sp=sinf(pitch*.5f);
-        f->q[0]=cr*cp;f->q[1]=sr*cp;f->q[2]=cr*sp;f->q[3]=-sr*sp;
+        attitude_from_gravity(a, f->q);
         f->initialized=true;f->reversals=0;f->previous_sign=0;
         elapsed=0;
     }

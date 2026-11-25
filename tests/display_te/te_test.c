@@ -72,6 +72,7 @@ int main(void)
     assert(co5300_display_wait_te(io,35)==ESP_OK); join(thread);
     assert(esp_timer_get_time()-start>=5000);
     assert(co5300_display_get_te_metrics(io,&metrics)==ESP_OK && metrics.edges==2 && metrics.synced==1);
+    assert(metrics.last_edge_us>=start && metrics.last_edge_us<=esp_timer_get_time());
     puts("PASS rising edge setup, shared GPIO ISR service, stale-token rejection and fresh-edge wait");
     start=esp_timer_get_time(); assert(co5300_display_wait_te(io,10)==ESP_ERR_TIMEOUT);
     assert(esp_timer_get_time()-start>=8000);
@@ -82,6 +83,7 @@ int main(void)
     assert(co5300_display_wait_te(io,35)==ESP_OK); join(thread);
     puts("PASS absent TE times out, cooldown keeps fallback responsive, and returning edges restore synchronization");
     thread=spawn(cancel_later,io); assert(co5300_display_wait_te(io,35)==ESP_ERR_INVALID_STATE); join(thread);
+    assert(co5300_display_get_te_metrics(io,&metrics)==ESP_OK && !metrics.last_edge_us && !metrics.last_period_us);
     thread=spawn(edge_later,(void *)4); assert(co5300_display_wait_te(io,35)==ESP_OK); join(thread);
     assert(co5300_display_get_te_metrics(io,&metrics)==ESP_OK && metrics.cancelled==1);
     puts("PASS sleep/reset cancellation unblocks task wait; next refresh requires a new TE edge");

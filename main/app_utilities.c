@@ -22,6 +22,7 @@ enum {
     ALARM_TONE_INTERVAL_MS = 2000,
     ALARM_TONE_RETRY_MS = 500,
     ALARM_RING_MAX_MS = 60000,
+    COUNTDOWN_RING_MAX_MS = 30000,
     ALARM_SLOT_BYTES = 4,
     ALARM_FLAG_CONFIGURED = 1,
     ALARM_FLAG_ENABLED = 2,
@@ -45,6 +46,11 @@ static uint64_t s_ringing_minute;
 static uint32_t s_ring_revision, s_preview_revision;
 static uint8_t s_ringing_mask, s_preview_tone = APP_ALARM_TONE_COUNT;
 static uint32_t s_alarm_revision, s_city_revision;
+static app_countdown_state_t s_countdown_state;
+static unsigned s_countdown_duration = 300;
+static int64_t s_countdown_deadline_us, s_countdown_paused_us, s_countdown_ring_ms;
+static bool s_countdown_ringing;
+static uint32_t s_countdown_revision;
 static bool s_city_pending, s_weather_running;
 static esp_err_t s_city_error;
 static int64_t s_weather_due;
@@ -267,17 +273,84 @@ static bool collect_due_alarms(const pcf85063_time_t *rtc)
 typedef struct {
     uint32_t revision;
     uint8_t slot, tone;
-    bool preview;
+    bool preview, countdown;
 } alarm_audio_request_t;
 
 static bool alarm_audio_current(void *context)
 {
     const alarm_audio_request_t *request = context;
+    const int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_lock);
-    const bool current = request->preview ? !s_alarm.ringing && request->revision == s_preview_revision :
-        s_alarm.ringing && request->slot == s_alarm.ringing_slot && request->revision == s_ring_revision;
+    bool current;
+    if (request->preview) {
+        current = !s_alarm.ringing && !s_countdown_ringing && request->revision == s_preview_revision &&
+                  (!s_countdown_deadline_us || now < s_countdown_deadline_us);
+    } else if (request->countdown) {
+        current = s_countdown_ringing && !s_alarm.ringing && request->revision == s_countdown_revision;
+    } else {
+        current = s_alarm.ringing && request->slot == s_alarm.ringing_slot && request->revision == s_ring_revision;
+    }
     portEXIT_CRITICAL(&s_lock);
     return current && power_running();
+}
+
+static bool collect_due_countdown(int64_t now_us)
+{
+    portENTER_CRITICAL(&s_lock);
+    const bool due = s_countdown_deadline_us && now_us >= s_countdown_deadline_us;
+    if (due) {
+        s_countdown_deadline_us = 0;
+        s_countdown_state = APP_COUNTDOWN_FINISHED;
+        s_countdown_ringing = true;
+        s_countdown_ring_ms = now_us / 1000;
+        ++s_countdown_revision;
+        s_preview_tone = APP_ALARM_TONE_COUNT;
+        ++s_preview_revision;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    return due;
+}
+
+static void process_clock_alerts(int64_t now_us, int64_t *ring_started, int64_t *next_tone)
+{
+    const int64_t now_ms = now_us / 1000;
+    const bool running = power_running();
+    const bool countdown_due = collect_due_countdown(now_us);
+    app_telemetry_snapshot_t telemetry;
+    app_telemetry_get(&telemetry);
+    const bool alarm_due = running && telemetry.rtc_error == ESP_OK && collect_due_alarms(&telemetry.rtc);
+    if (alarm_due) *ring_started = now_ms;
+    if (running && (alarm_due || countdown_due)) {
+        *next_tone = now_ms;
+        (void)app_power_wake(s_power);
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    const bool alarm_ringing = s_alarm.ringing;
+    const bool countdown_ringing = s_countdown_ringing;
+    const int64_t countdown_started = s_countdown_ring_ms;
+    portEXIT_CRITICAL(&s_lock);
+    if (alarm_ringing && (!running || now_ms - *ring_started >= ALARM_RING_MAX_MS)) app_alarm_dismiss();
+    if (countdown_ringing && (!running || now_ms - countdown_started >= COUNTDOWN_RING_MAX_MS))
+        app_countdown_dismiss();
+
+    portENTER_CRITICAL(&s_lock);
+    const bool ringing = s_alarm.ringing || s_countdown_ringing;
+    alarm_audio_request_t audio = s_alarm.ringing ? (alarm_audio_request_t){
+        .revision = s_ring_revision, .slot = s_alarm.ringing_slot, .tone = s_alarm.tone,
+    } : s_countdown_ringing ? (alarm_audio_request_t){
+        .revision = s_countdown_revision, .tone = 1, .countdown = true,
+    } : (alarm_audio_request_t){
+        .revision = s_preview_revision, .tone = s_preview_tone, .preview = true,
+    };
+    s_preview_tone = APP_ALARM_TONE_COUNT;
+    portEXIT_CRITICAL(&s_lock);
+
+    if (running && s_board->audio_ready && audio.tone < APP_ALARM_TONE_COUNT &&
+        (!ringing || now_ms >= *next_tone)) {
+        const esp_err_t error = app_alarm_audio_play(s_board->audio, audio.tone, alarm_audio_current, &audio);
+        if (ringing) *next_tone = now_ms + (error == ESP_OK ? ALARM_TONE_INTERVAL_MS : ALARM_TONE_RETRY_MS);
+    }
 }
 
 static void service(void *unused)
@@ -286,35 +359,19 @@ static void service(void *unused)
     load_preferences();
     int64_t ring_started = 0, next_tone = 0, next_save = 0;
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(450));
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        const bool running = power_running();
-        app_telemetry_snapshot_t telemetry;
-        app_telemetry_get(&telemetry);
-        if (running && telemetry.rtc_error == ESP_OK && collect_due_alarms(&telemetry.rtc)) {
-            ring_started = now_ms;
-            next_tone = now_ms;
-            (void)app_power_wake(s_power);
-        }
-
+        const int64_t before_wait = esp_timer_get_time();
         portENTER_CRITICAL(&s_lock);
-        const bool ringing = s_alarm.ringing;
-        alarm_audio_request_t audio = ringing ? (alarm_audio_request_t){
-            .revision = s_ring_revision, .slot = s_alarm.ringing_slot, .tone = s_alarm.tone,
-        } : (alarm_audio_request_t){
-            .revision = s_preview_revision, .tone = s_preview_tone, .preview = true,
-        };
-        s_preview_tone = APP_ALARM_TONE_COUNT;
+        const int64_t deadline = s_countdown_deadline_us;
         portEXIT_CRITICAL(&s_lock);
-
-        if (ringing && (!running || now_ms - ring_started >= ALARM_RING_MAX_MS)) {
-            app_alarm_dismiss();
-        } else if (running && s_board->audio_ready && audio.tone < APP_ALARM_TONE_COUNT &&
-                   (!ringing || now_ms >= next_tone)) {
-            const esp_err_t error = app_alarm_audio_play(s_board->audio, audio.tone,
-                                                         alarm_audio_current, &audio);
-            if (ringing) next_tone = now_ms + (error == ESP_OK ? ALARM_TONE_INTERVAL_MS : ALARM_TONE_RETRY_MS);
+        unsigned wait_ms = 450;
+        if (deadline && deadline - before_wait < 450000) {
+            const int64_t delay = deadline - before_wait;
+            wait_ms = delay > 0 ? (unsigned)(delay + 999) / 1000 : 0;
         }
+        ulTaskNotifyTake(pdTRUE, wait_ms ? pdMS_TO_TICKS(wait_ms) + 1 : 0);
+        const int64_t now_us = esp_timer_get_time();
+        const int64_t now_ms = now_us / 1000;
+        process_clock_alerts(now_us, &ring_started, &next_tone);
         /* Allow the shutdown coordinator to flush already admitted saves. */
         if (now_ms >= next_save && !storage_busy()) {
             esp_err_t error = save_preferences();
@@ -404,7 +461,7 @@ esp_err_t app_alarm_preview(unsigned tone)
     if (tone >= APP_ALARM_TONE_COUNT) return ESP_ERR_INVALID_ARG;
     if (!s_service || !s_board->audio_ready || !power_running()) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&s_lock);
-    const bool allowed = s_alarm.ready && !s_alarm.ringing;
+    const bool allowed = s_alarm.ready && !s_alarm.ringing && !s_countdown_ringing;
     if (allowed) {
         s_preview_tone = tone;
         ++s_preview_revision;
@@ -429,6 +486,82 @@ void app_alarm_dismiss(void)
         s_ringing_mask = 0;
         ++s_ring_revision;
         update_ringing_summary_locked();
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+void app_countdown_get(app_countdown_snapshot_t *out)
+{
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    int64_t remaining = s_countdown_deadline_us ? s_countdown_deadline_us - now : s_countdown_paused_us;
+    if (s_countdown_state == APP_COUNTDOWN_IDLE) remaining = (int64_t)s_countdown_duration * 1000000;
+    unsigned seconds = remaining > 0 ? (unsigned)((remaining + 999999) / 1000000) : 0;
+    if (seconds > s_countdown_duration) seconds = s_countdown_duration;
+    *out = (app_countdown_snapshot_t){s_countdown_state, s_countdown_duration, seconds, s_countdown_ringing};
+    portEXIT_CRITICAL(&s_lock);
+}
+
+esp_err_t app_countdown_start(unsigned seconds)
+{
+    if (!seconds || seconds > APP_COUNTDOWN_MAX_SECONDS) return ESP_ERR_INVALID_ARG;
+    if (!s_service || !power_running()) return ESP_ERR_INVALID_STATE;
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    s_countdown_duration = seconds;
+    s_countdown_state = APP_COUNTDOWN_RUNNING;
+    s_countdown_deadline_us = now + (int64_t)seconds * 1000000;
+    s_countdown_paused_us = 0;
+    s_countdown_ringing = false;
+    ++s_countdown_revision;
+    portEXIT_CRITICAL(&s_lock);
+    xTaskNotifyGive(s_service);
+    return ESP_OK;
+}
+
+void app_countdown_pause(void)
+{
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (s_countdown_deadline_us > now) {
+        s_countdown_paused_us = s_countdown_deadline_us - now;
+        s_countdown_deadline_us = 0;
+        s_countdown_state = APP_COUNTDOWN_PAUSED;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+void app_countdown_resume(void)
+{
+    if (!s_service || !power_running()) return;
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    const bool paused = s_countdown_state == APP_COUNTDOWN_PAUSED;
+    if (paused) {
+        s_countdown_deadline_us = now + s_countdown_paused_us;
+        s_countdown_paused_us = 0;
+        s_countdown_state = APP_COUNTDOWN_RUNNING;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (paused) xTaskNotifyGive(s_service);
+}
+
+void app_countdown_reset(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_countdown_deadline_us = s_countdown_paused_us = 0;
+    s_countdown_ringing = false;
+    s_countdown_state = APP_COUNTDOWN_IDLE;
+    ++s_countdown_revision;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+void app_countdown_dismiss(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    if (s_countdown_ringing) {
+        s_countdown_ringing = false;
+        ++s_countdown_revision;
     }
     portEXIT_CRITICAL(&s_lock);
 }

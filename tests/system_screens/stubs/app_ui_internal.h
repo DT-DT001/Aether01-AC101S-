@@ -48,4 +48,6 @@ bool app_ui_input_blocked(const app_ui_t *);
 void app_open_status(app_ui_t *);
 void app_open_clock(app_ui_t *);
 void app_open_alarm(app_ui_t *);
+void app_open_stopwatch(app_ui_t *);
+void app_open_countdown(app_ui_t *);
 void app_open_barometer(app_ui_t *);

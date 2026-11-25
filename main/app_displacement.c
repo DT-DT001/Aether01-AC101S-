@@ -1,7 +1,6 @@
 #include "app_displacement.h"
 #include "app_telemetry.h"
 
-#include <math.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -9,7 +8,6 @@
 #define CALIBRATION_TIMEOUT_MS 12000U
 #define READY_TIMEOUT_MS 20000U
 #define STALE_SAMPLE_MS 100U
-#define MOTION_LOG_INTERVAL_MS 750U
 
 static const char *const TAG = "displacement";
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -21,7 +19,6 @@ static bool s_finish, s_resume;
 /* Only telemetry owns the estimator and its working state. */
 static app_displacement_estimator_t s_estimator;
 static uint32_t s_worker_generation, s_last_stamp, s_ready_at;
-static uint32_t s_motion_logged_at;
 static bool s_have_stamp;
 
 static uint32_t now_ms(void)
@@ -50,24 +47,14 @@ static void publish(uint32_t generation, app_displacement_state_t state,
                     app_displacement_result_t result)
 {
     app_displacement_state_t previous = state;
-    bool rest_changed = false;
     portENTER_CRITICAL(&s_lock);
     if (generation == s_generation && s_status.active) {
         previous = s_status.state;
-        rest_changed = s_status.result.stationary != result.stationary;
         s_status.state = state;
         s_status.result = result;
         s_status.active = state != APP_DISPLACEMENT_COMPLETE && state != APP_DISPLACEMENT_INVALID;
     }
     portEXIT_CRITICAL(&s_lock);
-    if (rest_changed && state == APP_DISPLACEMENT_MOVING) {
-        const unsigned mean_hz = result.elapsed_ms ? (unsigned)(1000U * result.samples / result.elapsed_ms) : 0;
-        ESP_LOGI(TAG, "session=%lu %s xyz_mm=%ld,%ld,%ld residual_mm_s=%ld imu_hz=%u corrected=%d low_confidence=%d",
-                 (unsigned long)generation, result.stationary ? "held" : "resumed",
-                 (long)(result.xyz_m[0] * 1000.0f), (long)(result.xyz_m[1] * 1000.0f),
-                 (long)(result.xyz_m[2] * 1000.0f), (long)(result.end_speed_mps * 1000.0f),
-                 mean_hz, (int)result.endpoint_corrected, (int)result.low_confidence);
-    }
     if (previous == state) return;
     if (state == APP_DISPLACEMENT_INVALID) {
         ESP_LOGW(TAG, "session=%lu phase=%d fault=%d samples=%lu motion_ms=%lu max_gap_ms=%lu endpoint_mm_s2=%ld residual_mm_s=%ld",
@@ -75,17 +62,22 @@ static void publish(uint32_t generation, app_displacement_state_t state,
                  (unsigned long)result.samples, (unsigned long)result.elapsed_ms,
                  (unsigned long)result.max_gap_ms, (long)(result.endpoint_error_mps2 * 1000.0f),
                  (long)(result.end_speed_mps * 1000.0f));
-    } else {
-        ESP_LOGI(TAG, "session=%lu phase=%d->%d samples=%lu motion_ms=%lu limited=%d",
-                 (unsigned long)generation, (int)previous, (int)state,
-                 (unsigned long)result.samples, (unsigned long)result.elapsed_ms, (int)result.measurement_limited);
+    } else if (state == APP_DISPLACEMENT_COMPLETE) {
+        ESP_LOGI(TAG, "session=%lu complete samples=%lu motion_ms=%lu max_gap_ms=%lu distance_mm=%ld xyz_mm=%ld,%ld,%ld low_confidence=%d limited=%d",
+                 (unsigned long)generation, (unsigned long)result.samples,
+                 (unsigned long)result.elapsed_ms, (unsigned long)result.max_gap_ms,
+                 (long)(result.distance_m * 1000.0f), (long)(result.xyz_m[0] * 1000.0f),
+                 (long)(result.xyz_m[1] * 1000.0f), (long)(result.xyz_m[2] * 1000.0f),
+                 (int)result.low_confidence,
+                 (int)result.measurement_limited);
     }
 }
 
-static void fail(uint32_t generation, app_displacement_fault_t fault)
+static void fail(uint32_t generation, app_displacement_fault_t fault, uint32_t observed_gap_ms)
 {
     app_displacement_result_t result = s_estimator.result;
     result.fault = fault;
+    if (observed_gap_ms > result.max_gap_ms) result.max_gap_ms = observed_gap_ms;
     publish(generation, APP_DISPLACEMENT_INVALID, result);
 }
 
@@ -104,10 +96,9 @@ static void consume_sample(const app_telemetry_snapshot_t *sample)
         app_displacement_estimator_reset(&s_estimator);
         s_worker_generation = generation;
         s_have_stamp = false;
-        s_motion_logged_at = started_at;
     }
     if (!sample || !power_allows_measurement()) {
-        fail(generation, APP_DISPLACEMENT_FAULT_SENSOR);
+        fail(generation, APP_DISPLACEMENT_FAULT_SENSOR, 0);
         return;
     }
 
@@ -115,24 +106,25 @@ static void consume_sample(const app_telemetry_snapshot_t *sample)
     const uint32_t elapsed = now - started_at;
     if (sample->imu_error == ESP_ERR_NOT_FINISHED) {
         const uint32_t age = s_have_stamp ? now - s_last_stamp : elapsed;
-        if (age >= STALE_SAMPLE_MS) fail(generation, APP_DISPLACEMENT_FAULT_GAP);
+        if (age >= STALE_SAMPLE_MS) fail(generation, APP_DISPLACEMENT_FAULT_GAP, age);
         return;
     }
     if (sample->imu_error != ESP_OK) {
-        if (elapsed >= STALE_SAMPLE_MS || s_have_stamp) fail(generation, APP_DISPLACEMENT_FAULT_SENSOR);
+        if (elapsed >= STALE_SAMPLE_MS || s_have_stamp) fail(generation, APP_DISPLACEMENT_FAULT_SENSOR, 0);
         return;
     }
     const uint32_t stamp = sample->imu_updated_ms;
-    if ((!s_have_stamp && (int32_t)(stamp - started_at) < 0) || now - stamp > STALE_SAMPLE_MS) {
-        if (elapsed >= STALE_SAMPLE_MS) fail(generation, APP_DISPLACEMENT_FAULT_GAP);
+    const uint32_t age = now - stamp;
+    if ((!s_have_stamp && (int32_t)(stamp - started_at) < 0) || age > STALE_SAMPLE_MS) {
+        if (elapsed >= STALE_SAMPLE_MS) fail(generation, APP_DISPLACEMENT_FAULT_GAP, age);
         return;
     }
     if (s_estimator.phase == APP_DISPLACEMENT_WAITING_STILL && elapsed >= CALIBRATION_TIMEOUT_MS) {
-        fail(generation, APP_DISPLACEMENT_FAULT_START_STILL);
+        fail(generation, APP_DISPLACEMENT_FAULT_START_STILL, 0);
         return;
     }
     if (s_estimator.phase == APP_DISPLACEMENT_READY && !finish && now - s_ready_at >= READY_TIMEOUT_MS) {
-        fail(generation, APP_DISPLACEMENT_FAULT_WAIT_MOTION);
+        fail(generation, APP_DISPLACEMENT_FAULT_WAIT_MOTION, 0);
         return;
     }
     if (finish) (void)app_displacement_estimator_finish(&s_estimator);
@@ -151,19 +143,7 @@ static void consume_sample(const app_telemetry_snapshot_t *sample)
     const app_displacement_state_t after = app_displacement_estimator_push(
         &s_estimator, imu->accel_mps2, imu->gyro_raw_dps, stamp);
     if (after == APP_DISPLACEMENT_READY && before != after) s_ready_at = now;
-    const app_displacement_result_t visible = app_displacement_estimator_preview(&s_estimator);
-    publish(generation, after, visible);
-    if (after == APP_DISPLACEMENT_MOVING && !visible.stationary && now - s_motion_logged_at >= MOTION_LOG_INTERVAL_MS) {
-        const float *a = imu->accel_mps2, *w = s_estimator.last_rate, *v = s_estimator.velocity;
-        const uint32_t quiet_ms = s_estimator.raw_endpoint.count ? stamp - s_estimator.raw_endpoint.since : 0;
-        const unsigned mean_hz = visible.elapsed_ms ? (unsigned)(1000U * visible.samples / visible.elapsed_ms) : 0;
-        ESP_LOGI(TAG, "motion quiet_ms=%lu preview_held=%d imu_hz=%u accel_mm_s2=%ld gyro_mdps=%ld speed_mm_s=%ld",
-                 (unsigned long)quiet_ms, (int)visible.preview_held, mean_hz,
-                 (long)(1000.0f * sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2])),
-                 (long)(1000.0f * sqrtf(w[0]*w[0] + w[1]*w[1] + w[2]*w[2])),
-                 (long)(1000.0f * sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])));
-        s_motion_logged_at = now;
-    }
+    publish(generation, after, app_displacement_estimator_preview(&s_estimator));
     if (resume) {
         portENTER_CRITICAL(&s_lock);
         if (generation == s_generation) s_resume = false;

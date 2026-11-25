@@ -79,5 +79,29 @@ int main(void) {
     for(unsigned i=2;i<20000;++i) {assert(app_motion_filter_update(&f,a,w,i*20));unit(&f);}
     puts("PASS invalid samples preserve orientation; tick wrap and20k updates remain normalized");
     uncalibrated_game_tilt();
+    float roll = 99, pitch = 99;
+    assert(app_motion_level_angles((float[3]){0, 0, 9.0f}, NULL, &roll, &pitch));
+    assert(roll == 0 && pitch == 0);
+    assert(app_motion_level_angles((float[3]){0, G * .5f, G * .8660254f}, NULL, &roll, &pitch));
+    assert(fabsf(roll - 30.0f) < .01f && fabsf(pitch) < .01f);
+    assert(app_motion_level_angles((float[3]){G * .5f, 0, G * .8660254f}, NULL, &roll, &pitch));
+    assert(fabsf(roll) < .01f && fabsf(pitch + 30.0f) < .01f);
+    assert(!app_motion_level_angles((float[3]){0, 0, -G}, NULL, &roll, &pitch));
+    assert(!app_motion_level_angles((float[3]){0, 0, 0}, NULL, &roll, &pitch));
+    assert(!app_motion_level_angles((float[3]){NAN, 0, G}, NULL, &roll, &pitch));
+    puts("PASS spirit level: gravity axes, upside-down, freefall, and nonfinite input");
+    float reference[4];
+    const float tilted[3] = {0, G * .5f, G * .8660254f};
+    assert(app_motion_level_reference(tilted, reference));
+    assert(app_motion_level_angles(tilted, reference, &roll, &pitch));
+    assert(fabsf(roll) < .01f && fabsf(pitch) < .01f);
+    assert(app_motion_level_angles((float[3]){0, G * .7071068f, G * .7071068f}, reference, &roll, &pitch));
+    assert(fabsf(roll - 15.0f) < .01f && fabsf(pitch) < .01f);
+    assert(!app_motion_level_reference((float[3]){0, 0, -G}, reference));
+    assert(!app_motion_level_angles((float[3]){0, 0, -G}, reference, &roll, &pitch));
+    assert(app_motion_level_angles((float[3]){0, 0, G}, reference, &roll, &pitch));
+    assert(fabsf(roll + 30.0f) < .01f && fabsf(pitch) < .01f);
+    assert(!app_motion_level_angles((float[3]){0, -G * .9848078f, G * .1736482f}, reference, &roll, &pitch));
+    puts("PASS gravity zero: tilted reference, signed relative angles, preserved zero on rejected input, and reference-relative inversion");
     return 0;
 }

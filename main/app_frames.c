@@ -25,6 +25,7 @@ struct app_frames {
     uint16_t viewport_width, viewport_height;
     lv_image_dsc_t descriptor;
     lv_obj_t *refresh_image;
+    app_frames_direct_fn direct_present;
 };
 
 static void present_on_refresh(lv_event_t *event);
@@ -81,10 +82,16 @@ void app_frames_set_refresh_image(app_frames_handle_t frames, lv_obj_t *image)
         lv_obj_remove_event_cb_with_user_data(frames->refresh_image, refresh_image_deleted, frames);
     }
     frames->refresh_image = image;
+    if (!image) frames->direct_present = NULL;
     if (image) {
         lv_display_add_event_cb(lv_obj_get_display(image), present_on_refresh, LV_EVENT_REFR_START, frames);
         lv_obj_add_event_cb(image, refresh_image_deleted, LV_EVENT_DELETE, frames);
     }
+}
+
+void app_frames_set_direct_presenter(app_frames_handle_t frames, app_frames_direct_fn present)
+{
+    if (frames) frames->direct_present = present;
 }
 
 static void refresh_image_deleted(lv_event_t *event)
@@ -146,6 +153,9 @@ static void present(app_frames_handle_t frames, lv_obj_t *image, bool refreshing
         frames->metrics.queue_delay_us = delay <= 0 ? 0 : delay > UINT32_MAX ? UINT32_MAX : (uint32_t)delay;
         if (frames->metrics.queue_delay_us > frames->metrics.max_queue_delay_us)
             frames->metrics.max_queue_delay_us = frames->metrics.queue_delay_us;
+        /* The producer excludes the front slot even after releasing the lock.
+         * A potentially blocking panel transfer must never hold the mutex. */
+        xSemaphoreGive(frames->lock);
         const bool same_source = refreshing && lv_image_get_src(image) == &frames->descriptor &&
             frames->descriptor.header.w == frames->width[slot] &&
             frames->descriptor.header.h == frames->height[slot];
@@ -174,9 +184,13 @@ static void present(app_frames_handle_t frames, lv_obj_t *image, bool refreshing
                 lv_obj_center(image);
             }
         }
+        if (same_source && frames->direct_present &&
+            frames->direct_present(image, frames->pixels[slot], frames->width[slot], frames->height[slot]))
+            return;
         if (!same_source) lv_image_set_src(image, &frames->descriptor);
         if (!frames->viewport_width || !frames->viewport_height) lv_obj_center(image);
         lv_obj_invalidate(image);
+        return;
     }
     xSemaphoreGive(frames->lock);
 }

@@ -425,7 +425,10 @@ app_displacement_state_t app_displacement_estimator_push(app_displacement_estima
     uint32_t elapsed = est->have_stamp ? stamp - est->last_stamp : 0;
     if (est->have_stamp && !elapsed) return est->phase;
     if (elapsed > MAX_GAP_MS) {
-        if (est->phase != APP_DISPLACEMENT_WAITING_STILL) return invalidate(est, APP_DISPLACEMENT_FAULT_GAP);
+        if (est->phase != APP_DISPLACEMENT_WAITING_STILL) {
+            est->result.max_gap_ms = elapsed;
+            return invalidate(est, APP_DISPLACEMENT_FAULT_GAP);
+        }
         app_displacement_estimator_reset(est);
         elapsed = 0;
     }
@@ -502,7 +505,9 @@ app_displacement_state_t app_displacement_estimator_push(app_displacement_estima
 
     if (!est->recording && !settling) return est->phase;
     const bool near_gravity = fabsf(norm(accel) - norm(est->gravity)) <= END_GRAVITY_TOLERANCE;
+    const float linear_squared = dot(est->last_accel, est->last_accel);
     bool fast = true;
+    bool coasting = false;
     if (est->recording) {
         const float speed = norm(est->velocity);
         if (speed > est->peak_speed) est->peak_speed = speed;
@@ -510,21 +515,25 @@ app_displacement_state_t app_displacement_estimator_push(app_displacement_estima
             est->last_brake_stamp = stamp;
             est->braking_seen = true;
         }
-        const bool braking_stop = est->braking_seen && stamp - est->last_brake_stamp <= BRAKING_EVIDENCE_MS &&
+        const bool recent_braking = est->braking_seen && stamp - est->last_brake_stamp <= BRAKING_EVIDENCE_MS;
+        const bool braking_stop = recent_braking &&
             speed <= fminf(BRAKING_STOP_SPEED_MPS, 0.40f * est->peak_speed);
         const float linear_limit = settling ? FINISH_LINEAR_LIMIT_MPS2 :
             (braking_stop ? BRAKING_STOP_LINEAR_MPS2 : END_LINEAR_LIMIT_MPS2);
-        const float linear_squared = dot(est->last_accel, est->last_accel);
         fast = linear_squared <= linear_limit * linear_limit &&
             (settling || braking_stop || speed <= AUTO_STOP_SPEED_MPS);
+        coasting = !settling && !recent_braking && speed > BRAKING_STOP_SPEED_MPS &&
+            linear_squared <= END_LINEAR_LIMIT_MPS2 * END_LINEAR_LIMIT_MPS2;
     }
-    const bool tolerate_noise = dot(est->last_accel, est->last_accel) >
-        BRAKING_STOP_LINEAR_MPS2 * BRAKING_STOP_LINEAR_MPS2;
+    const bool tolerate_noise = linear_squared > BRAKING_STOP_LINEAR_MPS2 * BRAKING_STOP_LINEAR_MPS2;
     const bool fallback_rate = dot(rate, rate) <= FALLBACK_GYRO_LIMIT_DPS * FALLBACK_GYRO_LIMIT_DPS;
+    /* A smooth glide can produce the same raw samples as rest. Clear its
+     * candidate immediately so neither preview nor automatic lock rewinds it. */
+    if (coasting) est->raw_endpoint.count = 0;
     /* An explicit Finish supplies the stop intent missing from automatic
      * detection during a glide. Keep all of the raw stability checks. */
     const bool raw_still = track_endpoint(est, &est->raw_endpoint, accel, rate, stamp,
-        near_gravity && fallback_rate, false, tolerate_noise, settling ? END_STILL_MS : FALLBACK_STILL_MS);
+        !coasting && near_gravity && fallback_rate, false, tolerate_noise, settling ? END_STILL_MS : FALLBACK_STILL_MS);
     const bool fast_still = track_endpoint(est, &est->endpoint, accel, rate, stamp,
         near_gravity && slow_rotation && fast, true, false, END_STILL_MS);
     if (fast_still || raw_still) {

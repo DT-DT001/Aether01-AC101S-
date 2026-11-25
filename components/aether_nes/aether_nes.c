@@ -8,6 +8,12 @@
 #include "esp_log.h"
 
 #define NES_TASK_STACK 12288U
+#if defined(CONFIG_FREERTOS_UNICORE) && CONFIG_FREERTOS_UNICORE
+#define NES_TASK_CORE 0
+#else
+/* Leave core 0 for LVGL and networking, as the video decoder does. */
+#define NES_TASK_CORE 1
+#endif
 
 static const char *TAG = "aether_nes";
 /* Nofrendo has global machine state and supports only one instance. */
@@ -304,7 +310,7 @@ esp_err_t aether_nes_start(aether_nes_handle_t handle, const char *rom_path,
     handle->state = AETHER_NES_STARTING;
     handle->running = true;
     portEXIT_CRITICAL(&handle->lock);
-    if (xTaskCreate(nes_task, "nes", NES_TASK_STACK, handle, 7, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(nes_task, "nes", NES_TASK_STACK, handle, 7, NULL, NES_TASK_CORE) != pdPASS) {
         portENTER_CRITICAL(&handle->lock);
         handle->last_error = ESP_ERR_NO_MEM;
         handle->state = AETHER_NES_ERROR;

@@ -9,7 +9,7 @@ static uint32_t clock_ms;
 static unsigned tick_jitter;
 esp_err_t tg29_get_cc_events(tg29_handle_t handle, uint8_t *events)
 { (void)handle; *events=0; return ESP_OK; }
-static unsigned sleeps, wakes;
+static unsigned sleeps, wakes, idle_audio_calls;
 static uint8_t applied_brightness;
 static esp_err_t sleep_error, wake_error;
 static esp_err_t brightness_error, nvs_open_error, nvs_commit_error;
@@ -61,7 +61,7 @@ esp_err_t esp_pm_configure(const esp_pm_config_t *config) { pm_config = *config;
 esp_err_t lvgl_port_stop(void) { return ESP_OK; }
 esp_err_t lvgl_port_resume(void) { return ESP_OK; }
 esp_err_t gpio_intr_disable(int pin) { return pin == AETHER_GPIO_BOOT_KEY ? ESP_OK : ESP_FAIL; }
-esp_err_t ac101s_audio_idle_clocks(void *audio) { (void)audio; return ESP_OK; }
+esp_err_t ac101s_audio_idle_clocks(void *audio) { (void)audio; ++idle_audio_calls; return ESP_OK; }
 uint32_t __real_lv_timer_handler(void) { return 7; }
 
 static void step(char c) { shutdown_order[shutdown_order_length++] = c; }
@@ -87,6 +87,7 @@ static esp_err_t shutdown_hook(void *ctx, app_power_shutdown_stage_t stage, uint
         clock_ms += hook_finish_delay;
         return hook_finish_error;
     }
+    if (stage == APP_POWER_SHUTDOWN_POWER_OFF) { step('P'); return ESP_OK; }
     ++hook_cancel_calls; if(timeout>cancel_budget_max)cancel_budget_max=timeout; step('C'); return stage == APP_POWER_SHUTDOWN_CANCEL ? hook_cancel_error : ESP_FAIL;
 }
 
@@ -188,7 +189,7 @@ static void reset(void)
     pending_before_unlock = false;
     media_busy = deferred_without_commit = false;
     clock_ms = 0;
-    tick_jitter = sleeps = wakes = loop_number = 0;
+    tick_jitter = sleeps = wakes = idle_audio_calls = loop_number = 0;
     applied_brightness = 0;
     sleep_error = wake_error = ESP_OK;
     brightness_error = nvs_open_error = nvs_commit_error = ESP_OK;
@@ -293,7 +294,7 @@ static int test_software_shutdown(void)
     CHECK(app_power_set_shutdown_hook(&manager, shutdown_hook, NULL) == ESP_OK);
     prepare_shutdown(&manager);
     CHECK(manager.shutdown_state == APP_POWER_SHUTDOWN_REQUESTED && manager.shutdown_error == ESP_OK);
-    CHECK(!strcmp(shutdown_order, "BQIDFO") && power_off_calls == 1 && !resumes && !hook_cancel_calls);
+    CHECK(!strcmp(shutdown_order, "BQIDFPO") && power_off_calls == 1 && !resumes && !hook_cancel_calls);
     CHECK(app_power_set_shutdown_hook(&manager, NULL, NULL) == ESP_ERR_INVALID_STATE);
     puts("PASS shutdown order gates media, drains sampler, verifies both sensors, closes files then commands PMIC");
 
@@ -335,7 +336,7 @@ static int test_software_shutdown(void)
     prepare_shutdown(&manager);
     CHECK(manager.shutdown_state == APP_POWER_SHUTDOWN_REQUESTED && manager.cleanup_timed_out && power_off_calls == 1);
     CHECK(!resumes && !qmi_restores && !dps_restores && !hook_cancel_calls && clock_ms == 500);
-    CHECK(qmi_sleeps == 1 && dps_sleeps == 1 && !strcmp(shutdown_order, "BQIDFO"));
+    CHECK(qmi_sleeps == 1 && dps_sleeps == 1 && !strcmp(shutdown_order, "BQIDFPO"));
     CHECK(commits == 0 && manager.persist_pending == (PERSIST_TIMEOUT | PERSIST_BRIGHTNESS));
     for (unsigned sensor = 0; sensor < 2; ++sensor) {
         reset(); board.pmic = &board; board.imu_ready = board.barometer_ready = true;
@@ -352,7 +353,7 @@ static int test_software_shutdown(void)
     prepare_shutdown(&manager);
     CHECK(manager.shutdown_state == APP_POWER_SHUTDOWN_REQUESTED && manager.cleanup_timed_out && power_off_calls == 1);
     CHECK(!resumes && !qmi_restores && !dps_restores && !hook_cancel_calls && qmi_sleeps == 1 && dps_sleeps == 1);
-    CHECK(!strcmp(shutdown_order, "BQIDFO"));
+    CHECK(!strcmp(shutdown_order, "BQIDFPO"));
     CHECK(commits == 0 && manager.persist_pending == PERSIST_TIMEOUT);
     reset(); board.pmic = &board; board.imu_ready = board.barometer_ready = true;
     CHECK(app_power_set_shutdown_hook(&manager, shutdown_hook, NULL) == ESP_OK);
@@ -470,6 +471,30 @@ static void recover_brightness(unsigned iteration)
 static bool media_persistence_busy(void *context)
 {
     return *(bool *)context;
+}
+
+static int test_standby_audio_guard(void)
+{
+    for (unsigned manual = 0; manual < 2; ++manual) {
+        reset();
+        CHECK(app_power_init(&manager, &board, &display) == ESP_OK);
+        board.audio_ready = true;
+        board.audio = &board;
+        media_busy = true;
+        app_power_set_standby_audio_guard(&manager, media_persistence_busy, &media_busy);
+        if (manual) CHECK(app_power_sleep_now(&manager) == ESP_OK);
+        else CHECK(app_power_set_timeout(&manager, 1, false) == ESP_OK);
+        run_worker(25);
+        CHECK(sleeps == 1 && manager.sleeping && awake_clock_locked && !idle_audio_calls);
+        media_busy = false;
+        run_worker(loop_number + 2);
+        CHECK(manager.sleeping && !awake_clock_locked && idle_audio_calls > 0);
+        CHECK(app_power_wake(&manager) == ESP_OK);
+        run_worker(loop_number + 2);
+        CHECK(wakes == 1 && !manager.sleeping && awake_clock_locked);
+    }
+    puts("PASS manual and timed standby preserve the clock and skip idle I2S until background playback ends");
+    return 0;
 }
 
 static void pause_media(unsigned iteration)
@@ -716,6 +741,7 @@ static int test_user_key_dispatch(void)
 int main(void)
 {
     CHECK(test_standby_clock_policy() == 0);
+    CHECK(test_standby_audio_guard() == 0);
     reset();
     sleep_error = ESP_FAIL;
     CHECK(apply_sleep(&manager) == ESP_FAIL);

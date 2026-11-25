@@ -17,7 +17,7 @@ static co5300_te_metrics_t te = {.available = true, .edges = 2, .last_period_us 
 static aether_storage_status_t storage = {.mounted = true, .card_inserted = true, .capacity_bytes = 8ULL << 30};
 static pcf85063_time_t request;
 static uint32_t interest;
-static unsigned alarm_opens, clock_writes;
+static unsigned alarm_opens, stopwatch_opens, countdown_opens, clock_writes;
 static bool input_blocked, network_ready;
 
 esp_err_t aether_storage_get_status(void *handle, aether_storage_status_t *out)
@@ -54,6 +54,8 @@ esp_err_t app_tools_set_clock(const pcf85063_time_t *time)
     return ESP_OK;
 }
 void app_open_alarm(app_ui_t *ui) { assert(ui); ++alarm_opens; }
+void app_open_stopwatch(app_ui_t *ui) { assert(ui); ++stopwatch_opens; }
+void app_open_countdown(app_ui_t *ui) { assert(ui); ++countdown_opens; }
 bool app_ui_input_blocked(const app_ui_t *ui) { assert(ui); return input_blocked; }
 bool app_tools_clock_network_ready(void) { return network_ready; }
 esp_err_t app_tools_sync_clock(void)
@@ -91,14 +93,15 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
 {
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
     if (ui->page_cleanup) { ui->page_cleanup(ui); ui->page_cleanup = NULL; }
+    ui->page_back = NULL;
     interest = 0;
     memset(ui->app_obj, 0, sizeof(ui->app_obj));
     lv_obj_t *old = ui->screen;
     ui->screen = lv_obj_create(NULL);
     app_ui_add_text(ui->screen, title, LV_ALIGN_TOP_MID, 0, 16, 0xFFFFFF, &font_24);
     ui->content = lv_obj_create(ui->screen);
-    lv_obj_set_size(ui->content, 448, 386);
-    lv_obj_align(ui->content, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_set_size(ui->content, 448, 394);
+    lv_obj_align(ui->content, LV_ALIGN_BOTTOM_MID, 0, -14);
     lv_obj_set_style_pad_all(ui->content, 20, 0);
     lv_screen_load(ui->screen);
     if (old) lv_obj_delete(old);
@@ -112,16 +115,25 @@ static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
 static void tick(unsigned ms) { lv_tick_inc(ms); lv_timer_handler(); }
 static bool has_text(lv_obj_t *obj, const char *text) { return strstr(lv_label_get_text(obj), text) != NULL; }
 
+static lv_obj_t *find_label(lv_obj_t *object, const char *text)
+{
+    if (lv_obj_check_type(object, &lv_label_class) && !strcmp(lv_label_get_text(object), text)) return object;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(object); ++i) {
+        lv_obj_t *label = find_label(lv_obj_get_child(object, i), text);
+        if (label) return label;
+    }
+    return NULL;
+}
+
 static void click_named(lv_obj_t *content, const char *text)
 {
-    for (uint32_t i = 0; i < lv_obj_get_child_count(content); ++i) {
-        lv_obj_t *button = lv_obj_get_child(content, i);
-        if (lv_obj_check_type(button, &lv_button_class) && has_text(lv_obj_get_child(button, 0), text)) {
-            lv_obj_send_event(button, LV_EVENT_CLICKED, NULL);
-            return;
-        }
-    }
-    assert(!"button missing");
+    lv_obj_t *label = find_label(content, text);
+    assert(label);
+    lv_obj_t *button = lv_obj_get_parent(label);
+    assert(lv_obj_check_type(button, &lv_button_class));
+    lv_obj_update_layout(button);
+    assert(lv_obj_is_visible(button));
+    lv_obj_send_event(button, LV_EVENT_CLICKED, NULL);
 }
 
 static void test_clock(app_ui_t *ui)
@@ -185,52 +197,59 @@ static void test_clock(app_ui_t *ui)
     samples.rtc_error = ESP_ERR_TIMEOUT;
     tick(500);
     assert(has_text(ui->app_obj[0], "--:--:--") && has_text(ui->app_obj[1], "ESP_ERR_TIMEOUT"));
-    click_named(ui->content, LV_SYMBOL_BELL);
-    assert(clock_writes == 2 && alarm_opens == 1);
-    puts("PASS AC101S Clock actual LVGL: leap-date clamps, shutdown gate, manual readback, Wi-Fi gate, NTP timeout/retry/readback and alarm");
+    click_named(ui->content, "闹钟");
+    click_named(ui->content, "秒表");
+    click_named(ui->content, "倒计时");
+    assert(clock_writes == 2 && alarm_opens == 1 && stopwatch_opens == 1 && countdown_opens == 1);
+    assert(ui->page_back == app_open_clock);
+    puts("PASS AC101S Clock actual LVGL: leap-date clamps, shutdown gate, manual readback, Wi-Fi gate, NTP timeout/retry/readback and clock tools entries");
 }
 
 static void test_status(app_ui_t *ui)
 {
     app_open_status(ui);
     assert(interest == (APP_TELEMETRY_IMU | APP_TELEMETRY_BAROMETER));
-    assert(has_text(ui->app_obj[0], "TE 60.0 Hz") && has_text(ui->app_obj[0], "已挂载") &&
-           has_text(ui->app_obj[0], "PSRAM 总量 32 MiB") && has_text(ui->app_obj[0], "设置存储"));
+    assert(has_text(ui->app_obj[1], "固件 aether01-host") && has_text(ui->app_obj[1], "ESP-IDF 6.1-host") &&
+           has_text(ui->app_obj[2], "TE 60.0 Hz") && has_text(ui->app_obj[3], "DCDC2 3300 mV") &&
+           has_text(ui->app_obj[4], "PSRAM 32 MiB") && has_text(ui->app_obj[5], "已挂载") &&
+           has_text(ui->app_obj[5], "设置存储"));
     lv_obj_update_layout(ui->screen);
     lv_obj_scroll_to_y(ui->content, 8192, LV_ANIM_OFF);
     assert(lv_obj_get_scroll_y(ui->content) > 0);
     te.edges = 0;
     tick(1000);
-    assert(has_text(ui->app_obj[0], "等待有效信号"));
+    assert(has_text(ui->app_obj[2], "等待有效信号"));
     te.available = false;
     te.setup_error = tools.power_error = ESP_ERR_TIMEOUT;
     storage = (aether_storage_status_t){0};
     tick(1000);
-    assert(has_text(ui->app_obj[0], "TE 不可用") &&
-           has_text(ui->app_obj[0], "TG29 ESP_ERR_TIMEOUT") && has_text(ui->app_obj[0], "未插卡"));
+    assert(has_text(ui->app_obj[2], "TE 不可用") &&
+           has_text(ui->app_obj[3], "TG29 ESP_ERR_TIMEOUT") && has_text(ui->app_obj[5], "未插卡"));
     puts("PASS Device status actual LVGL: firmware, memory, battery, TE fallback, PMIC error, TF removal and scrolling");
 }
 
 static void test_barometer(app_ui_t *ui)
 {
     app_open_barometer(ui);
-    assert(interest == APP_TELEMETRY_BAROMETER && has_text(ui->app_obj[0], "996.00 hPa"));
+    lv_obj_t *content = ui->content;
+    assert(interest == APP_TELEMETRY_BAROMETER && find_label(content, "996.00") && find_label(content, "hPa"));
     click_named(ui->content, "相对高度归零");
     tick(700);
-    assert(has_text(ui->app_obj[1], "相对高度 +0.0 m"));
+    assert(find_label(content, "+0.0 m") && find_label(content, "相对高度已归零"));
     click_named(ui->content, "+1");
     tick(700);
-    assert(has_text(ui->app_obj[2], "1014.00 hPa") && has_text(ui->app_obj[3], "后台保存中"));
+    assert(find_label(content, "1014.00 hPa") && find_label(content, "正在保存参考气压"));
     samples.barometer.pressure_pa = NAN;
     tick(700);
-    assert(has_text(ui->app_obj[0], "采样数据异常") && has_text(ui->app_obj[1], "等待有效采样"));
+    assert(find_label(content, "采样异常") && find_label(content, "--"));
     samples.barometer_error = ESP_ERR_TIMEOUT;
     tick(700);
-    assert(has_text(ui->app_obj[0], "ESP_ERR_TIMEOUT"));
+    assert(find_label(content, "等待气压采样"));
     samples.barometer_error = ESP_OK;
     samples.barometer.pressure_pa = 100300;
     tick(700);
-    assert(has_text(ui->app_obj[0], "1003.00 hPa") && has_text(ui->app_obj[3], "996.00 / 最高 1003.00 hPa"));
+    lv_obj_t *range = lv_obj_get_parent(find_label(content, "海平面参考"));
+    assert(find_label(content, "1003.00") && find_label(range, "996.00") && find_label(range, "1003.00"));
     puts("PASS Barometer actual LVGL: zero, reference edit, persistence pending, invalid/timeout, recovery and extrema");
 }
 

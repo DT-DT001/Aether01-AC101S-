@@ -65,6 +65,11 @@ esp_err_t aether_board_set_display_brightness(aether_board_t *board,
 /** Put CST9220 into its command sleep state; normally kept awake for screen wake. */
 esp_err_t aether_board_set_touch_sleep(aether_board_t *board, bool sleeping);
 
+/** Before TG29 power-off, park the VSYS-powered display and amplifier and
+ * suspend touch. The caller must stop rendering and touch acquisition first.
+ * A failed power-off uses the existing display/touch wake functions. */
+esp_err_t aether_board_park_peripherals(aether_board_t *board);
+
 #ifdef __cplusplus
 }
 #endif

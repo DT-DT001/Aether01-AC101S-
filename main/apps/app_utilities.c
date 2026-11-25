@@ -411,7 +411,7 @@ void app_open_alarm(app_ui_t *ui)
 static lv_obj_t *s_alarm_popup;
 static lv_obj_t *s_alarm_popup_owner;
 static uint8_t s_alarm_popup_hour, s_alarm_popup_minute, s_alarm_popup_count;
-static bool s_alarm_popup_media;
+static bool s_alarm_popup_media, s_alarm_popup_countdown;
 
 static void alarm_popup_deleted(lv_event_t *event)
 {
@@ -423,7 +423,8 @@ static void alarm_popup_deleted(lv_event_t *event)
 
 static void alarm_popup_ack(lv_event_t *event)
 {
-    app_alarm_dismiss();
+    if (s_alarm_popup_count) app_alarm_dismiss();
+    if (s_alarm_popup_countdown) app_countdown_dismiss();
     lv_msgbox_close(lv_event_get_user_data(event));
 }
 
@@ -431,26 +432,32 @@ void app_utilities_alarm_ui(app_ui_t *ui)
 {
     app_alarm_snapshot_t alarm;
     app_alarm_get(&alarm);
-    if (s_alarm_popup && (!alarm.ringing || s_alarm_popup_owner != ui->screen ||
-                         s_alarm_popup_media != ui->media_active || s_alarm_popup_hour != alarm.hour ||
-                         s_alarm_popup_minute != alarm.minute || s_alarm_popup_count != alarm.ringing_count)) {
+    app_countdown_snapshot_t countdown;
+    app_countdown_get(&countdown);
+    const uint8_t ringing_count = alarm.ringing ? alarm.ringing_count : 0;
+    if (s_alarm_popup && (s_alarm_popup_owner != ui->screen || s_alarm_popup_media != ui->media_active ||
+                         s_alarm_popup_countdown != countdown.ringing || s_alarm_popup_count != ringing_count ||
+                         (alarm.ringing && (s_alarm_popup_hour != alarm.hour || s_alarm_popup_minute != alarm.minute)))) {
         if (s_alarm_popup_media) lv_obj_delete(s_alarm_popup);
         else lv_msgbox_close(s_alarm_popup);
     }
-    if (!alarm.ringing || s_alarm_popup || !ui->screen || app_ui_input_blocked(ui) ||
+    if ((!alarm.ringing && !countdown.ringing) || s_alarm_popup || !ui->screen || app_ui_input_blocked(ui) ||
         app_power_is_sleeping(ui->power)) return;
     s_alarm_popup_owner = ui->screen;
     s_alarm_popup_media = ui->media_active;
     s_alarm_popup_hour = alarm.hour;
     s_alarm_popup_minute = alarm.minute;
-    s_alarm_popup_count = alarm.ringing_count;
+    s_alarm_popup_count = ringing_count;
+    s_alarm_popup_countdown = countdown.ringing;
     if (ui->media_active) {
         /* Raw game input and the active audio stream keep their ownership.
          * A temporary visual alert stays above the media's LVGL image. */
-        char text[28];
-        snprintf(text, sizeof(text), LV_SYMBOL_BELL "  %02u:%02u", alarm.hour, alarm.minute);
+        char text[48];
+        if (alarm.ringing) snprintf(text, sizeof(text), LV_SYMBOL_BELL "  %02u:%02u%s", alarm.hour,
+                                    alarm.minute, countdown.ringing ? " · 倒计时结束" : "");
+        else snprintf(text, sizeof(text), LV_SYMBOL_BELL "  倒计时结束");
         s_alarm_popup = app_ui_add_text(ui->screen, text, LV_ALIGN_TOP_MID, 0, 12,
-                                         0xF8F2DE, &lv_font_montserrat_20);
+                                         0xF8F2DE, countdown.ringing ? app_ui_chinese_font() : &lv_font_montserrat_20);
         lv_obj_set_style_bg_color(s_alarm_popup, lv_color_hex(0x354058), 0);
         lv_obj_set_style_bg_opa(s_alarm_popup, LV_OPA_COVER, 0);
         lv_obj_set_style_pad_all(s_alarm_popup, 9, 0);
@@ -464,11 +471,14 @@ void app_utilities_alarm_ui(app_ui_t *ui)
     lv_obj_add_event_cb(popup, alarm_popup_deleted, LV_EVENT_DELETE, NULL);
     lv_obj_set_width(popup, 300);
     lv_obj_set_style_text_font(popup, app_ui_chinese_font(), 0);
-    lv_msgbox_add_title(popup, "闹钟");
-    char time[8];
-    snprintf(time, sizeof(time), "%02u:%02u", alarm.hour, alarm.minute);
-    lv_obj_t *body = lv_msgbox_add_text(popup, time);
-    lv_obj_set_style_text_font(body, &lv_font_montserrat_28, 0);
+    lv_msgbox_add_title(popup, alarm.ringing ? "闹钟" : "倒计时");
+    if (alarm.ringing) {
+        char time[8];
+        snprintf(time, sizeof(time), "%02u:%02u", alarm.hour, alarm.minute);
+        lv_obj_t *body = lv_msgbox_add_text(popup, time);
+        lv_obj_set_style_text_font(body, &lv_font_montserrat_28, 0);
+    }
+    if (countdown.ringing) lv_msgbox_add_text(popup, "倒计时结束");
     if (alarm.ringing_count > 1) {
         char concurrent[32];
         snprintf(concurrent, sizeof(concurrent), "%u 个闹钟同时响铃", alarm.ringing_count);

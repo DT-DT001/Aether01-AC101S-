@@ -7,7 +7,8 @@
 #include "esp_lcd_panel_ops.h"
 #include <string.h>
 
-static uint8_t source_a[32000],source_b[32000],source_snapshot[32000],expected[19200];
+static _Alignas(uint16_t) uint8_t source_a[32000],source_b[32000];
+static uint8_t source_snapshot[32000],expected[19200];
 static const uint8_t *dma_pixels;
 static size_t dma_bytes;
 static atomic_bool dma_live,submit_done;
@@ -57,6 +58,127 @@ static void assert_invalid(lv_display_t *d,const lv_area_t *a,uint8_t *source)
     assert(after.completed_regions==before.completed_regions&&after.completed_refreshes==before.completed_refreshes);
     assert(after.dropped_regions==before.dropped_regions+1&&after.staging_error==ESP_ERR_INVALID_ARG);
 }
+
+static void nes_timing_frame(lv_display_t *d, int64_t edge, int64_t first_done, int64_t last_done,
+                             bool interrupted)
+{
+    const lv_area_t viewport = {48, 96, 431, 143};
+    const lv_area_t top = {48, 96, 431, 119};
+    const lv_area_t bottom = {48, interrupted ? 122 : 120, 431, 143};
+    app_display_metrics_nes_arm(&viewport, edge, 16667, 480);
+    atomic_store(&test_clock_us, edge + 200);
+    d->last = false;
+    prepare(d, source_a, &top);
+    staged_submit(d, &top, source_a);
+    atomic_store(&test_clock_us, edge + first_done);
+    staged_complete();
+    d->last = true;
+    prepare(d, source_a, &bottom);
+    staged_submit(d, &bottom, source_a);
+    atomic_store(&test_clock_us, edge + last_done);
+    staged_complete();
+}
+
+static void test_nes_timing(lv_display_t *d)
+{
+    app_display_metrics_nes_reset();
+    nes_timing_frame(d, 1000000, 1000, 2000, false);
+    app_display_nes_metrics_t m = snapshot().nes;
+    assert(m.timed_frames == 1 && m.late_frames == 0);
+    assert(m.max_te_to_submit_us == 200 && m.max_te_to_done_us == 2000);
+    assert(m.min_scan_margin_us == 143 * 16667 / 480 - 2000);
+    nes_timing_frame(d, 2000000, 4300, 4400, false);
+    m = snapshot().nes;
+    assert(m.timed_frames == 2 && m.late_frames == 1);
+    assert(m.max_te_to_done_us == 4400 && m.min_scan_margin_us == 119 * 16667 / 480 - 4300);
+    nes_timing_frame(d, 3000000, 7000, 8000, true);
+    assert(snapshot().nes.timed_frames == 2); /* A disjoint redraw is not an NES frame. */
+    app_display_metrics_nes_reset();
+    assert(!snapshot().nes.timed_frames);
+    atomic_store(&test_clock_us, 0);
+    puts("PASS NES timing uses exact contiguous strips and real DMA completion; a late intermediate strip is detected");
+}
+
+static const uint8_t *direct_base;
+static esp_err_t direct_te(void *ctx)
+{
+    assert(direct_base && direct_base[0] == source_a[1] && direct_base[1] == source_a[0]);
+    return *(const esp_err_t *)ctx;
+}
+
+static esp_err_t direct_strip(void *ctx, const lv_area_t *first_window, const void *pixels, size_t bytes)
+{
+    (void)ctx;
+    static lv_area_t window;
+    static int32_t y;
+    if (first_window) {
+        window = *first_window;
+        y = window.y1;
+    }
+    const int32_t rows = (int32_t)(bytes / (2U * (window.x2 - window.x1 + 1)));
+    const esp_err_t error = stage_draw(staged_display, window.x1, y, window.x2+1, y+rows, pixels);
+    y += rows;
+    return error;
+}
+
+static unsigned next_half_verified;
+static void verify_while_dma_active(void)
+{
+    if (!dma_live) return;
+    assert(dma_bytes == 9216);
+    if (!next_half_verified) {
+        assert(dma_pixels == direct_base);
+        const uint8_t *next = direct_base + 9600;
+        for (size_t i=0; i<dma_bytes; i+=2) {
+            assert(next[i]==source_a[dma_bytes+i+1]&&next[i+1]==source_a[dma_bytes+i]);
+        }
+        assert(!memcmp(dma_pixels,expected,dma_bytes));
+    } else {
+        assert(dma_pixels == direct_base + 9600);
+    }
+    ++next_half_verified;
+    staged_complete();
+}
+
+static void test_direct_nes(lv_display_t *d)
+{
+    const lv_area_t strip = {48,96,431,119};
+    prepare(d,source_a,&strip);
+    esp_err_t te_error = ESP_ERR_TIMEOUT;
+    const unsigned ready_before = ready_calls;
+    app_display_metrics_t before = snapshot();
+    direct_base = dma_pixels;
+    assert(app_display_metrics_nes_write(d,&strip,(const uint16_t *)source_a,direct_te,direct_strip,&te_error)==ESP_ERR_TIMEOUT);
+    assert(snapshot().submitted_sequence==before.submitted_sequence&&!dma_live);
+    te_error = ESP_OK;
+    before_semaphore_take = verify_while_dma_active;
+    assert(app_display_metrics_nes_write(d,&strip,(const uint16_t *)source_a,direct_te,direct_strip,&te_error)==ESP_OK);
+    before_semaphore_take = NULL;
+    assert(next_half_verified==2);
+    app_display_metrics_t after = snapshot();
+    assert(after.nes.direct_frames==1&&after.completed_refreshes==before.completed_refreshes+1&&ready_calls==ready_before);
+
+    fail_draw = true;
+    assert(app_display_metrics_nes_write(d,&strip,(const uint16_t *)source_a,direct_te,direct_strip,&te_error)==ESP_FAIL);
+    fail_draw = false;
+    assert(snapshot().submitted_sequence==after.submitted_sequence&&!dma_live);
+
+    assert(app_display_metrics_nes_write(d,&strip,(const uint16_t *)source_a,direct_te,direct_strip,&te_error)==ESP_ERR_TIMEOUT);
+    const app_display_metrics_t blocked = snapshot();
+    assert(dma_live&&blocked.submitted_sequence==blocked.completed_sequence+1&&blocked.flush_stalled);
+    staged_submit(d,&strip,source_a);
+    assert(!d->flushing&&dma_live&&snapshot().submitted_sequence==blocked.submitted_sequence);
+    assert(ready_calls==ready_before+1);
+    d->flushing = true;
+    staged_complete();
+    assert(d->flushing&&ready_calls==ready_before+1); /* Readiness belongs to the current LVGL draw. */
+    d->flushing = false;
+    staged_submit(d,&strip,source_a);
+    staged_complete();
+    assert(snapshot().submitted_sequence==snapshot().completed_sequence&&ready_calls==ready_before+2);
+    puts("PASS NES pre-copies before TE and fills the idle half while DMA owns the other; timeout preserves mirror and LVGL ownership");
+}
+
 int main(void)
 {
     lv_display_t d={.flush_cb=stage_flush,.color_format=LV_COLOR_FORMAT_RGB565,.render_mode=LV_DISPLAY_RENDER_MODE_PARTIAL,.hres=480,.vres=480};
@@ -153,5 +275,7 @@ int main(void)
     assert(m.completed_regions==24&&m.completed_refreshes==1&&m.staging_error==ESP_OK&&m.dropped_regions);
     assert(m.staging_copied_bytes==19200ULL*29+1912&&test_heap_live==1);
     puts("PASS 24 full-width chunks preserve source bytes, count one real completed refresh and recover after dropped regions");
+    test_nes_timing(&d);
+    test_direct_nes(&d);
     return 0;
 }

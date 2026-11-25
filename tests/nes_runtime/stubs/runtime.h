@@ -27,7 +27,7 @@ typedef uint32_t TickType_t;
 void vTaskDelay(uint32_t ticks);
 void vTaskDelete(void *task);
 TickType_t xTaskGetTickCount(void);
-int xTaskCreate(void (*entry)(void *), const char *, unsigned, void *, unsigned, void *);
+int xTaskCreatePinnedToCore(void (*entry)(void *), const char *, unsigned, void *, unsigned, void *, int);
 typedef void *esp_timer_handle_t;
 typedef struct {
     void (*callback)(void *);

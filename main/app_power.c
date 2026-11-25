@@ -1,4 +1,5 @@
 #include "app_power.h"
+#include "app_service_task.h"
 #include "app_wake_input.h"
 #include "app_telemetry.h"
 
@@ -379,6 +380,8 @@ static void prepare_shutdown(app_power_t *manager)
         goto failed;
     }
     shutdown_stage(manager, APP_POWER_SHUTDOWN_POWER_OFF);
+    err = hook(context, APP_POWER_SHUTDOWN_POWER_OFF, shutdown_remaining(started));
+    if (err != ESP_OK) goto failed;
     err = tg29_request_power_off(manager->board->pmic);
     if (err != ESP_OK) goto failed;
     portENTER_CRITICAL(&s_settings_lock);
@@ -658,6 +661,10 @@ static void power_task(void *argument)
         uint32_t request_revision = manager->request_revision;
         bool (*persistence_busy)(void *) = manager->persistence_busy;
         void *persistence_context = manager->persistence_busy_context;
+#if CONFIG_PM_ENABLE
+        bool (*standby_audio_busy)(void *) = manager->standby_audio_busy;
+        void *standby_audio_context = manager->standby_audio_context;
+#endif
         portEXIT_CRITICAL(&s_settings_lock);
 
         /* Failed lock acquisition is not fresh touch activity. */
@@ -745,9 +752,13 @@ static void power_task(void *argument)
         }
 
 #if CONFIG_PM_ENABLE
-        if (manager->sleeping && manager->board->audio_ready)
+        /* I2S keeps APB available. Keep the decoder's CPU clock and the
+         * codec clocks available across startup, refills and track changes. */
+        const bool background_audio = manager->sleeping && standby_audio_busy &&
+            standby_audio_busy(standby_audio_context);
+        if (manager->sleeping && !background_audio && manager->board->audio_ready)
             (void)ac101s_audio_idle_clocks(manager->board->audio);
-        set_screen_clock(manager, !manager->sleeping);
+        set_screen_clock(manager, !manager->sleeping || background_audio);
 #endif
 
         /* Flash commit runs outside both the UI callbacks and LVGL lock. */
@@ -793,8 +804,8 @@ esp_err_t app_power_init(app_power_t *manager, aether_board_t *board,
     load_settings(manager);
     manager->applied_brightness = UINT8_MAX;
     TaskHandle_t task = NULL;
-    ESP_RETURN_ON_FALSE(xTaskCreate(power_task, "display_idle", 4096, manager, 4,
-                                    &task) == pdPASS,
+    ESP_RETURN_ON_FALSE(app_create_service_task(power_task, "display_idle", 4096, manager, 4,
+                                              &task) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "create power task");
     manager->task = task;
     esp_err_t key_irq = gpio_isr_handler_add(AETHER_GPIO_BOOT_KEY, user_key_interrupt, manager);
@@ -922,6 +933,16 @@ void app_power_set_persistence_guard(app_power_t *manager, bool (*busy)(void *),
     portENTER_CRITICAL(&s_settings_lock);
     manager->persistence_busy = busy;
     manager->persistence_busy_context = context;
+    portEXIT_CRITICAL(&s_settings_lock);
+    if (manager->task) xTaskNotifyGive((TaskHandle_t)manager->task);
+}
+
+void app_power_set_standby_audio_guard(app_power_t *manager, bool (*busy)(void *), void *context)
+{
+    if (!manager) return;
+    portENTER_CRITICAL(&s_settings_lock);
+    manager->standby_audio_busy = busy;
+    manager->standby_audio_context = context;
     portEXIT_CRITICAL(&s_settings_lock);
     if (manager->task) xTaskNotifyGive((TaskHandle_t)manager->task);
 }

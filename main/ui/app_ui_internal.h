@@ -98,6 +98,8 @@ void app_open_nes_path(app_ui_t *ui, const char *path);
 
 void app_open_status(app_ui_t *ui);
 void app_open_clock(app_ui_t *ui);
+void app_open_calculator(app_ui_t *ui);
+void app_open_theme(app_ui_t *ui);
 void app_open_notes(app_ui_t *ui);
 void app_open_calendar(app_ui_t *ui);
 void app_open_weather(app_ui_t *ui);

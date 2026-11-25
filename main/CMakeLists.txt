@@ -49,6 +49,8 @@ idf_component_register(
          "app_tools.c"
          "app_tools_math.c"
          "app_motion_filter.c"
+         "app_wallpaper_store.c"
+         "app_media_image.c"
          "ui/app_ui.c"
          "ui/app_ui_modal.c"
          "ui/app_ui_gyro_calibration.c"
@@ -60,6 +62,10 @@ idf_component_register(
          "ui/app_home.c"
          "ui/app_battery.c"
          "apps/app_system.c"
+         "apps/app_calculator.c"
+         "apps/app_calc_modes.c"
+         "apps/app_clock_tools.c"
+         "apps/app_theme.c"
          "apps/app_utilities.c"
          "apps/app_controls.c"
          "apps/app_sensors.c"
@@ -102,6 +108,8 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_IDF_TARGET_ESP32S31)
         apps/app_sensors.c apps/app_motion.c apps/app_displacement.c apps/app_gps.c
         apps/app_usb.c apps/app_bluetooth.c apps/app_pc_remote.c apps/app_wifi.c
         apps/app_recorder.c apps/app_intercom.c ui/app_home.c apps/app_files.c
+        app_wallpaper_store.c app_media_image.c apps/app_calculator.c apps/app_calc_modes.c
+        apps/app_clock_tools.c apps/app_theme.c
         APPEND PROPERTY COMPILE_OPTIONS -Os)
 endif()
 # Pull the project custom memory provider before the later LVGL archive is read.
@@ -136,6 +144,12 @@ if(AETHER_UI_SELFTEST AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     # Keep the diagnostic routes within the same factory slot as the release.
     set_property(SOURCE app_ui_selftest.c APPEND PROPERTY COMPILE_OPTIONS -Os)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_UI_SELFTEST=1)
+    if(DEFINED AETHER_UI_SELFTEST_ROUNDS)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_UI_SELFTEST_ROUNDS=${AETHER_UI_SELFTEST_ROUNDS})
+    endif()
+    if(AETHER_UI_SELFTEST_SILENT)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_UI_SELFTEST_SILENT=1)
+    endif()
 endif()
 if(AETHER_VIDEO_DIAGNOSTIC AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AETHER_VIDEO_DIAGNOSTIC=1)

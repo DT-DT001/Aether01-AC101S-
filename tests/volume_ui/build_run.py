@@ -24,10 +24,11 @@ ui=(root/'main/ui/app_ui.c').read_text(encoding='utf-8')
 shutdown=out/'shutdown.c'
 shutdown.write_text('#include "app_ui_internal.h"\n#include "app_ui_modal.h"\n'+
     ui[ui.index('static void shutdown_notice_close('):ui.index('static void service_timer(')]+
-    ui[ui.index('esp_err_t app_ui_quiesce_storage_begin('):ui.index('esp_err_t app_ui_start(')]+
+    ui[ui.index('esp_err_t app_ui_quiesce_storage_begin('):ui.index('void app_ui_screen_suspend(')]+
     '\nvoid test_ui_shutdown_service(app_ui_t *ui) { app_ui_shutdown_service(ui); }\n', encoding='utf-8')
 chrome=out/'page_chrome.c'
 chrome.write_text('#include "app_ui_internal.h"\n#include "app_battery.h"\n#include "app_screen.h"\n'
+    '#define app_theme_background(color) (color)\n'
     'lv_obj_t *app_ui_new_screen(app_ui_t *ui);\n'
     'void app_ui_set_user_key_exit(app_ui_t *ui, bool enabled);\n'
     'void app_ui_show_drawer(app_ui_t *ui);\n'+

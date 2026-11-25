@@ -18,6 +18,8 @@ typedef struct {
     bool sleeping;
 } motion_page_t;
 typedef struct {float x,y,z;} vector_t;
+/* The relative zero belongs to this power session, not a single screen. */
+static float zero_reference[4] = {1.0f};
 static uint32_t action_color(app_motion_action_t a) {
     if(a==APP_MOTION_IMPACT || a==APP_MOTION_FREEFALL) return 0xFF9791;
     if(a==APP_MOTION_SHAKING || a==APP_MOTION_TURNING) return 0xF4CB87;
@@ -125,10 +127,28 @@ static void update_labels(motion_page_t *page) {
     app_ui_label_fmt(page->acceleration, "%.1f m/s^2", page->filter.linear);
     app_ui_label_fmt(page->rotation, "%.0f°/s", page->filter.rotation);
 }
-static void motion_zero(lv_event_t *e) {
-    app_ui_t *ui=lv_event_get_user_data(e);motion_page_t *page=ui->page_context;
-    if(!page || !page->filter.initialized) return;
-    app_motion_filter_zero(&page->filter);update_labels(page);lv_obj_invalidate(page->model);
+static bool fresh_imu(const app_telemetry_snapshot_t *sample)
+{
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    return sample->imu_error == ESP_OK && !sample->gyro_calibrating && sample->imu_updated_ms &&
+           now - sample->imu_updated_ms <= 250;
+}
+
+static void motion_zero(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    motion_page_t *page = ui->page_context;
+    if (!page || !page->filter.initialized || app_power_is_sleeping(ui->power)) return;
+    app_telemetry_snapshot_t sample;
+    app_telemetry_get(&sample);
+    if (!fresh_imu(&sample) || !app_motion_level_reference(sample.imu.accel_mps2, zero_reference)) {
+        motion_state(page, "将设备放稳", INSTRUMENT_MUTED);
+        return;
+    }
+    memcpy(page->filter.q, zero_reference, sizeof(zero_reference));
+    app_motion_filter_zero(&page->filter);
+    update_labels(page);
+    lv_obj_invalidate(page->model);
 }
 static void motion_calibrate(lv_event_t *event)
 {
@@ -178,11 +198,138 @@ static void motion_tick(lv_timer_t *timer) {
 static lv_obj_t *text(lv_obj_t *parent,const char *value,int x,int y,uint32_t color,unsigned px) {
     return app_ui_add_text(parent,value,LV_ALIGN_TOP_LEFT,x,y,color,app_ui_chinese_font_size(px));
 }
+typedef struct {
+    lv_obj_t *bubble, *state, *roll_value, *pitch_value;
+    uint32_t stamp;
+    float roll, pitch;
+    bool ready, sleeping, level;
+} level_page_t;
+
+static void level_cleanup(app_ui_t *ui)
+{
+    free(ui->page_context);
+    ui->page_context = NULL;
+}
+
+static void level_wait(level_page_t *page)
+{
+    if (!page->ready) return;
+    page->ready = false;
+    lv_obj_add_flag(page->bubble, LV_OBJ_FLAG_HIDDEN);
+    app_ui_label_text(page->state, "将设备放稳");
+    app_ui_label_text(page->roll_value, "--");
+    app_ui_label_text(page->pitch_value, "--");
+}
+
+static void level_tick(lv_timer_t *timer)
+{
+    app_ui_t *ui = lv_timer_get_user_data(timer);
+    level_page_t *page = ui->page_context;
+    if (app_power_is_sleeping(ui->power)) {
+        if (!page->sleeping) app_telemetry_set_interest(0);
+        page->sleeping = true;
+        level_wait(page);
+        return;
+    }
+    if (page->sleeping) {
+        page->sleeping = false;
+        app_telemetry_set_interest(APP_TELEMETRY_IMU);
+    }
+    app_telemetry_snapshot_t sample;
+    app_telemetry_get(&sample);
+    const float *gyro = sample.imu.gyro_dps;
+    const float rotation_squared = gyro[0] * gyro[0] + gyro[1] * gyro[1] + gyro[2] * gyro[2];
+    float roll, pitch;
+    if (!fresh_imu(&sample) || !isfinite(rotation_squared) ||
+        (!sample.imu.gyro_stationary && rotation_squared > 45.0f * 45.0f) ||
+        !app_motion_level_angles(sample.imu.accel_mps2, zero_reference, &roll, &pitch)) {
+        level_wait(page);
+        return;
+    }
+    if (page->ready && sample.imu_updated_ms == page->stamp) return;
+    const bool was_ready = page->ready;
+    const float blend = was_ready ? .32f : 1.0f;
+    page->stamp = sample.imu_updated_ms;
+    page->ready = true;
+    page->roll += blend * (roll - page->roll);
+    page->pitch += blend * (pitch - page->pitch);
+    const float angle = hypotf(page->roll, page->pitch);
+    const float scale = 82.0f / fmaxf(12.0f, angle);
+    if (!was_ready) lv_obj_remove_flag(page->bubble, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(page->bubble, LV_ALIGN_CENTER, (int)lroundf(page->pitch * scale),
+                 (int)lroundf(-page->roll * scale));
+    const bool level = angle <= (page->level && was_ready ? .6f : .45f);
+    if (!was_ready || page->level != level) {
+        page->level = level;
+        lv_obj_set_style_bg_color(page->bubble, lv_color_hex(level ? INSTRUMENT_TEAL : INSTRUMENT_BLUE), 0);
+        app_ui_label_text(page->state, level ? "已水平" : "倾斜");
+    }
+    app_ui_label_fmt(page->roll_value, "%+.1f°", page->roll);
+    app_ui_label_fmt(page->pitch_value, "%+.1f°", page->pitch);
+}
+
+static void open_level(lv_event_t *event)
+{
+    app_ui_t *ui = lv_event_get_user_data(event);
+    lv_obj_t *content = app_ui_begin_page(ui, "水平仪");
+    ui->page_back = app_open_motion;
+    level_page_t *page = calloc(1, sizeof(*page));
+    if (!page) {
+        text(content, "内存不足", 0, 0, 0xFF9791, 16);
+        return;
+    }
+    ui->page_context = page;
+    ui->page_cleanup = level_cleanup;
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *card = instrument_card(content, 0, 0, 408, 272);
+    lv_obj_t *dial = lv_obj_create(card);
+    lv_obj_remove_style_all(dial);
+    lv_obj_remove_flag(dial, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(dial, 210, 210);
+    lv_obj_align(dial, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_set_style_radius(dial, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(dial, 2, 0);
+    lv_obj_set_style_border_color(dial, lv_color_hex(INSTRUMENT_MUTED), 0);
+    for (unsigned i = 0; i < 3; ++i) {
+        lv_obj_t *mark = lv_obj_create(dial);
+        lv_obj_remove_style_all(mark);
+        lv_obj_remove_flag(mark, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(mark, i == 0 ? 166 : i == 1 ? 2 : 48, i == 0 ? 2 : i == 1 ? 166 : 48);
+        lv_obj_center(mark);
+        if (i == 2) {
+            lv_obj_set_style_radius(mark, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_border_width(mark, 2, 0);
+            lv_obj_set_style_border_color(mark, lv_color_hex(INSTRUMENT_TEAL), 0);
+        } else {
+            lv_obj_set_style_bg_color(mark, lv_color_hex(0x334965), 0);
+            lv_obj_set_style_bg_opa(mark, LV_OPA_COVER, 0);
+        }
+    }
+    page->bubble = lv_obj_create(dial);
+    lv_obj_remove_style_all(page->bubble);
+    lv_obj_remove_flag(page->bubble, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(page->bubble, 32, 32);
+    lv_obj_set_style_radius(page->bubble, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(page->bubble, LV_OPA_COVER, 0);
+    lv_obj_add_flag(page->bubble, LV_OBJ_FLAG_HIDDEN);
+    page->state = app_ui_add_text(card, "将设备放稳", LV_ALIGN_BOTTOM_MID, 0, -15,
+                                  INSTRUMENT_TEAL, app_ui_chinese_font_size(20));
+    lv_obj_t *axes = instrument_card(content, 0, 282, 408, 70);
+    instrument_text(axes, "横滚", 16, 8, 160, INSTRUMENT_MUTED, app_ui_chinese_font());
+    instrument_text(axes, "俯仰", 220, 8, 160, INSTRUMENT_MUTED, app_ui_chinese_font());
+    page->roll_value = instrument_text(axes, "--", 16, 29, 180, INSTRUMENT_TEXT, &lv_font_montserrat_28);
+    page->pitch_value = instrument_text(axes, "--", 220, 29, 180, INSTRUMENT_TEXT, &lv_font_montserrat_28);
+    app_telemetry_set_interest(APP_TELEMETRY_IMU);
+    app_ui_set_timer(ui, level_tick, 50);
+    level_tick(ui->timer);
+}
+
 void app_open_motion(app_ui_t *ui) {
-    lv_obj_t *content=app_ui_begin_page(ui,"运动与姿态");
+    lv_obj_t *content=app_ui_begin_page(ui,"姿态");
     motion_page_t *page=calloc(1,sizeof(*page));
     if(!page) {text(content,"内存不足",0,0,0xFF9791,16);return;}
     ui->page_context=page;ui->page_cleanup=motion_cleanup;app_motion_filter_init(&page->filter);
+    memcpy(page->filter.reference, zero_reference, sizeof(zero_reference));
     app_telemetry_set_interest(APP_TELEMETRY_IMU);
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     const lv_font_t *small = app_ui_chinese_font();
@@ -207,15 +354,21 @@ void app_open_motion(app_ui_t *ui) {
         instrument_text(axis, labels[i], 14, 9, 102, INSTRUMENT_MUTED, small);
         page->values[i] = instrument_text(axis, "--", 14, 33, 106, INSTRUMENT_BLUE, &lv_font_montserrat_28);
     }
-    lv_obj_t *zero=lv_button_create(content);lv_obj_set_pos(zero,0,276);lv_obj_set_size(zero,198,46);
+    lv_obj_t *zero=lv_button_create(content);lv_obj_set_pos(zero,0,276);lv_obj_set_size(zero,132,46);
     instrument_button_style(zero, INSTRUMENT_SECONDARY);
     lv_obj_add_event_cb(zero,motion_zero,LV_EVENT_CLICKED,ui);
     app_ui_add_text(zero,"姿态归零",LV_ALIGN_CENTER,0,0,0xFFFFFF,app_ui_chinese_font());
     lv_obj_t *calibrate=lv_button_create(content);
-    lv_obj_set_pos(calibrate,210,276);lv_obj_set_size(calibrate,198,46);
+    lv_obj_set_pos(calibrate,138,276);lv_obj_set_size(calibrate,132,46);
     instrument_button_style(calibrate, INSTRUMENT_PRIMARY);
     lv_obj_add_event_cb(calibrate,motion_calibrate,LV_EVENT_CLICKED,ui);
     app_ui_add_text(calibrate,"漂移校准",LV_ALIGN_CENTER,0,0,0xFFFFFF,app_ui_chinese_font());
+    lv_obj_t *level = lv_button_create(content);
+    lv_obj_set_pos(level, 276, 276);
+    lv_obj_set_size(level, 132, 46);
+    instrument_button_style(level, INSTRUMENT_SECONDARY);
+    lv_obj_add_event_cb(level, open_level, LV_EVENT_CLICKED, ui);
+    app_ui_add_text(level, "水平仪", LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, small);
     text(content,"相对航向可能随时间漂移",8,333,INSTRUMENT_MUTED,16);
     app_ui_set_timer(ui,motion_tick,20);motion_tick(ui->timer);
 }
