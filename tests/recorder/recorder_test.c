@@ -12,6 +12,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "esp_nsn_iface.h"
+#include "esp_partition.h"
+#include "model_path.h"
+
 static void *test_calloc(size_t,size_t);
 static size_t test_fwrite(const void *,size_t,size_t,FILE *);
 static int test_fflush(FILE *),test_fsync(int),test_fclose(FILE *),test_ftruncate(int,off_t);
@@ -37,6 +41,98 @@ static atomic_uint reads,starts,stops,leases,sync_calls,allocation_index,fail_al
 static atomic_bool partial_write;
 static atomic_llong clock_offset;
 
+struct srmodel_list_t { unsigned allocated; };
+struct esp_nsn_data_t { unsigned frames; };
+static uint8_t model_bytes[256];
+static const esp_partition_t model_partition = {sizeof(model_bytes)};
+static struct srmodel_list_t model_list;
+static struct esp_nsn_data_t model_instance;
+static atomic_bool model_present, model_read_failed, model_active, model_failed, model_init_failed;
+static atomic_uint model_processes, model_destroys, model_loads;
+
+const esp_partition_t *esp_partition_find_first(int type, int subtype, const char *name)
+{
+    assert(type == ESP_PARTITION_TYPE_DATA && subtype == ESP_PARTITION_SUBTYPE_ANY && !strcmp(name, "model"));
+    return model_present ? &model_partition : NULL;
+}
+
+esp_err_t esp_partition_read(const esp_partition_t *part, size_t offset, void *out, size_t size)
+{
+    assert(part == &model_partition && !offset && size == sizeof(model_bytes) && out != model_bytes);
+    if (model_read_failed) return ESP_FAIL;
+    memcpy(out, model_bytes, size);
+    return ESP_OK;
+}
+
+srmodel_list_t *srmodel_load(const void *bundle)
+{
+    assert(bundle != model_bytes && !memcmp(bundle, model_bytes, sizeof(model_bytes)) && !model_list.allocated);
+    model_list.allocated = 1;
+    ++model_loads;
+    return &model_list;
+}
+
+srmodel_list_t *get_static_srmodels(void)
+{
+    return model_list.allocated ? &model_list : NULL;
+}
+
+char *esp_srmodel_filter(srmodel_list_t *list, const char *keyword, const char *other)
+{
+    static char name[] = "nsnet3";
+    assert(list == &model_list && !strcmp(keyword, name) && !other);
+    return name;
+}
+
+void esp_srmodel_deinit(srmodel_list_t *list)
+{
+    assert(list == &model_list && list->allocated && !model_active);
+    list->allocated = 0;
+}
+
+static esp_nsn_data_t *model_create(char *name)
+{
+    assert(!strcmp(name, "nsnet3") && model_list.allocated);
+    if (model_init_failed) return NULL;
+    assert(!atomic_exchange(&model_active, true));
+    model_instance.frames = 0;
+    return &model_instance;
+}
+
+static int model_rate(esp_nsn_data_t *model)
+{
+    assert(model == &model_instance);
+    return AETHER_DENOISE_RATE;
+}
+
+static int model_chunk(esp_nsn_data_t *model)
+{
+    assert(model == &model_instance);
+    return AETHER_DENOISE_SAMPLES;
+}
+
+static int model_process(esp_nsn_data_t *model, int16_t *input, int16_t *output)
+{
+    assert(model == &model_instance && model_active);
+    if (model_failed) return -1;
+    unsigned first = model->frames++ ? 0 : 16;
+    for (unsigned i = first; i < AETHER_DENOISE_SAMPLES; ++i) assert(abs(input[i] - 6000) <= 1);
+    for (unsigned i = 0; i < AETHER_DENOISE_SAMPLES; ++i) output[i] = 1000;
+    ++model_processes;
+    return 0;
+}
+
+static void model_destroy(esp_nsn_data_t *model)
+{
+    assert(model == &model_instance && atomic_exchange(&model_active, false));
+    ++model_destroys;
+}
+
+const esp_nsn_iface_t esp_nsnet3 = {
+    .create = model_create, .get_samp_rate = model_rate, .get_samp_chunksize = model_chunk,
+    .process = model_process, .destroy = model_destroy,
+};
+
 void vTaskDelay(TickType_t ms){struct timespec t={ms/1000,(long)(ms%1000)*1000000};nanosleep(&t,NULL);}
 TickType_t xTaskGetTickCount(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (TickType_t)(t.tv_sec*1000ULL+t.tv_nsec/1000000);}
 int64_t esp_timer_get_time(void){return (int64_t)xTaskGetTickCount()*1000+atomic_load(&clock_offset);}
@@ -45,12 +141,18 @@ void vTaskDelete(TaskHandle_t unused){(void)unused;pthread_exit(NULL);}
 static void *run_task(void *argument){struct test_task *t=argument;t->run(t->argument);return NULL;}
 BaseType_t xTaskCreate(void(*fn)(void*),const char *name,uint32_t stack,void *ctx,int priority,TaskHandle_t *out)
 {
-    assert(stack==4096);
+    assert(stack==4096 || stack==6144);
     bool collector=!strcmp(name,"rec_capture");assert(priority==(collector?5:3));
     if(atomic_exchange(collector?&fail_collector:&fail_writer,false))return pdFALSE;
     struct test_task *t=calloc(1,sizeof(*t));assert(t&&task_count<128);t->run=fn;t->argument=ctx;tasks[task_count++]=t;
     if(out)*out=t;
     assert(!pthread_create(&t->thread,NULL,run_task,t));return pdPASS;
+}
+BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t stack, void *ctx,
+                                  int priority, TaskHandle_t *out, int core)
+{
+    assert(stack == 6144 && core == 1);
+    return xTaskCreate(fn, name, stack, ctx, priority, out);
 }
 SemaphoreHandle_t xSemaphoreCreateMutex(void){pthread_mutex_t *m=malloc(sizeof(*m));assert(m&&!pthread_mutex_init(m,NULL));return m;}
 BaseType_t xSemaphoreTake(SemaphoreHandle_t m,TickType_t ms)
@@ -65,6 +167,11 @@ BaseType_t xSemaphoreGive(SemaphoreHandle_t m){assert(!pthread_mutex_unlock(m));
 void vSemaphoreDelete(SemaphoreHandle_t m){assert(!pthread_mutex_destroy(m));free(m);}
 static void *test_calloc(size_t n,size_t size){if(atomic_exchange(&fail_calloc,false))return NULL;return calloc(n,size);}
 void *heap_caps_malloc(size_t bytes,int caps){assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));unsigned n=++allocation_index;return n==fail_allocation?NULL:malloc(bytes);}
+void *heap_caps_calloc(size_t count, size_t size, int caps)
+{
+    assert(caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    return calloc(count, size);
+}
 esp_err_t aether_storage_acquire(aether_storage_handle_t s,uint32_t timeout){assert(s==(void*)2&&timeout==0);if(!inserted)return ESP_ERR_INVALID_STATE;++leases;return ESP_OK;}
 void aether_storage_release(aether_storage_handle_t s){assert(s==(void*)2&&leases==1);--leases;}
 bool aether_storage_card_inserted(aether_storage_handle_t s){assert(s==(void*)2);return inserted;}
@@ -72,11 +179,15 @@ esp_err_t ac101s_audio_capture_start(ac101s_audio_handle_t a,float gain)
 {assert(a==(void*)1&&gain==24&&!atomic_exchange(&codec_on,true));++starts;return atomic_exchange(&fail_start,false)?ESP_FAIL:ESP_OK;}
 esp_err_t ac101s_audio_capture_read(ac101s_audio_handle_t a,void *out,size_t bytes)
 {
-    assert(a==(void*)1&&codec_on&&bytes==4096);unsigned n=++reads;
+    assert(a==(void*)1&&codec_on&&bytes==(model_active?3072:4096));unsigned n=++reads;
     if(hold_read){read_entered=true;while(hold_read)vTaskDelay(1);}
     vTaskDelay(2);
     int16_t *pcm=out;const int16_t pattern[]={-32768,1234,0,32767};
-    for(unsigned i=0;i<bytes/4;++i){pcm[i*2]=pattern[i%4];const int16_t right[]={-32768,-2222,32767,32767};pcm[i*2+1]=right[i%4];}
+    for(unsigned i=0;i<bytes/4;++i){
+        pcm[i*2]=model_active?8000:pattern[i%4];
+        const int16_t right[]={-32768,-2222,32767,32767};
+        pcm[i*2+1]=model_active?4000:right[i%4];
+    }
     return fail_read_at&&n>=fail_read_at?ESP_FAIL:ESP_OK;
 }
 esp_err_t ac101s_audio_capture_stop(ac101s_audio_handle_t a)
@@ -104,12 +215,15 @@ static void verify_wav(aether_recorder_status_t s)
 {
     FILE *f=fopen(s.path,"rb");assert(f);uint8_t header[44];assert(fread(header,1,44,f)==44);
     assert(!memcmp(header,"RIFF",4)&&!memcmp(header+8,"WAVEfmt ",8)&&!memcmp(header+36,"data",4));
-    assert(get32(header+4)==s.data_bytes+36&&get32(header+24)==48000&&get32(header+28)==96000&&get32(header+40)==s.data_bytes);
+    const bool enhanced = s.mode == AETHER_RECORDER_VOICE_DENOISE;
+    const uint32_t sample_rate = enhanced ? 16000U : 48000U;
+    assert(get32(header+4)==s.data_bytes+36&&get32(header+24)==sample_rate&&
+           get32(header+28)==2*sample_rate&&get32(header+40)==s.data_bytes);
     assert(header[20]==1&&header[22]==1&&header[32]==2&&header[34]==16&&!(s.data_bytes&1));
     assert(!fseek(f,0,SEEK_END)&&(uint64_t)ftell(f)==44+s.data_bytes);rewind(f);fseek(f,44,SEEK_SET);
     const int16_t pattern[]={-32768,-494,16383,32767};
-    for(uint64_t i=0;i<s.data_bytes/2;++i){int lo=fgetc(f),hi=fgetc(f);assert(lo>=0&&hi>=0);assert((int16_t)(lo|(hi<<8))==pattern[i%4]);}
-    fclose(f);assert(s.duration_ms==s.data_bytes*1000/96000);
+    for(uint64_t i=0;i<s.data_bytes/2;++i){int lo=fgetc(f),hi=fgetc(f);assert(lo>=0&&hi>=0);assert((int16_t)(lo|(hi<<8))==(enhanced?1000:pattern[i%4]));}
+    fclose(f);assert(s.duration_ms==s.data_bytes*1000/(2*sample_rate));
 }
 static void wait_data(aether_recorder_handle_t h)
 {for(unsigned i=0;i<2000&&snapshot(h).data_bytes<8192;++i)vTaskDelay(1);assert(snapshot(h).data_bytes>=8192);}
@@ -188,6 +302,19 @@ static void test_failures(aether_recorder_handle_t h)
 }
 static void test_storage_faults(aether_recorder_handle_t h)
 {
+    hold_write = true;
+    write_entered = false;
+    assert(aether_recorder_start(h) == ESP_OK);
+    wait_flag(&write_entered);
+    const unsigned stalled_at = reads;
+    for (unsigned i = 0; i < 3000 && reads - stalled_at < 48; ++i) vTaskDelay(1);
+    assert(reads - stalled_at >= 48 && snapshot(h).last_error == ESP_OK);
+    hold_write = false;
+    wait_data(h);
+    assert(aether_recorder_stop_wait(h, 3000) == ESP_OK);
+    assert_released(h);
+    verify_wav(snapshot(h));
+
     hold_write=true;write_entered=false;assert(aether_recorder_start(h)==ESP_OK);wait_flag(&write_entered);
     for(unsigned i=0;i<3000&&snapshot(h).last_error==ESP_OK;++i)vTaskDelay(1);
     assert(snapshot(h).last_error==ESP_ERR_NO_MEM&&snapshot(h).active&&leases==1);
@@ -198,8 +325,91 @@ static void test_storage_faults(aether_recorder_handle_t h)
     atomic_bool *faults[]={&fail_flush,&fail_sync,&fail_close,&fail_truncate};
     for(unsigned i=0;i<4;++i){assert(aether_recorder_start(h)==ESP_OK);wait_state(h,AETHER_RECORDER_RECORDING);wait_data(h);atomic_store(faults[i],true);
         assert(aether_recorder_stop_wait(h,3000)==ESP_OK);assert_released(h);assert(snapshot(h).last_error==ESP_FAIL);if(i!=3)verify_wav(snapshot(h));}
-    puts("PASS bounded queue overflow explicitly errors; odd partial ENOSPC truncates to valid PCM; flush/fsync/fclose/ftruncate failures are surfaced");
+    puts("PASS transient TF stalls recover, bounded overflow explicitly errors, and I/O failures preserve recoverable PCM");
 }
+
+static void test_denoise(aether_recorder_handle_t h)
+{
+    assert(!aether_recorder_denoise_supported());
+    for (unsigned i = 0; i < 3; ++i) {
+        model_present = i != 0;
+        model_read_failed = i == 2;
+        memset(model_bytes, 0xff, sizeof(model_bytes));
+        assert(aether_recorder_start_mode(h, AETHER_RECORDER_VOICE_DENOISE) == ESP_OK);
+        wait_state(h, AETHER_RECORDER_RECORDING);
+        wait_data(h);
+        assert(snapshot(h).denoise_fallback && snapshot(h).mode == AETHER_RECORDER_ORIGINAL);
+        assert(aether_recorder_stop_wait(h, 3000) == ESP_OK);
+        verify_wav(snapshot(h));
+        assert(!model_loads && !model_list.allocated);
+    }
+    model_read_failed = false;
+
+    /* Real vendor pack header layout, with a stand-in deterministic model. */
+    memset(model_bytes, 0, sizeof(model_bytes));
+    put32(model_bytes, 1);
+    memcpy(model_bytes + 4, "nsnet3", 7);
+    put32(model_bytes + 36, 3);
+    const char *names[] = {"nsnet3_data", "nsnet3_index", "_MODEL_INFO_"};
+    for (unsigned i = 0; i < 3; ++i) {
+        uint8_t *entry = model_bytes + 40 + i * 40;
+        memcpy(entry, names[i], strlen(names[i]) + 1);
+        put32(entry + 32, 160 + i);
+        put32(entry + 36, 1);
+    }
+
+    for (unsigned i = 0; i < 2; ++i) {
+        put32(model_bytes + 72, i == 0 ? UINT32_MAX : 160);
+        model_init_failed = i != 0;
+        assert(aether_recorder_start_mode(h, AETHER_RECORDER_VOICE_DENOISE) == ESP_OK);
+        wait_data(h);
+        assert(snapshot(h).denoise_fallback && snapshot(h).mode == AETHER_RECORDER_ORIGINAL);
+        assert(aether_recorder_stop_wait(h, 3000) == ESP_OK);
+        verify_wav(snapshot(h));
+        assert(model_loads == i && !model_list.allocated);
+    }
+    model_init_failed = false;
+
+    for (unsigned i = 0; i < 2; ++i) {
+        assert(aether_recorder_denoise_supported());
+        assert(aether_recorder_start_mode(h, AETHER_RECORDER_VOICE_DENOISE) == ESP_OK);
+        wait_state(h, AETHER_RECORDER_RECORDING);
+        wait_data(h);
+        const aether_recorder_status_t before = snapshot(h);
+        assert(before.mode == AETHER_RECORDER_VOICE_DENOISE && !before.denoise_fallback &&
+               before.peak == 1000 && before.duration_ms == before.data_bytes * 1000 / 32000);
+        if (i == 0) {
+            assert(aether_recorder_set_paused(h, true) == ESP_OK);
+            wait_state(h, AETHER_RECORDER_PAUSED);
+            const unsigned processes = model_processes;
+            vTaskDelay(20);
+            assert(model_processes == processes && model_active);
+            assert(aether_recorder_set_paused(h, false) == ESP_OK);
+            wait_state(h, AETHER_RECORDER_RECORDING);
+            aether_recorder_set_screen_paused(h, true);
+            wait_state(h, AETHER_RECORDER_PAUSED);
+            for (unsigned wait = 0; wait < 250 && codec_on; ++wait) vTaskDelay(1);
+            assert(!codec_on);
+            aether_recorder_set_screen_paused(h, false);
+            wait_state(h, AETHER_RECORDER_RECORDING);
+            assert(aether_recorder_stop_wait(h, 3000) == ESP_OK);
+        } else {
+            model_failed = true;
+            wait_state(h, AETHER_RECORDER_ERROR);
+            model_failed = false;
+        }
+        verify_wav(snapshot(h));
+        assert_released(h);
+        assert(!model_active && !model_list.allocated && model_destroys == i + 1);
+    }
+    assert(aether_recorder_start(h) == ESP_OK);
+    wait_data(h);
+    assert(aether_recorder_stop_wait(h, 3000) == ESP_OK);
+    verify_wav(snapshot(h));
+    assert(model_loads == 3 && !snapshot(h).denoise_fallback);
+    puts("PASS unavailable NSNet3 fallback, 48/16 kHz WAV metadata, FIR input, manual/screen pause, recovery and teardown");
+}
+
 int main(void)
 {
     assert(!mkdir(AETHER_STORAGE_MOUNT_POINT,0777)||errno==EEXIST);
@@ -208,6 +418,7 @@ int main(void)
     aether_recorder_handle_t duplicate=(void*)3;assert(aether_recorder_new((void*)1,(void*)2,&duplicate)==ESP_ERR_INVALID_STATE&&!duplicate);
     assert(MAX_DATA_BYTES%2==0&&MAX_DATA_BYTES+44<=INT32_MAX&&MAX_DATA_BYTES+36<=UINT32_MAX);
     assert(aether_recorder_stop_wait(h,0)==ESP_OK);test_recording(h);test_screen_pause(h);test_failures(h);test_storage_faults(h);
+    test_denoise(h);
     assert(aether_recorder_del(h)==ESP_OK&&!aether_recorder_get_default());
     for(unsigned i=0;i<task_count;++i){assert(!pthread_join(tasks[i]->thread,NULL));free(tasks[i]);}
     puts("All production recorder host regressions passed.");return 0;

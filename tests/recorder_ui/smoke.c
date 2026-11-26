@@ -16,6 +16,8 @@ static unsigned start_calls, pause_calls, stop_calls, gate_invalidations, route;
 static char opened[192];
 static app_io_request_t request;
 static aether_recorder_status_t status;
+static aether_recorder_mode_t requested_mode;
+static bool denoise_supported = true;
 static esp_err_t start_error, pause_error, stop_error;
 static aether_recorder_handle_t recorder=(void*)1;
 static app_audio_system_snapshot_t audio={.ready=true};
@@ -29,9 +31,11 @@ bool app_io_usb_storage_blocked(app_io_handle_t io) { (void)io; return usb_block
 aether_recorder_handle_t aether_recorder_get_default(void) { return recorder; }
 esp_err_t aether_recorder_get_status(aether_recorder_handle_t h, aether_recorder_status_t *s)
 { assert(h==recorder&&s); *s=status; return ESP_OK; }
-esp_err_t aether_recorder_start(aether_recorder_handle_t h)
+bool aether_recorder_denoise_supported(void) { return denoise_supported; }
+esp_err_t aether_recorder_start_mode(aether_recorder_handle_t h, aether_recorder_mode_t mode)
 {
     assert(h==recorder); ++start_calls;
+    requested_mode = mode;
     if(start_error)return start_error;
     status=(aether_recorder_status_t){.state=AETHER_RECORDER_STARTING,.active=true};
     snprintf(status.path,sizeof(status.path),"/sdcard/Recordings/REC0001.wav");return ESP_OK;
@@ -176,6 +180,7 @@ int main(int argc,char **argv)
     deliver(&ui,ESP_ERR_TIMEOUT);advance(110);assert(find(ui.screen,"ESP_ERR_TIMEOUT"));
     assert(!gate_blocked&&!lv_obj_has_state(start,LV_STATE_DISABLED));
     tap(start);deliver(&ui,ESP_OK);assert(start_calls==1&&status.state==AETHER_RECORDER_STARTING&&gate_blocked);
+    assert(requested_mode == AETHER_RECORDER_ORIGINAL);
     status.state=AETHER_RECORDER_RECORDING;status.duration_ms=121300;status.data_bytes=12000000;
     static const uint16_t peaks[] = {
         1400, 4800, 9200, 12900, 8300, 5100, 2500, 3800, 12400, 21100, 27000, 19600,
@@ -231,6 +236,37 @@ int main(int argc,char **argv)
     status.state=AETHER_RECORDER_ERROR;status.last_error=ESP_FAIL;
     snprintf(status.detail,sizeof(status.detail),"TF 卡写入过慢，请换高速卡后重试");
     app_open_recorder(&ui);advance(120);assert(find(ui.screen,"TF 卡写入过慢"));capture(d,argv[1],"recorder-error");
+
+    start_error = ESP_OK;
+    status = (aether_recorder_status_t){0};
+    app_open_recorder(&ui);
+    advance(120);
+    lv_obj_t *denoise = control(&ui, "AI降噪关");
+    assert(!lv_obj_has_state(denoise, LV_STATE_DISABLED));
+    tap(denoise);
+    assert(find(ui.screen, "AI降噪开") && lv_obj_has_state(denoise, LV_STATE_CHECKED));
+    tap(control(&ui, "开始录音"));
+    assert(lv_obj_has_state(denoise, LV_STATE_DISABLED));
+    deliver(&ui, ESP_OK);
+    assert(requested_mode == AETHER_RECORDER_VOICE_DENOISE);
+    status.state = AETHER_RECORDER_RECORDING;
+    status.mode = AETHER_RECORDER_VOICE_DENOISE;
+    advance(120);
+    assert(find(ui.screen, "AI降噪开") && lv_obj_has_state(denoise, LV_STATE_DISABLED));
+    capture(d, argv[1], "recorder-ai-recording");
+    status.mode = AETHER_RECORDER_ORIGINAL;
+    status.denoise_fallback = true;
+    advance(120);
+    assert(find(ui.screen, "AI降噪关") && find(ui.screen, "降噪不可用，正在录制原声"));
+    status.active = false;
+    status.state = AETHER_RECORDER_FINISHED;
+    advance(120);
+    assert(find(ui.screen, "降噪不可用，已保存原声"));
+    denoise_supported = false;
+    app_open_recorder(&ui);
+    advance(120);
+    assert(lv_obj_has_state(control(&ui, "AI降噪关"), LV_STATE_DISABLED));
+
     app_ui_begin_page(&ui,"离开");recorder=NULL;app_open_recorder(&ui);advance(120);assert(find(ui.screen,"录音不可用"));
     assert(lv_obj_has_state(control(&ui,"开始录音"),LV_STATE_DISABLED));
     app_ui_begin_page(&ui,"结束");lv_obj_delete(ui.screen);lv_indev_delete(in);

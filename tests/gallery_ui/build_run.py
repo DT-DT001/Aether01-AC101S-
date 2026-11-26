@@ -1,16 +1,19 @@
 """Test the production AC101S Gallery using native LVGL and controlled storage."""
 from pathlib import Path
+import base64
 import os
 import struct
 import subprocess
+import zlib
 
 root = Path(__file__).resolve().parents[2]
 test = root / "tests/gallery_ui"
-out = root / "build/host_gallery_ui"
+out = Path(os.environ.get("AETHER_GALLERY_TEST_OUT", root / "build/host_gallery_ui")).resolve()
 out.mkdir(parents=True, exist_ok=True)
 cache = Path(os.environ.get("AETHER_LVGL_CACHE", root / "build/host_reader_ui"))
 cc = os.environ.get("CC", "cc")
-objects = sorted(cache.glob("managed_components_lvgl__lvgl_src_*.c.o"))
+objects = sorted(p for p in cache.glob("managed_components_lvgl__lvgl_src_*.c.o")
+                 if not p.name.endswith(("lv_font_montserrat_20.c.o", "lv_font_montserrat_48.c.o")))
 if not objects:
     raise SystemExit("Build native LVGL with tests/reader_ui/build_run.py first")
 objects += [cache / f"main_assets_font_{size}.c.o" for size in (16, 24)]
@@ -58,6 +61,35 @@ for name, width, height, top_down in [("wallpaper-wide", 3, 2, False),
     dib = struct.pack("<IiiHHIIiiII", 40, width, -height if top_down else height,
                       1, 24, 0, len(data), 0, 0, 0, 0)
     (photo_dir / f"{name}.bmp").write_bytes(header + dib + data)
+
+
+def png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+def png_rgba(width, height, raw, interlace=0):
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, interlace)
+    compressed = zlib.compress(raw)
+    split = len(compressed) // 2
+    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header) +
+            png_chunk(b"IDAT", compressed[:split]) + png_chunk(b"IDAT", compressed[split:]) +
+            png_chunk(b"IEND", b""))
+
+
+rgba = [bytes(c) for c in [(255, 0, 0, 255), (0, 255, 0, 128), (0, 0, 255, 0), (255, 255, 255, 255)]]
+png = png_rgba(2, 2, b"\x00" + b"".join(rgba[:2]) + b"\x00" + b"".join(rgba[2:]))
+(photo_dir / "fixture.PNG").write_bytes(png)
+(photo_dir / "truncated.png").write_bytes(png[:48])
+(photo_dir / "oversize.png").write_bytes(png_rgba(8192, 8192, b"\x00"))
+adam7 = [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+         (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)]
+scanlines = b"".join(b"\x00" + b"".join(rgba[(y % 2) * 2 + x % 2] for x in range(x0, 17, dx))
+                     for x0, y0, dx, dy in adam7 for y in range(y0, 17, dy))
+(photo_dir / "interlaced.png").write_bytes(png_rgba(17, 17, scanlines, interlace=1))
+# A two-frame GIF with a transparent pixel in the first frame.
+gif = base64.b64decode("R0lGODlhAgACAIEAAP8AAAD/AAAA/////yH/C05FVFNDQVBFMi4wAwEAAAAh+QQBBQACACwAAAAAAgACAAAIBwABBBAwICAAIfkEAQUAAgAsAAAAAAIAAgCB/wAAAP8AAAD/////CAcABwgIACAgADs=")
+(photo_dir / "animated.GIF").write_bytes(gif)
+(photo_dir / "truncated.gif").write_bytes(gif[:60])
 usb_dir = out / "usbphotos/DCIM/Camera"
 usb_dir.mkdir(parents=True, exist_ok=True)
 (usb_dir / "tail.bmp").write_bytes((photo_dir / "tail.bmp").read_bytes())

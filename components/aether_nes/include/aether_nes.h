@@ -95,6 +95,11 @@ esp_err_t aether_nes_set_screen_paused(aether_nes_handle_t handle, bool paused);
  * entire gesture (for example while requesting a screen wake). */
 esp_err_t aether_nes_set_input_gate(aether_nes_handle_t handle,
                                     bool (*gate)(void *), void *context);
+/* Optional board-level reader for shared touch ownership. Install while idle. */
+typedef esp_err_t (*aether_nes_touch_reader_t)(void *context, esp_lcd_touch_point_data_t *points,
+                                              uint8_t *count, uint8_t capacity);
+esp_err_t aether_nes_set_touch_reader(aether_nes_handle_t handle,
+                                      aether_nes_touch_reader_t reader, void *context);
 /** Stop and wait for callbacks, raw touch and audio to finish. Zero polls. */
 esp_err_t aether_nes_stop_wait(aether_nes_handle_t handle, uint32_t timeout_ms);
 /** Release the retained last frame when the emulator page is closed. */

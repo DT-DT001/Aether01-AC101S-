@@ -19,7 +19,6 @@ static unsigned interest_updates,telemetry_reads,dirty_calls;
 static unsigned calibration_cancels;
 static const char *output;
 static app_gyro_calibration_status_t calibration;
-
 esp_err_t app_telemetry_gyro_calibration_begin(void)
 {
     calibration = (app_gyro_calibration_status_t){
@@ -69,6 +68,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
     if(ui->page_cleanup){void(*cleanup)(app_ui_t*)=ui->page_cleanup;ui->page_cleanup=NULL;cleanup(ui);}
     assert(!ui->page_context);
     ui->page_back = NULL;
+    ui->page_suspend = NULL;
     lv_obj_t *old=ui->screen;
     ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x070A12),0);
@@ -155,9 +155,16 @@ static void check_labels(lv_obj_t *p)
 static void layout(app_ui_t *ui)
 {
     lv_obj_update_layout(ui->screen);check_labels(ui->screen);
-    lv_obj_t *caption=find(ui->screen,"姿态归零"),*footer=find(ui->screen,"相对航向可能随时间漂移");
-    assert(caption&&footer);lv_area_t a,b;lv_obj_get_coords(lv_obj_get_parent(caption),&a);lv_obj_get_coords(footer,&b);
-    assert(a.y2<b.y1);assert(lv_obj_get_scroll_y(ui->content)==0);
+    lv_obj_t *zero = find(ui->screen, "姿态归零");
+    lv_obj_t *calibrate = find(ui->screen, "漂移校准");
+    lv_obj_t *level_button = find(ui->screen, "水平仪");
+    assert(zero && calibrate && level_button);
+    lv_area_t a, b, c;
+    lv_obj_get_coords(lv_obj_get_parent(zero), &a);
+    lv_obj_get_coords(lv_obj_get_parent(calibrate), &b);
+    lv_obj_get_coords(lv_obj_get_parent(level_button), &c);
+    assert(a.x2 < b.x1 && b.x2 < c.x1);
+    assert(lv_obj_get_scroll_y(ui->content) == 0);
 }
 static void capture(app_ui_t *ui,const char *name)
 {
@@ -245,11 +252,22 @@ static void test_spirit_level(app_ui_t *ui)
     lv_obj_send_event(lv_obj_get_parent(entry), LV_EVENT_CLICKED, NULL);
     assert(ui->page_back == app_open_motion && interest == APP_TELEMETRY_IMU);
     pose(0, 0, 10);
-    assert(find(ui->screen, "已水平"));
+    lv_obj_t *centered = find(ui->screen, "已水平");
+    assert(centered);
+    lv_obj_t *dial = lv_obj_get_child(lv_obj_get_parent(centered), 0);
+    lv_obj_t *bubble = lv_obj_get_child(dial, -1);
+    assert(bubble && lv_obj_get_x_aligned(bubble) == 0 && lv_obj_get_y_aligned(bubble) == 0);
     capture(ui, "level-flat");
     pose(0, 15, 50);
     assert(find(ui->screen, "倾斜") && find(ui->screen, "+15.0°"));
+    assert(lv_obj_get_x_aligned(bubble) < -70 && lv_obj_get_y_aligned(bubble) == 0);
     capture(ui, "level-tilted");
+    pose(0, -15, 50);
+    assert(find(ui->screen, "-15.0°") && lv_obj_get_x_aligned(bubble) > 70 && lv_obj_get_y_aligned(bubble) == 0);
+    pose(15, 0, 50);
+    assert(lv_obj_get_x_aligned(bubble) == 0 && lv_obj_get_y_aligned(bubble) < -70);
+    pose(-15, 0, 50);
+    assert(lv_obj_get_x_aligned(bubble) == 0 && lv_obj_get_y_aligned(bubble) > 70);
     feed(0, 0, G, 0, 80, 0, 10);
     assert(find(ui->screen, "将设备放稳"));
     pose(0, 0, 10);
@@ -268,7 +286,7 @@ static void test_spirit_level(app_ui_t *ui)
     assert(find(ui->screen, "姿态"));
     app_ui_begin_page(ui, "主页");
     assert(!interest && !ui->timer && !ui->page_context);
-    puts("PASS level flat and tilted, rejects movement/stale samples, resumes after standby, returns to pose");
+    puts("PASS level center and all four bubble directions, signed readouts, movement/stale rejection, standby and Back");
 }
 
 static void click_motion_button(app_ui_t *ui, const char *caption)
@@ -331,6 +349,25 @@ static void test_shared_level_zero(app_ui_t *ui)
     puts("PASS shared pose/level zero on a double-axis tilt, reopen and home, gyro drift rejection, invalid zero preservation, and re-zero");
 }
 
+static void test_board_sample_zero(app_ui_t *ui)
+{
+    app_open_motion(ui);
+    advance(300);
+    click_motion_button(ui, "姿态归零");
+    assert(find(ui->screen, "将设备放稳"));
+    /* Recorded COM40 gravity and rates while stationary flag remained false. */
+    feed(-.538f, -.229f, 8.863f, 8.578f, 3.187f, -.078f, 1);
+    assert(find(ui->screen, "已归零"));
+    feed(-.538f, -.229f, 8.863f, 8.578f, 3.187f, -.078f, 200);
+    assert(fabsf(value(ui, 0)) < 1 && fabsf(value(ui, 1)) < 1 && fabsf(value(ui, 2)) < 1);
+    click_motion_button(ui, "水平仪");
+    assert(find(ui->screen, "已水平"));
+    ui->page_back(ui);
+    pose(0, 0, 60);
+    click_motion_button(ui, "姿态归零");
+    puts("PASS queued pose zero uses the next real gravity frame and stays centered with the recorded AC101S transverse drift");
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==2);output=argv[1];setbuf(stdout,NULL);lv_init();
@@ -341,6 +378,7 @@ int main(int argc,char **argv)
     test_poses(&ui);test_actions(&ui);test_invalid_and_sleep(&ui);test_calibration(&ui);
     test_spirit_level(&ui);
     test_shared_level_zero(&ui);
+    test_board_sample_zero(&ui);
     for(unsigned i=0;i<100;++i){level(&ui);feed(0,0,G,0,0,60,5);app_ui_begin_page(&ui,"主页");assert(!interest&&!ui.timer&&!ui.page_context&&lv_mem_test()==LV_RESULT_OK);}
     lv_obj_delete(ui.screen);lv_display_delete(display);assert(lv_mem_test()==LV_RESULT_OK);lv_deinit();
     printf("PASS 100 actual motion/home rebuilds, real model draws, all labels within 480px, supplied-font glyphs and LVGL allocator integrity (%u scheduler ticks)\n",dirty_calls);

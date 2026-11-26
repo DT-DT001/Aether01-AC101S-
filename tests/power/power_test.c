@@ -23,7 +23,7 @@ static jmp_buf stop_loop;
 static unsigned loop_number, loop_limit;
 static void (*iteration_hook)(unsigned);
 static void (*lock_hook)(void);
-static bool lock_available, gui_touch_enabled;
+static bool lock_available, touch_irq_awake;
 static int boot_level, touch_level, pmic_level;
 static uint8_t key_events;
 static unsigned key_reads, key_configures, consumed_gestures;
@@ -107,8 +107,8 @@ lv_timer_t *lv_display_get_refr_timer(lv_display_t *target) { return &target->re
 void lv_timer_pause(lv_timer_t *timer) { timer->paused = true; }
 void lv_timer_resume(lv_timer_t *timer) { timer->paused = false; }
 void lv_timer_ready(lv_timer_t *timer) { ++timer->ready_calls; }
-bool app_touch_wake_enabled(void) { return gui_touch_enabled; }
 void app_touch_consume_wake_gesture(void) { ++consumed_gestures; }
+void app_touch_set_screen_awake(bool awake) { touch_irq_awake = awake; }
 esp_err_t tg29_configure_key_wakeup(tg29_handle_t pmic)
 { (void)pmic; ++key_configures; return key_setup_error; }
 esp_err_t tg29_get_key_events(tg29_handle_t pmic, uint8_t *events)
@@ -155,7 +155,12 @@ esp_err_t nvs_get_u32(nvs_handle_t handle, const char *key, uint32_t *value)
     return ESP_FAIL;
 }
 esp_err_t nvs_set_u32(nvs_handle_t handle, const char *key, uint32_t value)
-{ (void)handle; (void)key; (void)value; return ESP_OK; }
+{
+    (void)handle;
+    (void)key;
+    (void)value;
+    return ESP_OK;
+}
 esp_err_t nvs_commit(nvs_handle_t handle)
 {
     (void)handle;
@@ -181,7 +186,7 @@ static void reset(void)
     manager.timeout_seconds = 30;
     display.invalidation_count = 1;
     display.invalidation = true;
-    lock_available = gui_touch_enabled = true;
+    lock_available = touch_irq_awake = true;
     boot_level = touch_level = pmic_level = 1;
     key_events = key_reads = key_configures = consumed_gestures = 0;
     key_setup_error = key_read_error = ESP_OK;
@@ -448,7 +453,7 @@ static void cancel_sleep_retry_with_wake(unsigned iteration)
     }
 }
 
-static void supersede_failed_touch_wake(unsigned iteration)
+static void supersede_failed_wake(unsigned iteration)
 {
     if (iteration == 2) display.last_activity = 150;
     if (iteration == 3) {
@@ -612,7 +617,7 @@ static int test_power_key_gestures(void)
     puts("PASS PWRON sleep/wake requests survive unavailable LVGL mutex without a same-gesture duplicate transition");
 
     key_fixture(true);
-    CHECK(app_power_wake(&manager) == ESP_OK); /* Touch/UI wake has not reached the panel. */
+    CHECK(app_power_wake(&manager) == ESP_OK); /* Explicit wake has not reached the panel. */
     lock_available = false;
     key_unlock_at = 4;
     key_script[0] = TG29_KEY_EVENT_PRESS;
@@ -636,7 +641,7 @@ static int test_power_key_gestures(void)
     run_worker(4);
     CHECK(pending_before_unlock && !sleeps && !wakes && !manager.sleeping);
     CHECK(!manager.sleep_requested && !manager.wake_requested && manager.request_revision == 2);
-    puts("PASS PMIC press/short cannot cancel a queued touch/UI wake while physically asleep; press safely cancels an unapplied explicit sleep");
+    puts("PASS PMIC press/short preserves a queued explicit wake while asleep and cancels an unapplied explicit sleep");
 
     key_fixture(false);
     key_script[0] = TG29_KEY_EVENT_PRESS;
@@ -745,15 +750,15 @@ int main(void)
     reset();
     sleep_error = ESP_FAIL;
     CHECK(apply_sleep(&manager) == ESP_FAIL);
-    CHECK(manager.sleeping && !display.invalidation);
+    CHECK(manager.sleeping && !display.invalidation && !touch_irq_awake);
     CHECK(app_power_is_sleeping(&manager));
     wake_error = ESP_FAIL;
     CHECK(apply_wake(&manager) == ESP_FAIL);
-    CHECK(manager.sleeping && !display.invalidation);
+    CHECK(manager.sleeping && !display.invalidation && !touch_irq_awake);
     wake_error = ESP_OK;
     clock_ms = 150;
     CHECK(apply_wake(&manager) == ESP_OK);
-    CHECK(!manager.sleeping && display.invalidation && display.last_activity == 150);
+    CHECK(!manager.sleeping && display.invalidation && touch_irq_awake && display.last_activity == 150);
     clock_ms = 300;
     CHECK(apply_wake(&manager) == ESP_OK); /* Explicit wake while already awake. */
     CHECK(display.last_activity == 300);
@@ -809,7 +814,7 @@ int main(void)
     manager.sleeping = board.display_sleeping = true;
     wake_error = ESP_FAIL;
     CHECK(app_power_wake(&manager) == ESP_OK);
-    iteration_hook = supersede_failed_touch_wake;
+    iteration_hook = supersede_failed_wake;
     run_worker(25);
     CHECK(wakes == 1 && sleeps == 1 && manager.sleeping);
     CHECK(!manager.sleep_requested && !display.invalidation);
@@ -906,7 +911,7 @@ int main(void)
     iteration_hook = unlock_second_iteration;
     run_worker(2);
     CHECK(pending_before_unlock && key_reads == 1 && wakes == 1 && !manager.sleeping &&
-          !manager.wake_requested && display.invalidation_count == 1);
+          !manager.wake_requested && display.invalidation_count == 1 && touch_irq_awake && consumed_gestures == 1);
     puts("PASS TG29 physical power-key wake is recorded before acquiring the LVGL lock");
 
     reset();
@@ -925,13 +930,12 @@ int main(void)
     lock_available = false;
     iteration_hook = unlock_second_iteration;
     run_worker(2);
-    CHECK(!pending_before_unlock && wakes == 0 && manager.sleeping && consumed_gestures == 0);
+    CHECK(!pending_before_unlock && wakes == 0 && manager.sleeping && !touch_irq_awake && consumed_gestures == 0);
     puts("PASS raw touch IRQ cannot wake the panel even after LVGL lock recovery");
 
     reset();
     CHECK(apply_sleep(&manager) == ESP_OK);
     board.touch_ready = true;
-    gui_touch_enabled = false; /* NES owns raw touch; its input gate handles screen wake. */
     touch_level = 0;
     run_worker(1);
     CHECK(wakes == 0 && consumed_gestures == 0 && manager.sleeping);

@@ -25,6 +25,12 @@ static const uint8_t fixture_bmp[58] = {
     [18] = 1, [22] = 1, [26] = 1, [28] = 24, [34] = 4, [56] = 255,
 };
 
+static const uint8_t fixture_png_header[33] = {
+    0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 13, 'I', 'H', 'D', 'R',
+    0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
+};
+static const uint8_t fixture_gif_header[16] = {'G', 'I', 'F', '8', '9', 'a', 2, 0, 2, 0};
+
 static void fixture_path(char path[256], const char *root, const char *name)
 {
     const int length = snprintf(path, 256, "%s/%s", root, name);
@@ -96,6 +102,22 @@ static void test_gallery_catalog(app_io_handle_t io)
     fixture_path(expected, tf, "tail.bmp");
     assert(!strcmp(r.entries[1].path, expected));
     app_io_result_free(&r);
+
+    write_photo_fixture(album, "sample.PNG", fixture_png_header, sizeof(fixture_png_header), 3500);
+    write_photo_fixture(album, "sample.GIF", fixture_gif_header, sizeof(fixture_gif_header), 3400);
+    write_photo_fixture(album, "mislabelled.png", fixture_gif_header, sizeof(fixture_gif_header), 3600);
+    capacity = 0;
+    r = gallery_result(io);
+    assert(aether_media_fs_acquire(io->storage, tf, &io->media_lease) == ESP_OK);
+    assert(scan_gallery_root(io, tf, dirs, &r, &capacity, 2) == ESP_OK);
+    aether_media_fs_release(&io->media_lease);
+    qsort(r.entries, r.count, sizeof(*r.entries), newest_photo);
+    assert(r.count == 2 && r.total_count == 4);
+    fixture_path(expected, album, "sample.PNG");
+    assert(!strcmp(r.entries[0].path, expected));
+    fixture_path(expected, album, "sample.GIF");
+    assert(!strcmp(r.entries[1].path, expected));
+    app_io_result_free(&r);
     free(dirs);
 
     const app_io_request_t request = {.operation = APP_IO_CATALOG, .filter = APP_IO_IMAGES};
@@ -137,7 +159,8 @@ static void test_gallery_catalog(app_io_handle_t io)
         fixture_path(expected, gallery_usb_root, filename);
         assert(!unlink(expected));
     }
-    const char *const album_files[] = {"Photo.JPG", "renamed.jpg", "still-not-a-photo.mp4", "progressive.jpeg"};
+    const char *const album_files[] = {"Photo.JPG", "renamed.jpg", "still-not-a-photo.mp4", "progressive.jpeg",
+                                      "sample.PNG", "sample.GIF", "mislabelled.png"};
     for (size_t i = 0; i < sizeof(album_files) / sizeof(album_files[0]); ++i) {
         fixture_path(expected, album, album_files[i]);
         assert(!unlink(expected));
@@ -149,5 +172,5 @@ static void test_gallery_catalog(app_io_handle_t io)
     fixture_path(expected, gallery_usb_root, "short.bmp");
     assert(!unlink(expected));
     assert(!rmdir(album) && !rmdir(camera) && !rmdir(tf) && !rmdir(gallery_usb_root));
-    puts("PASS gallery I/O recursively filters real 1×1 JPEG/BMP, keeps newest across both roots, discards an old USB generation and cancels during a scan");
+    puts("PASS gallery I/O matches JPEG/BMP/PNG/GIF headers, keeps newest across both roots, discards an old USB generation and cancels during a scan");
 }

@@ -16,6 +16,8 @@
 #define MEASUREMENT_IMU_PERIOD_MS 5U
 #define MEASUREMENT_IMU_RETRY_MS 2U
 #define MEASUREMENT_RTC_TIMEOUT_MS 8
+#define GAME_IMU_PERIOD_MS 10U
+#define IMU_INTEREST (APP_TELEMETRY_IMU | APP_TELEMETRY_IMU_GAME)
 enum {
     GYRO_COUNTDOWN_MS = 2000U,
     GYRO_SAMPLE_MS = 5000U,
@@ -171,7 +173,7 @@ void app_telemetry_get(app_telemetry_snapshot_t *snapshot)
         }
         /* A cached sample must never look live after leaving/reopening a page
          * or when the worker is delayed by a peripheral error. */
-        if (!(interest & APP_TELEMETRY_IMU)) snapshot->imu_error = ESP_ERR_NOT_FINISHED;
+        if (!(interest & IMU_INTEREST)) snapshot->imu_error = ESP_ERR_NOT_FINISHED;
         else if (snapshot->imu_error == ESP_OK && now - snapshot->imu_updated_ms > 2000) {
             snapshot->imu_error = ESP_ERR_TIMEOUT;
         }
@@ -230,11 +232,11 @@ void app_telemetry_set_screen_suspended(bool suspended)
 
 void app_telemetry_set_interest(uint32_t mask)
 {
-    mask &= APP_TELEMETRY_IMU | APP_TELEMETRY_BAROMETER;
+    mask &= IMU_INTEREST | APP_TELEMETRY_BAROMETER;
     portENTER_CRITICAL(&s_lock);
     if (s_interest != mask) {
         const uint32_t activated = mask & ~s_interest;
-        if (activated & APP_TELEMETRY_IMU) s_snapshot.imu_error = ESP_ERR_NOT_FINISHED;
+        if (activated & IMU_INTEREST) s_snapshot.imu_error = ESP_ERR_NOT_FINISHED;
         if (activated & APP_TELEMETRY_BAROMETER) s_snapshot.barometer_error = ESP_ERR_NOT_FINISHED;
         s_interest = mask;
         ++s_interest_generation;
@@ -448,9 +450,11 @@ static void telemetry_task(void *argument)
         const bool can_sample_imu = !suspended && !(parked_sensors & APP_TELEMETRY_IMU);
         const bool measurement = can_sample_imu && measurement_consumer &&
             measurement_requested && measurement_requested();
+        const bool game_imu = can_sample_imu && (interest & APP_TELEMETRY_IMU_GAME);
+        const unsigned fast_imu_ms = measurement ? MEASUREMENT_IMU_PERIOD_MS : game_imu ? GAME_IMU_PERIOD_MS : 0;
         /* Console writes and auxiliary application work can block longer
          * than a valid motion sample interval. Run them between sessions. */
-        if (!measurement && !suspended) {
+        if (!fast_imu_ms && !suspended) {
             if ((int32_t)(now - media_due) >= 0) {
                 portENTER_CRITICAL(&s_lock);
                 void (*probe)(void *) = s_media_probe;
@@ -468,7 +472,7 @@ static void telemetry_task(void *argument)
         if (measurement != previous_measurement) due_imu = now;
         previous_measurement = measurement;
         const uint32_t activated = generation != previous_generation ? interest : 0;
-        if (activated & APP_TELEMETRY_IMU) due_imu = now;
+        if (activated & IMU_INTEREST) due_imu = now;
         if (activated & APP_TELEMETRY_BAROMETER) {
             due_baro = now;
             pressure_count = pressure_index = 0;
@@ -484,7 +488,7 @@ static void telemetry_task(void *argument)
             } else ESP_LOGI("imu", "startup calibration: no qualified stationary samples (%u reads)", imu_reads);
         }
         const bool sample_imu = can_sample_imu &&
-            (measurement || warm_imu || gyro_sampling || (interest & APP_TELEMETRY_IMU));
+            (measurement || warm_imu || gyro_sampling || (interest & IMU_INTEREST));
         const bool read_imu = sample_imu && (int32_t)(now - due_imu) >= 0;
         esp_err_t imu_error = ESP_ERR_NOT_FINISHED;
         if (read_imu) {
@@ -510,8 +514,8 @@ static void telemetry_task(void *argument)
             /* Anchor the fast cadence to the start of the transaction. A
              * late read produces one sample, with its actual timestamp. */
             if (waiting_for_frame)
-                due_imu = uptime_ms() + (measurement ? MEASUREMENT_IMU_RETRY_MS : 5U);
-            else if (imu_error == ESP_OK && measurement) due_imu = now + MEASUREMENT_IMU_PERIOD_MS;
+                due_imu = uptime_ms() + (fast_imu_ms ? MEASUREMENT_IMU_RETRY_MS : 5U);
+            else if (imu_error == ESP_OK && fast_imu_ms) due_imu = now + fast_imu_ms;
             else due_imu = uptime_ms() + (imu_error == ESP_OK ? 20U : 2000U);
             if (measurement) {
                 const esp_err_t cached_error = next.imu_error;
@@ -575,7 +579,7 @@ static void telemetry_task(void *argument)
         }
         portEXIT_CRITICAL(&s_lock);
         if (consumer && !measurement) consumer(suspended ? NULL : &next);
-        if (!measurement && (int32_t)(now - health_due) >= 0) {
+        if (!fast_imu_ms && (int32_t)(now - health_due) >= 0) {
             const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
             ESP_LOGI("health", "heap internal=%u min=%u largest=%u psram=%u telemetry_stack_min=%u dma=%u dma_min=%u dma_largest=%u",
                      (unsigned)heap_caps_get_free_size(internal_caps),
@@ -604,11 +608,11 @@ static void telemetry_task(void *argument)
             }
         }
         unsigned sleep_ms = suspended ? 100U : sample_imu ? 10U : 50U;
-        if (measurement) {
+        if (fast_imu_ms) {
             const int32_t until_imu = (int32_t)(due_imu - uptime_ms());
             if (until_imu <= 0) sleep_ms = 1U;
-            else if (until_imu < (int32_t)MEASUREMENT_IMU_PERIOD_MS) sleep_ms = (unsigned)until_imu;
-            else sleep_ms = MEASUREMENT_IMU_PERIOD_MS;
+            else if (until_imu < (int32_t)fast_imu_ms) sleep_ms = (unsigned)until_imu;
+            else sleep_ms = fast_imu_ms;
         }
         const TickType_t delay = pdMS_TO_TICKS(sleep_ms);
         vTaskDelay(delay ? delay : 1);

@@ -5,12 +5,7 @@
 #include "app_audio_system.h"
 #include "app_telemetry.h"
 #include "app_utilities.h"
-#ifdef ESP_PLATFORM
 #include "app_theme.h"
-#else
-#define app_theme_color(value) (value)
-#define app_theme_background(value) (value)
-#endif
 #include "aether_wifi.h"
 #include "../assets/icons/app_icons.h"
 #include <stdlib.h>
@@ -424,13 +419,18 @@ void app_ui_show_home(app_ui_t *ui)
     lv_obj_set_style_bg_color(screen, lv_color_hex(app_theme_background(0x1D2540)), 0);
     lv_obj_set_style_bg_grad_color(screen, lv_color_hex(app_theme_background(0x101322)), 0);
     lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
-#ifdef ESP_PLATFORM
-    if (app_theme_wallpaper_view(screen)) {
+    const bool has_wallpaper = app_theme_wallpaper_view(screen) != NULL;
+    if (has_wallpaper) {
+        /* Shade the text area and fade toward the lower part of the photo. */
         lv_obj_t *shade = shape(screen, 480, 480, 0, 0x0A101D);
         lv_obj_center(shade);
-        lv_obj_set_style_bg_opa(shade, LV_OPA_30, 0);
+        lv_obj_set_style_bg_grad_color(shade, lv_color_hex(0x0A101D), 0);
+        lv_obj_set_style_bg_grad_dir(shade, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_main_stop(shade, 156, 0);
+        lv_obj_set_style_bg_grad_stop(shade, 229, 0);
+        lv_obj_set_style_bg_main_opa(shade, LV_OPA_70, 0);
+        lv_obj_set_style_bg_grad_opa(shade, LV_OPA_20, 0);
     }
-#endif
     lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(screen, desktop_swipe, LV_EVENT_PRESSED, ui);
     lv_obj_add_event_cb(screen, desktop_swipe, LV_EVENT_PRESSING, ui);
@@ -439,14 +439,13 @@ void app_ui_show_home(app_ui_t *ui)
     lv_obj_add_event_cb(screen, desktop_swipe, LV_EVENT_INDEV_RESET, ui);
     status_bar(ui, screen);
     ui->home_time = app_ui_add_text(screen, "--:--", LV_ALIGN_TOP_MID,
-                                    0, 105, 0xF6F1FF, &lv_font_montserrat_48);
+                                    0, 76, 0xF6F1FF, &lv_font_montserrat_48);
     ui->app_obj[HOME_DATE] = app_ui_add_text(screen, "", LV_ALIGN_TOP_MID,
-                                           0, 168, 0xD5D6F3, app_ui_chinese_font_size(24));
+                                           0, 137, 0xD5D6F3, app_ui_chinese_font_size(24));
 
-    lv_obj_t *weather = shape(screen, 392, 116, 24, app_theme_background(0x262D48));
-    lv_obj_align(weather, LV_ALIGN_TOP_MID, 0, 237);
-    lv_obj_set_style_border_width(weather, 1, 0);
-    lv_obj_set_style_border_color(weather, lv_color_hex(0x394361), 0);
+    lv_obj_t *weather = shape(screen, 392, 116, 0, 0);
+    lv_obj_set_style_bg_opa(weather, LV_OPA_TRANSP, 0);
+    lv_obj_align(weather, LV_ALIGN_TOP_MID, 0, 181);
     ui->app_obj[HOME_SUN] = shape(weather, 38, 38, LV_RADIUS_CIRCLE, 0xF8CE82);
     lv_obj_set_pos(ui->app_obj[HOME_SUN], 26, 25);
     lv_obj_t *cloud = shape(weather, 76, 38, 0, 0x262D48);
@@ -461,10 +460,18 @@ void app_ui_show_home(app_ui_t *ui)
     ui->app_obj[HOME_CITY] = app_ui_add_text(weather, "", LV_ALIGN_TOP_LEFT, 114, 27,
                                             0xEFEBFF, app_ui_chinese_font_size(24));
     ui->app_obj[HOME_CONDITION] = app_ui_add_text(weather, "", LV_ALIGN_TOP_LEFT, 115, 66,
-                                                 0xACB8D9, app_ui_chinese_font());
+                                                 0xDEE5F8, app_ui_chinese_font());
     ui->app_obj[HOME_TEMP] = app_ui_add_text(weather, "--°", LV_ALIGN_RIGHT_MID, -24, 0,
                                             0xF5EFFF, &lv_font_montserrat_48);
-    app_ui_add_text(screen, LV_SYMBOL_UP, LV_ALIGN_BOTTOM_MID, 0, -58, 0xB7B8EA, &lv_font_montserrat_20);
+    lv_obj_t *swipe_hint = app_ui_add_text(screen, LV_SYMBOL_UP, LV_ALIGN_BOTTOM_MID,
+                                          0, -58, 0xD7DBFA, &lv_font_montserrat_20);
+    if (has_wallpaper) {
+        lv_obj_set_style_bg_color(swipe_hint, lv_color_hex(0x0A101D), 0);
+        lv_obj_set_style_bg_opa(swipe_hint, LV_OPA_50, 0);
+        lv_obj_set_style_radius(swipe_hint, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_hor(swipe_hint, 8, 0);
+        lv_obj_set_style_pad_ver(swipe_hint, 3, 0);
+    }
     lv_obj_t *handle = shape(screen, 112, 5, 3, app_theme_color(0x747AA6));
     lv_obj_align(handle, LV_ALIGN_BOTTOM_MID, 0, -24);
     app_ui_load_screen(screen);

@@ -4,7 +4,7 @@ import os
 import subprocess
 root=Path(__file__).resolve().parents[2]
 test=root/'tests/volume_ui'
-out=root/'build/host_volume_ui'
+out=Path(os.environ.get('AETHER_VOLUME_UI_OUT',root/'build/host_volume_ui')).resolve()
 out.mkdir(parents=True,exist_ok=True)
 lvgl=root/'managed_components/lvgl__lvgl'
 cached=Path(os.environ.get('AETHER_LVGL_CACHE', root/'build/host_reader_ui'))

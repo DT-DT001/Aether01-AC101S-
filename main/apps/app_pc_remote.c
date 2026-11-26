@@ -13,7 +13,7 @@
 #define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
 
 typedef enum {
-    REMOTE_MOUSE, REMOTE_OBS,
+    REMOTE_MOUSE, REMOTE_OBS, REMOTE_MOUSE_SETTINGS,
 } remote_view_t;
 
 enum {
@@ -21,6 +21,7 @@ enum {
     ACTION_LEFT, ACTION_RIGHT, ACTION_MIDDLE, ACTION_RECENTER,
     ACTION_EDIT, ACTION_SAVE, ACTION_CANCEL,
     ACTION_CONFIRM, ACTION_REJECT, ACTION_PAIR_OFF, ACTION_CALIBRATE,
+    ACTION_MOUSE_SETTINGS, ACTION_MOUSE_SLOWER, ACTION_MOUSE_DEFAULT, ACTION_MOUSE_FASTER,
     ACTION_SHORTCUT_BASE = 32, ACTION_SCENE_BASE = 64,
 };
 
@@ -60,6 +61,7 @@ typedef struct {
     char notice[96];
     lv_obj_t *direct_keys[ARRAY_COUNT(mouse_shortcuts)];
     lv_obj_t *move, *mouse_hint, *mouse_buttons[3], *recenter, *calibrate;
+    lv_obj_t *sensitivity, *slower, *restore_speed, *faster;
     lv_obj_t *edit, *instructions, *grid, *editor, *edit_title, *key_selector;
     lv_obj_t *scenes[APP_PC_REMOTE_SCENES], *bindings[APP_PC_REMOTE_SCENES];
     lv_obj_t *mod_buttons[ARRAY_COUNT(modifiers)];
@@ -71,6 +73,7 @@ typedef struct {
 static void page_cleanup(app_ui_t *ui);
 static void button_clicked(lv_event_t *event);
 static void refresh(remote_page_t *page);
+static void open_mouse_settings(app_ui_t *ui);
 
 static remote_page_t *current_page(lv_event_t *event)
 {
@@ -222,7 +225,26 @@ static void build_mouse(remote_page_t *page, lv_obj_t *content)
         page->direct_keys[i] = button(page, parent, mouse_shortcuts[i].label, (int)i * 103, 195, 95, 44,
                                       ACTION_SHORTCUT_BASE + i);
     page->recenter = button(page, parent, "回中", 0, 247, 196, 46, ACTION_RECENTER);
-    page->calibrate = button(page, parent, "漂移校准", 208, 247, 196, 46, ACTION_CALIBRATE);
+    (void)button(page, parent, "配置", 208, 247, 196, 46, ACTION_MOUSE_SETTINGS);
+}
+
+static void build_mouse_settings(remote_page_t *page, lv_obj_t *content)
+{
+    lv_obj_t *card = lv_obj_create(content);
+    lv_obj_set_pos(card, 0, 57);
+    lv_obj_set_size(card, REMOTE_WIDTH, 178);
+    app_connection_card_style(card);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    app_ui_add_text(card, "灵敏度", LV_ALIGN_TOP_MID, 0, 10, CONNECTION_TEXT, app_ui_chinese_font_size(24));
+    page->sensitivity = app_ui_add_text(card, "", LV_ALIGN_TOP_MID, 0, 47,
+                                        CONNECTION_ACCENT, &lv_font_montserrat_28);
+    page->slower = button(page, card, "-", 14, 98, 94, 56, ACTION_MOUSE_SLOWER);
+    page->restore_speed = button(page, card, "恢复默认", 119, 98, 166, 56, ACTION_MOUSE_DEFAULT);
+    page->faster = button(page, card, "+", 296, 98, 94, 56, ACTION_MOUSE_FASTER);
+    lv_obj_set_style_text_font(lv_obj_get_child(page->slower, 0), &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(lv_obj_get_child(page->faster, 0), &lv_font_montserrat_28, 0);
+    page->calibrate = button(page, content, "漂移校准", 0, 245, REMOTE_WIDTH, 56, ACTION_CALIBRATE);
+    page->mouse_hint = label(content, "", 315, REMOTE_WIDTH, 28, CONNECTION_DETAIL);
 }
 
 static size_t key_index(uint8_t usage)
@@ -555,10 +577,10 @@ static void refresh(remote_page_t *page)
     }
     app_ui_label_text(lv_obj_get_child(page->toggle, 0), status.requested ? "关闭键鼠" : "开启键鼠");
     set_enabled(page->toggle, status.available || status.requested);
-    if (page->view == REMOTE_OBS && status.save_error != ESP_OK)
+    if (page->view != REMOTE_MOUSE && status.save_error != ESP_OK)
         app_ui_label_text(page->hint, "保存失败，稍后重试");
-    else if (page->view == REMOTE_OBS && status.save_pending)
-        app_ui_label_text(page->hint, "正在保存场景…");
+    else if (page->view != REMOTE_MOUSE && status.save_pending)
+        app_ui_label_text(page->hint, page->view == REMOTE_OBS ? "正在保存场景…" : "正在保存设置…");
     else if (page->notice[0] && lv_tick_elaps(page->notice_tick) < 2800)
         app_ui_label_text(page->hint, page->notice);
     else if (status.reconnecting) app_ui_label_text(page->hint, "请保持对方蓝牙开启");
@@ -576,17 +598,23 @@ static void refresh(remote_page_t *page)
             app_ui_label_text(page->bindings[i], binding);
             indicate_ready(page->scenes[i], ready || page->edit_select);
         }
-    } else {
+    } else if (page->view == REMOTE_MOUSE) {
         for (size_t i = 0; i < ARRAY_COUNT(page->direct_keys); ++i) indicate_ready(page->direct_keys[i], ready);
         for (size_t i = 0; i < ARRAY_COUNT(page->mouse_buttons); ++i) indicate_ready(page->mouse_buttons[i], ready);
         const bool can_move = ready && status.gyro_ready && status.gyro_calibrated;
         if (!can_move) stop_motion(page);
         indicate_ready(page->move, can_move);
         indicate_ready(page->recenter, ready && status.gyro_ready);
-        indicate_ready(page->calibrate, status.gyro_ready);
         app_ui_label_text(page->mouse_hint, !status.gyro_ready ? "未检测到陀螺仪，仍可使用鼠标按键。" :
-            !ready ? "连接电脑后可移动鼠标。" : !status.gyro_calibrated ? "平放设备，或点漂移校准" :
+            !ready ? "连接电脑后可移动鼠标。" : !status.gyro_calibrated ? "平放设备，或在配置中校准" :
             page->motion_held ? "松手停止" : "按住后转动设备");
+    } else {
+        app_ui_label_fmt(page->sensitivity, "%u%%", (unsigned)status.sensitivity);
+        set_enabled(page->slower, status.sensitivity > APP_PC_MOUSE_MIN);
+        set_enabled(page->faster, status.sensitivity < APP_PC_MOUSE_MAX);
+        set_enabled(page->restore_speed, status.sensitivity != APP_PC_MOUSE_DEFAULT);
+        set_enabled(page->calibrate, status.gyro_ready);
+        app_ui_label_text(page->mouse_hint, status.gyro_ready ? "设备平放，静止时校准" : "未检测到陀螺仪");
     }
     if (!page->calibration.box && !page->rename_box) refresh_pairing(page, &status);
 }
@@ -603,9 +631,19 @@ static void button_clicked(lv_event_t *event)
         if (status.requested) release_motion(page);
         show_result(page, app_pc_remote_set_enabled(!status.requested), NULL);
     } else if (status.confirm_pending) return;
-    else if (action == ACTION_CALIBRATE && page->view == REMOTE_MOUSE) {
-        release_motion(page);
+    else if (action == ACTION_MOUSE_SETTINGS && page->view == REMOTE_MOUSE) {
+        open_mouse_settings(page->ui);
+        return;
+    } else if (action == ACTION_CALIBRATE && page->view == REMOTE_MOUSE_SETTINGS) {
+        if (!status.gyro_ready) return;
         app_ui_gyro_calibration_open(page->ui->screen, &page->calibration);
+    } else if (page->view == REMOTE_MOUSE_SETTINGS && action >= ACTION_MOUSE_SLOWER && action <= ACTION_MOUSE_FASTER) {
+        unsigned percent = APP_PC_MOUSE_DEFAULT;
+        if (action == ACTION_MOUSE_SLOWER)
+            percent = LV_MAX(APP_PC_MOUSE_MIN, (int)status.sensitivity - APP_PC_MOUSE_STEP);
+        else if (action == ACTION_MOUSE_FASTER)
+            percent = LV_MIN(APP_PC_MOUSE_MAX, (int)status.sensitivity + APP_PC_MOUSE_STEP);
+        show_result(page, app_pc_remote_set_sensitivity(percent), NULL);
     } else if (action == ACTION_RECENTER && page->view == REMOTE_MOUSE) {
         if (require_link(page, ready)) {
             if (status.gyro_ready) {
@@ -669,6 +707,7 @@ static void page_suspend(app_ui_t *ui, bool suspended)
 static void open_page(app_ui_t *ui, remote_view_t view, const char *title)
 {
     lv_obj_t *content = app_ui_begin_page(ui, title);
+    if (view == REMOTE_MOUSE_SETTINGS) ui->page_back = app_open_pc_remote;
     remote_page_t *page = calloc(1, sizeof(*page));
     if (!page) { label(content, "内存不足", 0, REMOTE_WIDTH, 24, 0xFFAAAA); return; }
     page->ui = ui;
@@ -688,13 +727,14 @@ static void open_page(app_ui_t *ui, remote_view_t view, const char *title)
     lv_obj_set_x(page->hint, 34);
     page->toggle = button(page, content, "开启键鼠", 280, 2, 122, 44, ACTION_ENABLE);
     if (view == REMOTE_OBS) build_obs(page, content);
-    else {
+    else if (view == REMOTE_MOUSE) {
         build_mouse(page, content);
         app_pc_remote_set_air_mode(true);
-    }
+    } else build_mouse_settings(page, content);
     app_ui_set_timer(ui, page_timer, 150);
     refresh(page);
 }
 
 void app_open_pc_remote(app_ui_t *ui) { open_page(ui, REMOTE_MOUSE, "空中飞鼠"); }
 void app_open_obs_switcher(app_ui_t *ui) { open_page(ui, REMOTE_OBS, "OBS 切换台"); }
+static void open_mouse_settings(app_ui_t *ui) { open_page(ui, REMOTE_MOUSE_SETTINGS, "飞鼠配置"); }

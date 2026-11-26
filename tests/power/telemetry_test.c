@@ -18,6 +18,7 @@ static atomic_bool pressure_waiting_frame, pressure_allow_fault;
 static atomic_uint pressure_attempts;
 static atomic_bool measurement_requested;
 static atomic_uint measurement_samples, measurement_pauses;
+static atomic_uint background_imu_samples;
 static atomic_int measurement_last_error;
 static atomic_uint measurement_first_ms, measurement_last_ms;
 static atomic_uint measurement_max_gap_ms, timed_rtc_reads;
@@ -30,6 +31,11 @@ static gyro_calibration_record_t stored_bias, pending_bias;
 static float live_bias[3];
 static bool record_exists, commit_fails, auto_bias_enabled = true;
 static unsigned commit_attempts, bias_updates;
+
+static void observe_background(const app_telemetry_snapshot_t *sample)
+{
+    if (sample && sample->imu_error == ESP_OK) atomic_fetch_add(&background_imu_samples, 1);
+}
 static int64_t monotonic_us(void)
 { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * INT64_C(1000000) + ts.tv_nsec / 1000; }
 int64_t esp_timer_get_time(void) { return fixture_ms ? INT64_C(1000) * fixture_ms : monotonic_us(); }
@@ -374,7 +380,7 @@ int main(void)
     assert(median_pressure((float[]){100001,109000,100000}) == 100001);
     assert(median_pressure((float[]){100001,96000,100000}) == 100000);
     assert(median_pressure((float[]){100001,100001,100001}) == 100001);
-    aether_board_t board = {.imu_ready = true, .imu = (void *)1, .barometer_ready = true,
+    aether_board_t board = {.imu_ready = true, .imu = (void *)1, .barometer_ready = true, .barometer = (void *)1,
                             .rtc_ready = true, .display_io=(void *)1};
     app_telemetry_set_imu_measurement(request_measurement, consume_measurement);
     assert(app_telemetry_start(&board) == ESP_OK);
@@ -399,6 +405,33 @@ int main(void)
     assert(fast_reads >= 8 && fast_reads <= 14 && atomic_load(&baro_reads) == b);
     app_telemetry_get(&snap); assert(snap.imu_error == ESP_OK && snap.barometer_error == ESP_ERR_NOT_FINISHED);
     puts("PASS active IMU samples at 20ms cadence, uninterested sensors remain idle and resume invalidates old samples");
+
+    atomic_store(&no_new_imu_frame, true);
+    app_telemetry_set_consumer(observe_background);
+    app_telemetry_set_interest(APP_TELEMETRY_IMU_GAME);
+    vTaskDelay(50);
+    app_telemetry_get(&snap);
+    assert(snap.imu_error == ESP_ERR_NOT_FINISHED);
+    atomic_store(&no_new_imu_frame, false);
+    vTaskDelay(40);
+    app_telemetry_get(&snap);
+    assert(snap.imu_error == ESP_OK);
+    const unsigned game_reads = atomic_load(&imu_reads);
+    const unsigned callbacks = atomic_load(&background_imu_samples);
+    vTaskDelay(240);
+    const unsigned game_count = atomic_load(&imu_reads) - game_reads;
+    assert(game_count >= 17 && game_count <= 27 && atomic_load(&measurement_samples) == 0);
+    assert(atomic_load(&background_imu_samples) > callbacks);
+    app_telemetry_set_screen_suspended(true);
+    vTaskDelay(50);
+    const unsigned suspended_game_reads = atomic_load(&imu_reads);
+    vTaskDelay(70);
+    assert(atomic_load(&imu_reads) == suspended_game_reads);
+    app_telemetry_set_screen_suspended(false);
+    vTaskDelay(150);
+    assert(atomic_load(&imu_reads) > suspended_game_reads);
+    app_telemetry_set_consumer(NULL);
+    puts("PASS game IMU 10ms cadence, fresh frames on entry, background consumer and standby sampling gate");
 
     /* Measure real worker cadence between fresh timestamped samples rather
      * than guessing how many callbacks are delivered during a wall delay. */

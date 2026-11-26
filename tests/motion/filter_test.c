@@ -97,11 +97,18 @@ int main(void) {
     assert(fabsf(roll) < .01f && fabsf(pitch) < .01f);
     assert(app_motion_level_angles((float[3]){0, G * .7071068f, G * .7071068f}, reference, &roll, &pitch));
     assert(fabsf(roll - 15.0f) < .01f && fabsf(pitch) < .01f);
-    assert(!app_motion_level_reference((float[3]){0, 0, -G}, reference));
+    assert(!app_motion_level_reference((float[3]){0, 0, 0}, reference));
     assert(!app_motion_level_angles((float[3]){0, 0, -G}, reference, &roll, &pitch));
     assert(app_motion_level_angles((float[3]){0, 0, G}, reference, &roll, &pitch));
     assert(fabsf(roll + 30.0f) < .01f && fabsf(pitch) < .01f);
     assert(!app_motion_level_angles((float[3]){0, -G * .9848078f, G * .1736482f}, reference, &roll, &pitch));
+    app_motion_filter_init(&f);
+    const float vertical[3] = {-G, 0, 0};
+    const float moving_gyro[3] = {2, 3, 4};
+    assert(app_motion_filter_zero_at(&f, vertical, 23) && f.initialized);
+    assert(!app_motion_filter_update(&f, vertical, moving_gyro, 23));
+    assert(!app_motion_filter_zero_at(&f, vertical, 22));
+    assert(fabsf(f.roll) < .01f && fabsf(f.pitch) < .01f);
     puts("PASS gravity zero: tilted reference, signed relative angles, preserved zero on rejected input, and reference-relative inversion");
     return 0;
 }

@@ -5,6 +5,7 @@
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL -1
+#define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_TIMEOUT 0x107
 #define CONFIG_ESP_LCD_TOUCH_MAX_POINTS 2
 #define GPIO_NUM_NC -1
@@ -17,11 +18,13 @@ typedef int esp_err_t;
 #define pdTRUE 1
 #define pdPASS 1
 #define portMAX_DELAY UINT32_MAX
+#define pdMS_TO_TICKS(ms) (ms)
 typedef int BaseType_t;
 typedef uint32_t TickType_t;
 typedef void *TaskHandle_t;
 BaseType_t xTaskCreate(void (*)(void *), const char *, uint32_t, void *, unsigned, TaskHandle_t *);
 uint32_t ulTaskNotifyTake(BaseType_t, TickType_t);
+void xTaskNotifyGive(TaskHandle_t);
 void vTaskNotifyGiveFromISR(TaskHandle_t, BaseType_t *);
 void test_yield_from_isr(void);
 #define portYIELD_FROM_ISR() test_yield_from_isr()
@@ -38,7 +41,7 @@ struct lv_indev {
     int type;
     bool enabled;
 };
-typedef struct { uint16_t x; uint16_t y; } esp_lcd_touch_point_data_t;
+typedef struct { uint16_t x; uint16_t y; uint8_t track_id; } esp_lcd_touch_point_data_t;
 typedef struct esp_lcd_touch {
     struct { int int_gpio_num; void *user_data; } config;
 } *esp_lcd_touch_handle_t;

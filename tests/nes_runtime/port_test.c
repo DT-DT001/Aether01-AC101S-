@@ -240,6 +240,31 @@ static void test_external_controls_and_touch_exit(void)
     card_inserted=false;clock_us=1000;osd_getinput();assert(quit_calls==1&&touch_reads==1);
 }
 
+static esp_err_t shared_touch_probe(void *context, esp_lcd_touch_point_data_t *points,
+                                   uint8_t *count, uint8_t capacity)
+{
+    assert(context && points && count && capacity);
+    ++*(unsigned *)context;
+    *count = 0;
+    return ESP_OK;
+}
+
+static void test_shared_touch_reader(void)
+{
+    reset();
+    unsigned reads = 0;
+    handle.touch_reader = shared_touch_probe;
+    handle.touch_reader_context = &reads;
+    poll_at(0, 0, 0, false);
+    assert(reads == 1 && !touch_reads);
+    assert(aether_nes_set_screen_paused(&handle, true) == ESP_OK);
+    poll_at(125000, 20, 20, true);
+    assert(reads == 1 && !touch_reads);
+    assert(aether_nes_set_screen_paused(&handle, false) == ESP_OK);
+    poll_at(250000, 0, 0, false);
+    assert(reads == 2 && !touch_reads && !quit_calls);
+}
+
 static unsigned timer_creates,timer_deletes,ticks;
 static bool timer_live,timer_running;
 static esp_err_t timer_stop_error,timer_delete_error;
@@ -337,6 +362,7 @@ int main(void)
 {
     test_audio_and_measurement();test_stage_measurement();test_blit_has_no_audio_clock();
     test_external_controls_and_touch_exit();test_timer_cleanup();test_remote_pause_owner();
+    test_shared_touch_reader();
     reset();assert(osd_storage_available());card_inserted=false;assert(!osd_storage_available());
     osd_persistence_error("old save retained");osd_persistence_error("later error");
     assert(handle.persistence_error==ESP_FAIL&&handle.last_error==ESP_FAIL&&!strcmp(handle.detail,"old save retained"));

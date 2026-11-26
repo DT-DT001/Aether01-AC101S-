@@ -89,7 +89,7 @@ idf_component_register(
          "assets/font_24.c"
          ${AETHER_ICON_SOURCES}
     INCLUDE_DIRS "." "ui"
-    EMBED_FILES "assets/boot_logo.rgb565"
+    EMBED_FILES "assets/boot_logo.rgb565.zlib"
     REQUIRES aether_media_fs aether_usb_storage aether_usb_audio aether_board aether_storage aether_usb_msc aether_usb_host aether_audio_player aether_recorder
              aether_video_player aether_bluetooth aether_wifi aether_intercom_radio aether_intercom_audio aether_nes co5300_display
              aether_usb_camera aether_camera_record aether_image esp_driver_jpeg
@@ -103,12 +103,13 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION AND CONFIG_IDF_TARGET_ESP32S31)
     # size for setup, configuration and other non-realtime page handlers.
     set_property(SOURCE
         app_io.c app_power.c app_tools.c app_utilities.c app_weather_data.c
-        app_gps.c app_otg.c app_audio_system.c app_pc_remote.c
+        app_gps.c app_otg.c app_audio_system.c app_pc_remote.c app_arcade.c
         apps/app_system.c apps/app_utilities.c apps/app_controls.c
         apps/app_sensors.c apps/app_motion.c apps/app_displacement.c apps/app_gps.c
         apps/app_usb.c apps/app_bluetooth.c apps/app_pc_remote.c apps/app_wifi.c
         apps/app_recorder.c apps/app_intercom.c ui/app_home.c apps/app_files.c
-        app_wallpaper_store.c app_media_image.c apps/app_calculator.c apps/app_calc_modes.c
+        app_wallpaper_store.c app_media_image.c apps/app_gallery.c apps/app_game.c
+        apps/app_calculator.c apps/app_calc_modes.c
         apps/app_clock_tools.c apps/app_theme.c
         APPEND PROPERTY COMPILE_OPTIONS -Os)
 endif()

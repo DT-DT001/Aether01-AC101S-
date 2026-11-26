@@ -14,6 +14,7 @@ typedef struct {
     aether_recorder_handle_t recorder;
     uint32_t generation;
     bool pending, stopping, gated;
+    bool denoise_enabled, denoise_supported;
     uint8_t input_options;
     esp_err_t command_error;
     uint8_t peaks[WAVE_SAMPLES], wave_next, wave_count;
@@ -21,7 +22,7 @@ typedef struct {
     lv_obj_t *state, *time, *level, *waveform, *message;
     lv_obj_t *start, *pause, *pause_label, *stop, *replay, *browse;
     lv_obj_t *record_dot, *record_label;
-    lv_obj_t *input;
+    lv_obj_t *input, *denoise, *denoise_label;
 } recorder_page_t;
 
 static void update_page(recorder_page_t *page);
@@ -60,7 +61,9 @@ static void prepared(app_ui_t *ui, const app_io_result_t *result)
         result->generation != page->generation) return;
     page->pending = false;
     page->command_error = result->error;
-    if (result->error == ESP_OK) page->command_error = aether_recorder_start(page->recorder);
+    if (result->error == ESP_OK)
+        page->command_error = aether_recorder_start_mode(page->recorder, page->denoise_enabled ?
+            AETHER_RECORDER_VOICE_DENOISE : AETHER_RECORDER_ORIGINAL);
     update_page(page);
 }
 
@@ -137,6 +140,17 @@ static void input_event(lv_event_t *event)
     update_page(page);
 }
 
+static void denoise_event(lv_event_t *event)
+{
+    recorder_page_t *page = event_page(event);
+    aether_recorder_status_t status;
+    if (!page || !page->denoise_supported || page->pending || page->stopping || !page->recorder ||
+        aether_recorder_get_status(page->recorder, &status) != ESP_OK || status.active) return;
+    page->denoise_enabled = !page->denoise_enabled;
+    page->command_error = ESP_OK;
+    update_page(page);
+}
+
 static void draw_waveform(lv_event_t *event)
 {
     const recorder_page_t *page = lv_event_get_user_data(event);
@@ -203,6 +217,12 @@ static void update_page(recorder_page_t *page)
         (audio.input != APP_AUDIO_INPUT_USB || audio.usb_capture_connected);
     const bool can_start = ready && mounted && !busy && input_ready;
     enabled(page->input, audio.ready && !busy);
+    enabled(page->denoise, ready && page->denoise_supported && !busy);
+    const bool denoise_active = busy ? status.mode == AETHER_RECORDER_VOICE_DENOISE :
+                                        page->denoise_enabled;
+    app_ui_label_text(page->denoise_label, denoise_active ? "AI降噪开" : "AI降噪关");
+    if (denoise_active) lv_obj_add_state(page->denoise, LV_STATE_CHECKED);
+    else lv_obj_remove_state(page->denoise, LV_STATE_CHECKED);
     enabled(page->start, can_start);
     enabled(page->pause, ready && !page->pending && !page->stopping &&
         (status.state == AETHER_RECORDER_RECORDING || status.state == AETHER_RECORDER_PAUSED));
@@ -255,6 +275,9 @@ static void update_page(recorder_page_t *page)
     else if (!input_ready) app_ui_label_text(page->message, "正在切换录音输入，请稍候…");
     else if (page->stopping || status.state == AETHER_RECORDER_SAVING)
         app_ui_label_text(page->message, "正在写入 WAV 文件头，请稍候…");
+    else if (status.denoise_fallback)
+        app_ui_label_text(page->message, status.state == AETHER_RECORDER_FINISHED ?
+            "降噪不可用，已保存原声" : "降噪不可用，正在录制原声");
     else if (status.state == AETHER_RECORDER_FINISHED && status.path[0]) {
         const char *name = strrchr(status.path, '/');
         app_ui_label_text(page->message, name ? name + 1 : status.path);
@@ -336,13 +359,19 @@ void app_open_recorder(app_ui_t *ui)
     page->ui = ui;
     page->generation = ui->page_generation;
     page->recorder = aether_recorder_get_default();
+    page->denoise_supported = aether_recorder_denoise_supported();
     ui->page_context = page;
     ui->page_cleanup = recorder_cleanup;
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(content, lv_color_hex(0x181820), 0);
     page->state = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 12, 9, 0xEAE4EA, NULL);
-    lv_obj_set_size(page->state, 174, 22);
+    lv_obj_set_size(page->state, 104, 22);
     lv_label_set_long_mode(page->state, LV_LABEL_LONG_DOT);
+    page->denoise = button(page, "AI降噪关", 121, 1, 78, 0x2D2B34, denoise_event);
+    lv_obj_set_height(page->denoise, 33);
+    lv_obj_set_style_radius(page->denoise, 10, 0);
+    lv_obj_set_style_bg_color(page->denoise, lv_color_hex(0x4D466A), LV_STATE_CHECKED);
+    page->denoise_label = lv_obj_get_child(page->denoise, 0);
     page->input = lv_dropdown_create(content);
     lv_obj_set_pos(page->input, 207, 1);
     lv_obj_set_size(page->input, 189, 33);

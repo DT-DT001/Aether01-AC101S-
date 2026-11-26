@@ -9,10 +9,11 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 
-typedef enum { GAME_TILES, GAME_CRATES, GAME_SNAKE, GAME_JUMP, GAME_COUNT } game_kind_t;
+typedef enum { GAME_TILES, GAME_CRATES, GAME_SNAKE, GAME_JUMP, GAME_DICE, GAME_FALL, GAME_COUNT } game_kind_t;
+typedef enum { FALL_LEFT, FALL_RIGHT, FALL_ROTATE, FALL_SOFT, FALL_DROP, FALL_PAUSE, FALL_CONTROLS } fall_control_t;
 
 static const char *const game_titles[GAME_COUNT] = {
-    "2048", "推箱子", "贪吃蛇", "跳一跳",
+    "2048", "推箱子", "贪吃蛇", "跳一跳", "摇骰子", "落块挑战",
 };
 
 static app_tools_arcade_preferences_t game_preferences(void)
@@ -26,6 +27,15 @@ static app_tools_arcade_preferences_t game_preferences(void)
 }
 
 typedef struct {
+    uint32_t random;
+    uint32_t start_ms;
+    uint32_t imu_stamp;
+    uint8_t faces[3];
+    uint8_t count, frame, motion_samples;
+    bool rolling, shake, armed;
+} dice_game_t;
+
+typedef struct {
     app_ui_t *ui;
     game_kind_t kind;
     union {
@@ -33,6 +43,8 @@ typedef struct {
         arcade_crates_t crates;
         arcade_snake_t snake;
         arcade_jump_t jump;
+        dice_game_t dice;
+        arcade_fall_t fall;
     } model;
     lv_obj_t *board;
     lv_obj_t *touch_surface;
@@ -56,21 +68,26 @@ typedef struct {
     lv_obj_t *aim;
     lv_obj_t *aim_target;
     lv_obj_t *power_fill;
+    lv_obj_t *fall_controls[FALL_CONTROLS];
     lv_indev_t *jump_input;
     lv_indev_t *swipe_input;
     lv_point_t swipe_origin;
     arcade_tilt_t tilt;
+    arcade_accel_t acceleration;
     app_motion_filter_t attitude;
     uint32_t snake_due_ms;
+    uint32_t fall_due_ms;
     uint32_t sleep_ms;
     uint8_t displayed_exponents[16];
     uint8_t level;
     uint8_t neutral_samples;
     int8_t sensor_status;
     bool tilt_enabled;
+    bool accel_enabled;
     bool neutral_set;
     bool snake_start_requested;
     bool snake_started;
+    bool fall_started;
     bool paused;
     bool sleeping;
 } game_page_t;
@@ -92,8 +109,16 @@ enum {
     JUMP_FLOOR_Y = 211,
     JUMP_POWER_WIDTH = 376,
     TILT_POLL_MS = 10,
+    TILES_ACCEL_POLL_MS = 6,
     TILE_SWIPE_DISTANCE = 30,
     SNAKE_START_GRACE_MS = 500,
+    DICE_POLL_MS = 50,
+    DICE_ROLL_MS = 650,
+    FALL_POLL_MS = 32,
+    FALL_SIDE = 17,
+    FALL_PAD = 4,
+    FALL_CARD_X = 196,
+    FALL_CARD_WIDTH = 202,
 };
 
 static void open_game(app_ui_t *ui, game_kind_t kind);
@@ -187,10 +212,11 @@ static void tiles_render_status(game_page_t *page)
     const arcade_tiles_t *game = &page->model.tiles;
     const char *hint = "滑动棋盘";
     if (game->over) hint = "无可用移动  ·  点击重开";
-    else if (page->tilt_enabled && page->sensor_status < 0) hint = "传感器暂不可用 · 可切回滑动";
-    else if (page->tilt_enabled && !page->neutral_set) hint = "请拿稳设备";
+    else if (page->accel_enabled && page->sensor_status < 0) hint = "传感器暂不可用 · 可切回滑动";
+    else if (page->accel_enabled && !page->acceleration.ready) hint = "请拿稳设备";
+    else if (page->accel_enabled && !page->acceleration.armed) hint = "停稳后继续";
     else if (game->won) hint = "达到 2048";
-    else if (page->tilt_enabled) hint = "轻倾移块，回正后再倾";
+    else if (page->accel_enabled) hint = "沿屏幕方向轻推";
     app_ui_label_text(page->hint, hint);
 }
 
@@ -416,6 +442,242 @@ static void jump_render(game_page_t *page, uint32_t now, bool scene_changed)
 
 static void game_timer(lv_timer_t *timer);
 
+static void die_draw(lv_layer_t *layer, int x, int y, int size, int height, unsigned value)
+{
+    static const uint16_t pips[] = {0x010, 0x044, 0x054, 0x145, 0x155, 0x16D};
+    const int radius = size / 6;
+    const int dot = size / 8;
+    draw_rect(layer, x + 3, y + 8, size, height, radius, 0x132E44);
+    draw_rect(layer, x, y + 3, size, height, radius, 0x8AA8C6);
+    draw_rect(layer, x, y, size, height - 2, radius, 0xE8F1FF);
+    draw_rect(layer, x + radius, y + 3, size - 2 * radius, 2, 1, 0xFFFFFF);
+    for (unsigned dots = pips[value - 1U]; dots; dots &= dots - 1U) {
+        const unsigned i = __builtin_ctz(dots);
+        const int px = x + size * (24 + (int)(i % 3U) * 26) / 100 - dot / 2;
+        const int py = y + height * (24 + (int)(i / 3U) * 26) / 100 - dot / 2;
+        draw_rect(layer, px, py, dot, dot, LV_RADIUS_CIRCLE, value == 1 ? 0xDF5179 : 0x1F4766);
+    }
+}
+
+static void dice_draw(lv_event_t *event)
+{
+    const game_page_t *page = lv_event_get_user_data(event);
+    const dice_game_t *dice = &page->model.dice;
+    lv_area_t area;
+    lv_obj_get_coords(page->board, &area);
+    lv_layer_t *layer = lv_event_get_layer(event);
+    const int size = dice->count == 1 ? 134 : 102;
+    const int total = size * dice->count + 14 * (dice->count - 1);
+    const int left = area.x1 + (lv_area_get_width(&area) - total) / 2;
+    const int center_y = area.y1 + lv_area_get_height(&area) / 2;
+    static const int8_t bounce[] = {0, -16, -30, -38, -36, -27, -14, 0, -12, -17, -11, -4, 0};
+    for (unsigned i = 0; i < dice->count; ++i) {
+        const int step = dice->rolling ? bounce[dice->frame] : 0;
+        const int height = size + step / 2;
+        const int offset_x = dice->rolling && (dice->frame & 1U) ? (i & 1U ? -3 : 3) : 0;
+        die_draw(layer, left + (int)i * (size + 14) + offset_x, center_y - height / 2 + step,
+                 size, height, dice->faces[i]);
+    }
+}
+
+static void dice_update_score(game_page_t *page)
+{
+    const dice_game_t *dice = &page->model.dice;
+    unsigned total = 0;
+    for (unsigned i = 0; i < dice->count; ++i) total += dice->faces[i];
+    app_ui_label_fmt(page->score, "总点数  %u", total);
+}
+
+static void dice_start(game_page_t *page, uint32_t now)
+{
+    dice_game_t *dice = &page->model.dice;
+    if (dice->rolling || page->sleeping || app_power_is_sleeping(page->ui->power)) return;
+    dice->start_ms = now;
+    dice->frame = 0;
+    dice->rolling = true;
+    dice->motion_samples = 0;
+    dice->armed = false;
+    app_ui_label_text(page->score, "摇动中");
+    set_enabled(page->start_button, false);
+    set_enabled(page->undo, false);
+    app_ui_set_timer(page->ui, game_timer, DICE_POLL_MS);
+}
+
+static void dice_tick(game_page_t *page, uint32_t now)
+{
+    dice_game_t *dice = &page->model.dice;
+    if (dice->rolling) {
+        const uint32_t elapsed = now - dice->start_ms;
+        dice->frame = elapsed < DICE_ROLL_MS ? elapsed / DICE_POLL_MS : 0;
+        for (unsigned i = 0; i < dice->count; ++i) dice->faces[i] = arcade_roll_die(&dice->random);
+        if (elapsed >= DICE_ROLL_MS) {
+            dice->rolling = false;
+            dice_update_score(page);
+            set_enabled(page->start_button, true);
+            set_enabled(page->undo, true);
+            if (!dice->shake) app_ui_clear_timer(page->ui);
+        }
+        lv_obj_invalidate(page->board);
+        return;
+    }
+    if (!dice->shake) return;
+    app_telemetry_snapshot_t sample;
+    app_telemetry_get(&sample);
+    if (sample.imu_error != ESP_OK || now_ms() - sample.imu_updated_ms >= 150U) {
+        dice->motion_samples = 0;
+        dice->armed = false;
+        return;
+    }
+    if (sample.imu_updated_ms == dice->imu_stamp) return;
+    dice->imu_stamp = sample.imu_updated_ms;
+    const float *a = sample.imu.accel_mps2;
+    const float energy = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+    if (energy > 70.0f && energy < 145.0f) dice->armed = true;
+    if (!dice->armed || energy < 280.0f || !isfinite(energy)) {
+        dice->motion_samples = 0;
+    } else if (++dice->motion_samples >= 2) {
+        dice_start(page, now);
+    }
+}
+
+static void dice_roll_click(lv_event_t *event)
+{
+    dice_start(lv_event_get_user_data(event), now_ms());
+}
+
+static void dice_count_click(lv_event_t *event)
+{
+    game_page_t *page = lv_event_get_user_data(event);
+    dice_game_t *dice = &page->model.dice;
+    if (dice->rolling) return;
+    dice->count = dice->count % 3U + 1U;
+    app_ui_label_fmt(lv_obj_get_child(page->undo, 0), "%u 枚", (unsigned)dice->count);
+    dice_update_score(page);
+    lv_obj_invalidate(page->board);
+}
+
+static void dice_shake_click(lv_event_t *event)
+{
+    game_page_t *page = lv_event_get_user_data(event);
+    dice_game_t *dice = &page->model.dice;
+    dice->shake = !dice->shake;
+    dice->armed = false;
+    dice->motion_samples = 0;
+    app_ui_label_text(page->mode_label, dice->shake ? "感应开" : "感应关");
+    app_ui_label_text(page->hint, dice->shake ? "摇动设备或点击骰子" : "点击骰子或掷骰");
+    app_telemetry_set_interest(dice->shake ? APP_TELEMETRY_IMU : 0);
+    if (dice->shake || dice->rolling) app_ui_set_timer(page->ui, game_timer, DICE_POLL_MS);
+    else app_ui_clear_timer(page->ui);
+}
+
+static const uint32_t fall_colors[ARCADE_FALL_PIECES] = {
+    0x66D5EB, 0xF3CE76, 0xAE9BFB, 0x8BDAA5, 0xEE879C, 0x87AFF7, 0xF2A678,
+};
+
+static void fall_piece_draw(lv_layer_t *layer, int x, int y, int side,
+                            unsigned shape, unsigned piece, int min_row, bool ghost)
+{
+    const uint32_t color = fall_colors[piece];
+    for (; shape; shape &= shape - 1U) {
+        const unsigned bit = __builtin_ctz(shape);
+        const int cell_x = x + (int)(bit % 4U) * side, cell_y = y + (int)(bit / 4U) * side;
+        if (cell_y < min_row) continue;
+        draw_rect(layer, cell_x + 1, cell_y + 1, side - 2, side - 2, 3,
+                  ghost ? 0x31516B : color);
+        if (ghost) draw_rect(layer, cell_x + 3, cell_y + 3, side - 6, side - 6, 2, BOARD_INK);
+    }
+}
+
+static void fall_draw(lv_event_t *event)
+{
+    const game_page_t *page = lv_event_get_user_data(event);
+    const arcade_fall_t *fall = &page->model.fall;
+    lv_area_t area;
+    lv_obj_get_coords(page->board, &area);
+    lv_layer_t *layer = lv_event_get_layer(event);
+    const int x = area.x1 + FALL_PAD, y = area.y1 + FALL_PAD;
+    for (int i = 1; i < ARCADE_FALL_COLUMNS; ++i)
+        draw_rect(layer, x + i * FALL_SIDE, y, 1, FALL_SIDE * ARCADE_FALL_ROWS, 0, 0x182940);
+    for (int i = 1; i < ARCADE_FALL_ROWS; ++i)
+        draw_rect(layer, x, y + i * FALL_SIDE, FALL_SIDE * ARCADE_FALL_COLUMNS, 1, 0, 0x182940);
+    for (int row = 0; row < ARCADE_FALL_ROWS; ++row) {
+        for (int col = 0; col < ARCADE_FALL_COLUMNS; ++col) {
+            const unsigned cell = fall->cells[row][col];
+            if (cell) fall_piece_draw(layer, x + col * FALL_SIDE, y + row * FALL_SIDE,
+                                      FALL_SIDE, 1, cell - 1U, y, false);
+        }
+    }
+    if (fall->over) return;
+    const unsigned shape = arcade_fall_shape(fall->piece, fall->rotation);
+    const int landing = arcade_fall_landing(fall);
+    if (landing > fall->y) fall_piece_draw(layer, x + fall->x * FALL_SIDE, y + landing * FALL_SIDE,
+                                           FALL_SIDE, shape, fall->piece, y, true);
+    fall_piece_draw(layer, x + fall->x * FALL_SIDE, y + fall->y * FALL_SIDE,
+                    FALL_SIDE, shape, fall->piece, y, false);
+}
+
+static void fall_next_draw(lv_event_t *event)
+{
+    const game_page_t *page = lv_event_get_user_data(event);
+    const unsigned piece = page->model.fall.next;
+    lv_area_t area;
+    lv_obj_get_coords(lv_event_get_target_obj(event), &area);
+    fall_piece_draw(lv_event_get_layer(event), area.x1 + (piece < 2 ? 1 : 8), area.y1 + 2,
+                    14, arcade_fall_shape(piece, 0), piece, area.y1, false);
+}
+
+static void fall_render(game_page_t *page)
+{
+    const arcade_fall_t *fall = &page->model.fall;
+    app_ui_label_fmt(page->score, "得分  %lu", (unsigned long)fall->score);
+    app_ui_label_fmt(page->hint, "%lu 行  ·  Lv.%u", (unsigned long)fall->lines, arcade_fall_level(fall));
+    const bool running = page->fall_started && !page->paused && !fall->over;
+    set_visible(page->start_overlay, !running);
+    for (unsigned i = 0; i < FALL_CONTROLS; ++i)
+        set_enabled(page->fall_controls[i], running);
+    app_ui_label_text(page->start_label, fall->over ? "再玩一次" : page->paused ? "继续" : "开始");
+    app_ui_label_text(page->start_note, fall->over ? "游戏结束" : page->paused ? "已暂停" : "移动方块填满整行");
+    lv_obj_invalidate(page->board);
+    lv_obj_invalidate(page->next_level);
+}
+
+static void fall_start_click(lv_event_t *event)
+{
+    game_page_t *page = lv_event_get_user_data(event);
+    if (page->sleeping || app_power_is_sleeping(page->ui->power)) return;
+    if (page->model.fall.over) arcade_fall_init(&page->model.fall, esp_random());
+    page->fall_started = true;
+    page->paused = false;
+    page->fall_due_ms = now_ms() + arcade_fall_interval(&page->model.fall);
+    app_ui_set_timer(page->ui, game_timer, FALL_POLL_MS);
+    fall_render(page);
+}
+
+static void fall_control_click(lv_event_t *event)
+{
+    game_page_t *page = lv_event_get_user_data(event);
+    arcade_fall_t *fall = &page->model.fall;
+    if (!page->fall_started || page->paused || fall->over || page->sleeping ||
+        app_power_is_sleeping(page->ui->power)) return;
+    lv_obj_t *control = lv_event_get_target_obj(event);
+    if (control == page->fall_controls[FALL_PAUSE]) {
+        page->paused = true;
+        app_ui_clear_timer(page->ui);
+    } else if (control == page->fall_controls[FALL_DROP]) {
+        arcade_fall_drop(fall);
+        page->fall_due_ms = now_ms() + arcade_fall_interval(fall);
+        if (fall->over) app_ui_clear_timer(page->ui);
+    } else if (control == page->fall_controls[FALL_ROTATE]) {
+        if (!arcade_fall_rotate(fall)) return;
+    } else if (control == page->fall_controls[FALL_SOFT]) {
+        if (!arcade_fall_move(fall, 0, 1)) return;
+        page->fall_due_ms = now_ms() + arcade_fall_interval(fall);
+    } else if (!arcade_fall_move(fall, control == page->fall_controls[FALL_LEFT] ? -1 : 1, 0)) {
+        return;
+    }
+    fall_render(page);
+}
+
 static void jump_pointer(lv_event_t *event)
 {
     game_page_t *page = lv_event_get_user_data(event);
@@ -452,14 +714,23 @@ static void jump_pointer(lv_event_t *event)
 static void set_tilt(game_page_t *page, bool enabled)
 {
     page->tilt_enabled = enabled;
-    page->swipe_input = NULL;
     page->neutral_set = false;
     page->neutral_samples = 0;
     page->sensor_status = 0;
     page->tilt = (arcade_tilt_t){0};
     app_motion_filter_init(&page->attitude);
-    const bool over = page->kind == GAME_TILES ? page->model.tiles.over : page->model.snake.over;
-    app_telemetry_set_interest(enabled && !over ? APP_TELEMETRY_IMU : 0);
+    app_telemetry_set_interest(enabled && !page->model.snake.over ? APP_TELEMETRY_IMU : 0);
+}
+
+static void reset_tiles_sensor(game_page_t *page)
+{
+    page->acceleration = (arcade_accel_t){0};
+    page->swipe_input = NULL;
+    page->sensor_status = 0;
+    const bool active = page->accel_enabled && !page->model.tiles.over && !page->sleeping;
+    app_telemetry_set_interest(active ? APP_TELEMETRY_IMU_GAME : 0);
+    if (active) app_ui_set_timer(page->ui, game_timer, TILES_ACCEL_POLL_MS);
+    else app_ui_clear_timer(page->ui);
 }
 
 static void snake_start_when_ready(game_page_t *page, uint32_t now)
@@ -499,7 +770,7 @@ static void tiles_pointer(lv_event_t *event)
     game_page_t *page = lv_event_get_user_data(event);
     lv_indev_t *input = lv_event_get_param(event);
     const lv_event_code_t code = lv_event_get_code(event);
-    const bool enabled = !page->tilt_enabled && !page->model.tiles.over &&
+    const bool enabled = !page->accel_enabled && !page->model.tiles.over &&
                          !page->sleeping && !app_power_is_sleeping(page->ui->power);
     if (code == LV_EVENT_PRESSED) {
         if (!enabled || !input || lv_indev_get_type(input) != LV_INDEV_TYPE_POINTER) return;
@@ -532,15 +803,12 @@ static void tilt_sensor_wait(game_page_t *page, int8_t status)
     page->tilt = (arcade_tilt_t){0};
     app_motion_filter_init(&page->attitude);
     page->sensor_status = status;
-    if (page->kind == GAME_TILES) tiles_render_status(page);
-    else snake_render_status(page);
+    snake_render_status(page);
 }
 
 static void tilt_tick(game_page_t *page, uint32_t now)
 {
-    if (!page->tilt_enabled) return;
-    if (page->kind == GAME_SNAKE && page->model.snake.over) return;
-    if (page->paused) return;
+    if (!page->tilt_enabled || page->model.snake.over || page->paused) return;
     app_telemetry_snapshot_t sample;
     app_telemetry_get(&sample);
     const uint32_t age_ms = now_ms() - sample.imu_updated_ms;
@@ -558,10 +826,7 @@ static void tilt_tick(game_page_t *page, uint32_t now)
     }
     const bool recovered = page->sensor_status != status;
     page->sensor_status = status;
-    if (recovered) {
-        if (page->kind == GAME_TILES) tiles_render_status(page);
-        else snake_render_status(page);
-    }
+    if (recovered) snake_render_status(page);
     if (!page->neutral_set) {
         if (page->attitude.rotation > 18 || fabsf(page->attitude.acceleration - 9.81f) > 1.8f) {
             page->neutral_samples = 0;
@@ -570,28 +835,47 @@ static void tilt_tick(game_page_t *page, uint32_t now)
         if (++page->neutral_samples < 3) return;
         app_motion_filter_zero(&page->attitude);
         page->neutral_set = true;
-        if (page->kind == GAME_TILES) {
-            tiles_render_status(page);
-        } else {
-            if (page->snake_started) page->snake_due_ms = now + arcade_snake_interval(&page->model.snake);
-            snake_start_when_ready(page, now);
-            snake_render_status(page);
-        }
+        if (page->snake_started) page->snake_due_ms = now + arcade_snake_interval(&page->model.snake);
+        snake_start_when_ready(page, now);
+        snake_render_status(page);
     }
-    const bool tiles = page->kind == GAME_TILES;
-    if (!tiles && !page->snake_started) return;
+    if (!page->snake_started) return;
     const arcade_direction_t previous_tilt = page->tilt.held;
     /* In the AC101S screen orientation, positive pitch points to the right. */
-    const arcade_direction_t direction = arcade_tilt_update(&page->tilt,
-                                         page->attitude.pitch, page->attitude.roll, tiles);
+    const arcade_direction_t direction = arcade_tilt_update(&page->tilt, page->attitude.pitch,
+                                                            page->attitude.roll);
     if (move_game(page, direction)) {
         lv_display_trigger_activity(lv_obj_get_display(page->board));
-    } else if (!tiles && direction != ARCADE_NONE &&
+    } else if (direction != ARCADE_NONE &&
                page->model.snake.next != page->model.snake.direction &&
                page->model.snake.next != direction) {
         /* Let a confirmed turn retry once Snake has used its pending turn. */
         page->tilt.held = previous_tilt;
     }
+}
+
+static void tiles_accel_tick(game_page_t *page)
+{
+    app_telemetry_snapshot_t sample;
+    app_telemetry_get(&sample);
+    const uint32_t age_ms = now_ms() - sample.imu_updated_ms;
+    const bool ready = page->acceleration.ready;
+    const bool armed = page->acceleration.armed;
+    const int8_t previous_status = page->sensor_status;
+    arcade_direction_t move = ARCADE_NONE;
+    if (sample.imu_error == ESP_ERR_NOT_FINISHED || sample.gyro_calibrating) {
+        page->sensor_status = 0;
+    } else if (sample.imu_error == ESP_OK && age_ms < 150U &&
+               arcade_accel_update(&page->acceleration, sample.imu.accel_mps2, sample.imu.gyro_dps,
+                                   sample.imu_updated_ms, &move)) {
+        page->sensor_status = 1;
+    } else {
+        page->sensor_status = -1;
+    }
+    if (page->sensor_status <= 0) page->acceleration = (arcade_accel_t){0};
+    if (ready != page->acceleration.ready || armed != page->acceleration.armed || previous_status != page->sensor_status)
+        tiles_render_status(page);
+    if (move_game(page, move)) lv_display_trigger_activity(lv_obj_get_display(page->board));
 }
 
 static void game_suspend(app_ui_t *ui, bool suspended)
@@ -603,19 +887,41 @@ static void game_suspend(app_ui_t *ui, bool suspended)
     if (suspended) {
         page->sleep_ms = now;
         page->swipe_input = NULL;
-        if (page->tilt_enabled) app_telemetry_set_interest(0);
+        if (page->kind == GAME_TILES) reset_tiles_sensor(page);
+        else if (page->tilt_enabled) app_telemetry_set_interest(0);
         if (page->kind == GAME_JUMP) {
             page->jump_input = NULL;
             arcade_jump_cancel(&page->model.jump);
+        } else if (page->kind == GAME_DICE) {
+            app_telemetry_set_interest(0);
+            page->model.dice.armed = false;
+            page->model.dice.motion_samples = 0;
+            app_ui_clear_timer(ui);
+        } else if (page->kind == GAME_FALL) {
+            app_ui_clear_timer(ui);
         }
         return;
     }
     const uint32_t sleep = now - page->sleep_ms;
     if (page->tilt_enabled) set_tilt(page, true);
+    if (page->kind == GAME_TILES) {
+        reset_tiles_sensor(page);
+        tiles_render_status(page);
+    }
     if (page->kind == GAME_SNAKE) page->snake_due_ms += sleep;
     if (page->kind == GAME_JUMP) {
         page->model.jump.phase_ms += sleep;
         jump_render(page, now, true);
+    } else if (page->kind == GAME_DICE) {
+        dice_game_t *dice = &page->model.dice;
+        if (dice->shake) app_telemetry_set_interest(APP_TELEMETRY_IMU);
+        if (dice->rolling || dice->shake) {
+            dice->start_ms += sleep;
+            app_ui_set_timer(ui, game_timer, DICE_POLL_MS);
+        }
+    } else if (page->kind == GAME_FALL && page->fall_started && !page->paused && !page->model.fall.over) {
+        page->fall_due_ms += sleep;
+        app_ui_set_timer(ui, game_timer, FALL_POLL_MS);
     }
 }
 
@@ -636,14 +942,23 @@ static void game_timer(lv_timer_t *timer)
         if (page->model.jump.phase == ARCADE_JUMP_READY || page->model.jump.phase == ARCADE_JUMP_OVER) {
             app_ui_clear_timer(ui);
         }
-    } else {
+    } else if (page->kind == GAME_DICE) {
+        dice_tick(page, now);
+    } else if (page->kind == GAME_FALL) {
+        if ((int32_t)(now - page->fall_due_ms) >= 0) {
+            arcade_fall_step(&page->model.fall);
+            page->fall_due_ms = now + arcade_fall_interval(&page->model.fall);
+            if (page->model.fall.over) app_ui_clear_timer(ui);
+            fall_render(page);
+        }
+    } else if (page->kind == GAME_TILES) {
+        if (page->accel_enabled && !page->model.tiles.over) tiles_accel_tick(page);
+    } else if (page->kind == GAME_SNAKE) {
         tilt_tick(page, now);
-        if (page->kind == GAME_SNAKE) {
-            snake_tick(page, now);
-            if (page->model.snake.over) {
-                app_telemetry_set_interest(0);
-                app_ui_clear_timer(ui);
-            }
+        snake_tick(page, now);
+        if (page->model.snake.over) {
+            app_telemetry_set_interest(0);
+            app_ui_clear_timer(ui);
         }
     }
 }
@@ -722,20 +1037,22 @@ static void crates_next_click(lv_event_t *event)
     crates_render(page);
 }
 
-static void tiles_set_mode(game_page_t *page, bool tilt)
+static void tiles_set_mode(game_page_t *page, bool acceleration)
 {
-    set_tilt(page, tilt);
-    app_ui_label_text(page->mode_label, tilt ? "倾斜" : "滑动");
-    set_visible(page->recenter, tilt);
+    page->accel_enabled = acceleration;
+    reset_tiles_sensor(page);
+    app_ui_label_text(page->mode_label, acceleration ? "加速度" : "滑动");
+    set_visible(page->recenter, acceleration && !page->model.tiles.over);
     tiles_render_status(page);
 }
 
 static void tiles_mode_click(lv_event_t *event)
 {
     game_page_t *page = lv_event_get_user_data(event);
-    tiles_set_mode(page, !page->tilt_enabled);
+    tiles_set_mode(page, !page->accel_enabled);
 #ifndef AETHER_UI_SELFTEST
-    app_tools_set_arcade_tilt(APP_TOOLS_ARCADE_TILES, page->tilt_enabled);
+    /* Retain the existing on-flash bit for the selected 2048 sensor mode. */
+    app_tools_set_arcade_tilt(APP_TOOLS_ARCADE_TILES, page->accel_enabled);
 #endif
 }
 
@@ -791,7 +1108,7 @@ static void snake_start_click(lv_event_t *event)
 static void zero_click(lv_event_t *event)
 {
     game_page_t *page = lv_event_get_user_data(event);
-    if (!page->tilt_enabled || page->model.tiles.over) return;
+    if (!page->accel_enabled || page->model.tiles.over || page->sleeping) return;
     tiles_set_mode(page, true);
 }
 
@@ -801,9 +1118,8 @@ static void restart_click(lv_event_t *event)
     switch (page->kind) {
     case GAME_TILES:
         arcade_tiles_init(&page->model.tiles, esp_random());
-        tiles_set_mode(page, page->tilt_enabled);
+        tiles_set_mode(page, page->accel_enabled);
         tiles_render(page);
-        app_ui_set_timer(page->ui, game_timer, TILT_POLL_MS);
         break;
     case GAME_CRATES:
         arcade_crates_init(&page->model.crates, page->level);
@@ -818,6 +1134,13 @@ static void restart_click(lv_event_t *event)
         arcade_jump_init(&page->model.jump, esp_random());
         jump_render(page, now_ms(), true);
         app_ui_clear_timer(page->ui);
+        break;
+    case GAME_FALL:
+        arcade_fall_init(&page->model.fall, esp_random());
+        page->fall_started = false;
+        page->paused = false;
+        app_ui_clear_timer(page->ui);
+        fall_render(page);
         break;
     default:
         break;
@@ -840,9 +1163,9 @@ static void build_tiles(game_page_t *page)
         page->numbers[i] = app_ui_add_text(page->cells[i], "", LV_ALIGN_CENTER, 0, 0,
                                            0x202744, &lv_font_montserrat_28);
     }
-    lv_obj_t *mode = button(parent, 172, 0, 62, 34, "滑动", app_ui_chinese_font(), tiles_mode_click, page);
+    lv_obj_t *mode = button(parent, 172, 0, 80, 34, "滑动", app_ui_chinese_font(), tiles_mode_click, page);
     page->mode_label = lv_obj_get_child(mode, 0);
-    page->recenter = button(parent, 241, 0, 43, 34, LV_SYMBOL_GPS, &lv_font_montserrat_20, zero_click, page);
+    page->recenter = button(parent, 260, 0, 43, 34, LV_SYMBOL_GPS, &lv_font_montserrat_20, zero_click, page);
     arcade_tiles_init(&page->model.tiles, esp_random());
     tiles_render(page);
     const app_tools_arcade_preferences_t preferences = game_preferences();
@@ -939,12 +1262,82 @@ static void build_jump(game_page_t *page)
     jump_render(page, now_ms(), true);
 }
 
+static void build_dice(game_page_t *page)
+{
+    lv_obj_t *parent = page->ui->content;
+    dice_game_t *dice = &page->model.dice;
+    dice->random = esp_random();
+    dice->count = 1;
+    for (unsigned i = 0; i < sizeof(dice->faces); ++i) dice->faces[i] = arcade_roll_die(&dice->random);
+    page->board = block(parent, 4, 47, 394, 220, 20, 0x23465D);
+    lv_obj_set_style_border_color(page->board, lv_color_hex(0x427290), 0);
+    lv_obj_set_style_border_width(page->board, 2, 0);
+    lv_obj_add_flag(page->board, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(page->board, dice_draw, LV_EVENT_DRAW_MAIN, page);
+    lv_obj_add_event_cb(page->board, dice_roll_click, LV_EVENT_CLICKED, page);
+    page->undo = button(parent, 4, 278, 78, 53, "1 枚", app_ui_chinese_font_size(24), dice_count_click, page);
+    page->start_button = button(parent, 92, 278, 212, 53, "掷骰", app_ui_chinese_font_size(24),
+                                dice_roll_click, page);
+    lv_obj_set_style_bg_color(page->start_button, lv_color_hex(0x275C72), 0);
+    lv_obj_t *shake = button(parent, 314, 278, 84, 53, "感应关", app_ui_chinese_font(), dice_shake_click, page);
+    page->mode_label = lv_obj_get_child(shake, 0);
+    app_ui_label_text(page->hint, "点击骰子或掷骰");
+    dice_update_score(page);
+}
+
+static void build_fall(game_page_t *page)
+{
+    lv_obj_t *parent = page->ui->content;
+    const lv_font_t *font = app_ui_chinese_font();
+    const lv_font_t *symbols = &lv_font_montserrat_20;
+    const int width = ARCADE_FALL_COLUMNS * FALL_SIDE + 2 * FALL_PAD;
+    const int height = ARCADE_FALL_ROWS * FALL_SIDE + 2 * FALL_PAD;
+    page->board = block(parent, 4, 3, width, height, 10, BOARD_INK);
+    lv_obj_add_event_cb(page->board, fall_draw, LV_EVENT_DRAW_MAIN, page);
+    lv_obj_set_pos(page->score, FALL_CARD_X, 5);
+    lv_obj_set_style_text_font(page->score, font, 0);
+    lv_obj_align(page->hint, LV_ALIGN_TOP_LEFT, FALL_CARD_X, 31);
+    lv_obj_t *preview = block(parent, FALL_CARD_X, 55, FALL_CARD_WIDTH, 78, 13, 0x1A2946);
+    app_ui_add_text(preview, "下一块", LV_ALIGN_LEFT_MID, 15, 0, TEXT_MUTED, font);
+    page->next_level = block(preview, 106, 20, 62, 40, 6, 0x101B30);
+    lv_obj_add_event_cb(page->next_level, fall_next_draw, LV_EVENT_DRAW_MAIN, page);
+    page->fall_controls[FALL_LEFT] = button(parent, FALL_CARD_X, 146, 96, 55, LV_SYMBOL_LEFT, symbols,
+                                           fall_control_click, page);
+    page->fall_controls[FALL_RIGHT] = button(parent, 302, 146, 96, 55, LV_SYMBOL_RIGHT, symbols,
+                                            fall_control_click, page);
+    page->fall_controls[FALL_ROTATE] = button(parent, FALL_CARD_X, 209, 96, 55, "旋转", font,
+                                             fall_control_click, page);
+    page->fall_controls[FALL_SOFT] = button(parent, 302, 209, 96, 55, LV_SYMBOL_DOWN, symbols,
+                                           fall_control_click, page);
+    page->fall_controls[FALL_DROP] = button(parent, FALL_CARD_X, 272, 135, 62, "快速落下", font,
+                                           fall_control_click, page);
+    lv_obj_set_style_bg_color(page->fall_controls[FALL_DROP], lv_color_hex(0x3D3B70), 0);
+    page->fall_controls[FALL_PAUSE] = button(parent, 341, 272, 57, 62, LV_SYMBOL_PAUSE, symbols,
+                                            fall_control_click, page);
+    page->start_overlay = block(page->board, 0, 0, 165, 108, 12, 0x203552);
+    lv_obj_center(page->start_overlay);
+    page->start_note = app_ui_add_text(page->start_overlay, "", LV_ALIGN_TOP_MID, 0, 12, TEXT_MUTED, font);
+    page->start_button = button(page->start_overlay, 12, 42, 141, 51, "开始",
+                                app_ui_chinese_font_size(24), fall_start_click, page);
+    lv_obj_set_style_bg_color(page->start_button, lv_color_hex(0x405783), 0);
+    page->start_label = lv_obj_get_child(page->start_button, 0);
+    arcade_fall_init(&page->model.fall, esp_random());
+    fall_render(page);
+}
+
+static void remove_game_callbacks(lv_obj_t *obj, game_page_t *page)
+{
+    lv_obj_remove_event_cb_with_user_data(obj, NULL, page);
+    for (uint32_t i = 0; i < lv_obj_get_child_count(obj); ++i)
+        remove_game_callbacks(lv_obj_get_child(obj, i), page);
+}
+
 static void game_cleanup(app_ui_t *ui)
 {
     game_page_t *page = ui->page_context;
-    if (page && page->board) {
-        /* An old screen may still dispatch draw or pointer-reset events. */
-        lv_obj_remove_event_cb_with_user_data(page->board, NULL, page);
+    if (page) {
+        /* An old screen may still dispatch draw or input events. */
+        remove_game_callbacks(ui->content, page);
         if (page->touch_surface)
             lv_obj_remove_event_cb_with_user_data(page->touch_surface, NULL, page);
     }
@@ -969,31 +1362,56 @@ static void open_game(app_ui_t *ui, game_kind_t kind)
     ui->page_suspend = game_suspend;
     page->score = app_ui_add_text(content, "", LV_ALIGN_TOP_LEFT, 4, 4, TEXT_BRIGHT, app_ui_chinese_font_size(24));
     page->hint = app_ui_add_text(content, "", LV_ALIGN_TOP_MID, 0, 335, TEXT_MUTED, app_ui_chinese_font());
-    button(content, 350, 0, 48, 34, LV_SYMBOL_REFRESH, &lv_font_montserrat_20, restart_click, page);
+    if (kind != GAME_DICE)
+        button(content, 350, 0, 48, 34, LV_SYMBOL_REFRESH, &lv_font_montserrat_20, restart_click, page);
     switch (kind) {
     case GAME_TILES: build_tiles(page); break;
     case GAME_CRATES: build_crates(page); break;
     case GAME_SNAKE: build_snake(page); break;
     case GAME_JUMP: build_jump(page); break;
+    case GAME_DICE: build_dice(page); break;
+    case GAME_FALL: build_fall(page); break;
     default: return;
     }
-    if (kind == GAME_TILES || kind == GAME_SNAKE) app_ui_set_timer(ui, game_timer, TILT_POLL_MS);
+    if (kind == GAME_SNAKE) app_ui_set_timer(ui, game_timer, TILT_POLL_MS);
 }
 
 static void select_tiles(lv_event_t *event) { open_game(lv_event_get_user_data(event), GAME_TILES); }
 static void select_crates(lv_event_t *event) { open_game(lv_event_get_user_data(event), GAME_CRATES); }
 static void select_snake(lv_event_t *event) { open_game(lv_event_get_user_data(event), GAME_SNAKE); }
 static void select_jump(lv_event_t *event) { open_game(lv_event_get_user_data(event), GAME_JUMP); }
+static void select_dice(lv_event_t *event) { open_game(lv_event_get_user_data(event), GAME_DICE); }
+static void select_fall(lv_event_t *event) { open_game(lv_event_get_user_data(event), GAME_FALL); }
+
+static void dice_preview(lv_event_t *event)
+{
+    lv_area_t area;
+    lv_obj_get_coords(lv_event_get_target_obj(event), &area);
+    lv_layer_t *layer = lv_event_get_layer(event);
+    die_draw(layer, area.x1 + 39, area.y1 + 17, 39, 39, 3);
+    die_draw(layer, area.x1 + 92, area.y1 + 10, 45, 45, 5);
+}
+
+static void fall_preview(lv_event_t *event)
+{
+    lv_area_t area;
+    lv_obj_get_coords(lv_event_get_target_obj(event), &area);
+    lv_layer_t *layer = lv_event_get_layer(event);
+    const int x = area.x1, y = area.y1;
+    fall_piece_draw(layer, x + 15, y + 20, 15, arcade_fall_shape(2, 2), 2, y, false);
+    fall_piece_draw(layer, x + 65, y + 14, 15, arcade_fall_shape(5, 0), 5, y, false);
+    fall_piece_draw(layer, x + 115, y + 27, 15, arcade_fall_shape(3, 0), 3, y, false);
+}
 
 static void game_preview(lv_obj_t *card, game_kind_t kind)
 {
-    lv_obj_t *art = block(card, 10, 10, 174, 97, 12, 0x102034);
+    lv_obj_t *art = block(card, 10, 5, 174, 74, 12, 0x102034);
     switch (kind) {
     case GAME_TILES: {
         static const char *const values[] = {"2", "4", "16", "64"};
         static const uint32_t colors[] = {0xDBE8FF, 0xB7E5FD, 0x4FD4AD, 0xE1D871};
         for (unsigned i = 0; i < 4; ++i) {
-            lv_obj_t *tile = block(art, 49 + (i % 2) * 36, 10 + (i / 2) * 36, 32, 32, 6, colors[i]);
+            lv_obj_t *tile = block(art, 53 + (i % 2) * 33, 5 + (i / 2) * 33, 30, 30, 6, colors[i]);
             app_ui_add_text(tile, values[i], LV_ALIGN_CENTER, 0, 0, 0x233152, &lv_font_montserrat_16);
         }
         break;
@@ -1015,11 +1433,17 @@ static void game_preview(lv_obj_t *card, game_kind_t kind)
         block(art, 127, 30, 14, 14, 7, 0xFD7C94);
         break;
     case GAME_JUMP:
-        block(art, 23, 65, 48, 15, 5, 0x927BD4);
+        block(art, 23, 59, 48, 14, 5, 0x927BD4);
         block(art, 108, 55, 44, 15, 5, 0x4DC0BC);
         block(art, 73, 21, 24, 27, 7, 0xEDF2FF);
         block(art, 78, 25, 15, 10, 4, 0x434B76);
         block(art, 84, 28, 6, 3, 1, 0x8CE8F1);
+        break;
+    case GAME_DICE:
+        lv_obj_add_event_cb(art, dice_preview, LV_EVENT_DRAW_MAIN, NULL);
+        break;
+    case GAME_FALL:
+        lv_obj_add_event_cb(art, fall_preview, LV_EVENT_DRAW_MAIN, NULL);
         break;
     default:
         break;
@@ -1030,18 +1454,18 @@ void app_open_game(app_ui_t *ui)
 {
     lv_obj_t *content = app_ui_begin_page(ui, "小游戏");
     lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    const lv_event_cb_t callbacks[] = {select_tiles, select_crates, select_snake, select_jump};
+    const lv_event_cb_t callbacks[] = {select_tiles, select_crates, select_snake, select_jump, select_dice, select_fall};
     for (unsigned i = 0; i < GAME_COUNT; ++i) {
-        lv_obj_t *card = button(content, 4 + (i % 2) * 203, 5 + (i / 2) * 174, 194, 161,
+        lv_obj_t *card = button(content, 4 + (i % 2) * 203, 3 + (i / 2) * 117, 194, 112,
                                 NULL, NULL, callbacks[i], ui);
         app_connection_button_style(card, false);
         lv_obj_set_style_bg_color(card, lv_color_hex(CONNECTION_PANEL), 0);
         lv_obj_set_style_border_color(card, lv_color_hex(CONNECTION_BORDER), 0);
         lv_obj_set_style_border_width(card, 1, 0);
         game_preview(card, (game_kind_t)i);
-        app_ui_add_text(card, game_titles[i], LV_ALIGN_BOTTOM_LEFT, 14, -13,
+        app_ui_add_text(card, game_titles[i], LV_ALIGN_BOTTOM_LEFT, 14, -4,
                         TEXT_BRIGHT, app_ui_chinese_font_size(24));
-        app_ui_add_text(card, LV_SYMBOL_RIGHT, LV_ALIGN_BOTTOM_RIGHT, -14, -17,
+        app_ui_add_text(card, LV_SYMBOL_RIGHT, LV_ALIGN_BOTTOM_RIGHT, -14, -8,
                         CONNECTION_ACCENT, &lv_font_montserrat_16);
     }
 }

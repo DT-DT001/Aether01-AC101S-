@@ -6,6 +6,7 @@
 enum {
     APP_TELEMETRY_IMU = 1U << 0,
     APP_TELEMETRY_BAROMETER = 1U << 2,
+    APP_TELEMETRY_IMU_GAME = 1U << 3, /* Faster cached samples for short game gestures. */
 };
 
 typedef struct {

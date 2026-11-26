@@ -18,6 +18,8 @@ PARTITION_TABLE_SIZE = 0xC00
 STORAGE_START = 0x850000
 FLASH_END = 0x4000000
 WALLPAPER_START = 0x3F00000
+MODEL_START = 0x3E00000
+IMU_MODEL_START = 0x3E80000
 EXTENSION_START = 0x900000
 EXTENSION_SIZE = 0x300000
 HEADER = struct.Struct('<4s9I')
@@ -73,6 +75,7 @@ def check_partition_table(data):
         raise ValueError('Incomplete partition table read')
     storage = None
     wallpaper = None
+    models = {}
     for start in range(0, len(data), PARTITION_ROW.size):
         row = data[start:start + PARTITION_ROW.size]
         if row.startswith(PARTITION_MD5):
@@ -91,6 +94,10 @@ def check_partition_table(data):
             if wallpaper is not None:
                 raise ValueError('Duplicate live wallpaper partition')
             wallpaper = kind, subtype, address, count, flags
+        elif name in (b'model', b'imu_model'):
+            if name in models:
+                raise ValueError('Duplicate live model partition')
+            models[name] = kind, subtype, address, count, flags
         elif address < EXTENSION_START + EXTENSION_SIZE and address + count > EXTENSION_START:
             raise ValueError('Another partition overlaps the dictionary region')
     else:
@@ -98,6 +105,15 @@ def check_partition_table(data):
     storage_end = FLASH_END if wallpaper is None else WALLPAPER_START
     if wallpaper is not None and wallpaper != (1, 0x40, WALLPAPER_START, FLASH_END - WALLPAPER_START, 0):
         raise ValueError('Unsupported live AC101S wallpaper partition layout')
+    if models:
+        model = models.get(b'model')
+        supported = ((1, 0x82, MODEL_START, 0x80000, 0),
+                     (1, 0x82, 0x3E20000, 0x60000, 0))
+        old_slot = models.get(b'imu_model')
+        if (wallpaper is None or model not in supported or
+                (old_slot is not None and old_slot != (1, 0x41, IMU_MODEL_START, 0x80000, 0))):
+            raise ValueError('Unsupported live AC101S model partition layout')
+        storage_end = model[2]
     if storage != (1, 0x81, STORAGE_START, storage_end - STORAGE_START, 0):
         raise ValueError('Unsupported live AC101S storage partition layout')
     return storage_end

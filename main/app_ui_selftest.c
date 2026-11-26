@@ -94,6 +94,7 @@ static const nested_route_t nested_routes[] = {
     {CLOCK, "秒表", {"stopwatch", "秒表", NULL}},
     {CLOCK, "倒计时", {"countdown", "倒计时", NULL}},
     {MOTION, "水平仪", {"spirit-level", "水平仪", NULL}},
+    {REMOTE, "配置", {"air-mouse-settings", "飞鼠配置", NULL}},
     {THEME, "从 TF 卡选择", {"wallpaper-picker", "选择壁纸", NULL}},
     {SETTINGS, "Wi-Fi", {"wifi", "Wi-Fi 网络", NULL}},
     {SETTINGS, "蓝牙", {"bluetooth", "蓝牙", NULL}},
@@ -104,6 +105,8 @@ static const nested_route_t nested_routes[] = {
     {GAMES, "推箱子", {"game-crates", "推箱子", NULL}},
     {GAMES, "贪吃蛇", {"game-snake", "贪吃蛇", NULL}},
     {GAMES, "跳一跳", {"game-jump", "跳一跳", NULL}},
+    {GAMES, "摇骰子", {"game-dice", "摇骰子", NULL}},
+    {GAMES, "落块挑战", {"game-fall", "落块挑战", NULL}},
 };
 
 typedef struct {
@@ -1434,6 +1437,7 @@ static void report_sensors(route_id_t id)
 }
 
 static bool tap_game_button(probe_t *probe, const char *caption);
+static bool page_has_label(probe_t *probe, const char *label);
 
 static bool calculator_result_is(probe_t *probe, const char *value, const char *expression)
 {
@@ -1638,22 +1642,94 @@ static bool test_crates_touch(probe_t *probe)
     return moved;
 }
 
+static bool tiles_read_grid(probe_t *probe, uint32_t values[16])
+{
+    if (!lvgl_port_lock(1000)) return false;
+    lv_obj_t *content = probe->ui->content;
+    lv_obj_t *board = NULL;
+    if (current_page(probe)) {
+        for (uint32_t i = 0; i < lv_obj_get_child_count(content); ++i) {
+            lv_obj_t *child = lv_obj_get_child(content, (int32_t)i);
+            if (lv_obj_get_child_count(child) == 16) { board = child; break; }
+        }
+    }
+    bool ok = board != NULL;
+    for (unsigned i = 0; ok && i < 16; ++i) {
+        lv_obj_t *cell = lv_obj_get_child(board, (int32_t)i);
+        lv_obj_t *label = lv_obj_get_child(cell, 0);
+        ok = label && lv_obj_check_type(label, &lv_label_class);
+        if (ok) values[i] = (uint32_t)strtoul(lv_label_get_text(label), NULL, 10);
+    }
+    lvgl_port_unlock();
+    return ok;
+}
+
+static bool test_tiles_acceleration_idle(probe_t *probe)
+{
+    const int64_t deadline = esp_timer_get_time() + INT64_C(2200000);
+    bool ready = false;
+    do {
+        pause_ms(POLL_MS);
+        ready = page_has_label(probe, "沿屏幕方向轻推");
+    } while (!ready && esp_timer_get_time() < deadline);
+
+    uint32_t before[16], after[16];
+    bool stayed = ready && tiles_read_grid(probe, before);
+    unsigned samples = 0;
+    app_telemetry_snapshot_t sample = {0};
+    if (stayed) {
+        const int64_t until = esp_timer_get_time() + INT64_C(400000);
+        uint32_t previous_stamp = 0;
+        while (esp_timer_get_time() < until) {
+            app_telemetry_get(&sample);
+            if (sample.imu_error == ESP_OK && sample.imu_updated_ms != previous_stamp) {
+                previous_stamp = sample.imu_updated_ms;
+                ++samples;
+            }
+            pause_ms(4);
+        }
+        stayed = tiles_read_grid(probe, after) && memcmp(before, after, sizeof(before)) == 0;
+    }
+    app_telemetry_get(&sample);
+    ESP_LOGI(TAG, "CHECK subpage=game-2048 live_acceleration_ready=%u idle_board_unchanged=%u imu=%s fresh_frames_400ms=%u",
+             ready, stayed, esp_err_to_name(sample.imu_error), samples);
+    return ready && stayed && samples >= 24;
+}
+
 static bool test_game_controls(probe_t *probe, const route_t *route)
 {
+    if (strcmp(route->id, "game-dice") == 0) {
+        if (!tap_game_button(probe, "1 枚") || !page_has_label(probe, "2 枚") ||
+            !tap_game_button(probe, "掷骰") || !page_has_label(probe, "摇动中")) return false;
+        pause_ms(800);
+        return !page_has_label(probe, "摇动中") && page_has_label(probe, "2 枚");
+    }
+    if (strcmp(route->id, "game-fall") == 0) {
+        return tap_game_button(probe, "开始") && tap_game_button(probe, "旋转") &&
+            tap_game_button(probe, "快速落下") && !page_has_label(probe, "得分  0") &&
+            tap_game_button(probe, LV_SYMBOL_PAUSE) && page_has_label(probe, "已暂停") &&
+            tap_game_button(probe, "继续") && !page_has_label(probe, "已暂停");
+    }
     const bool tiles = strcmp(route->id, "game-2048") == 0;
     const bool snake = strcmp(route->id, "game-snake") == 0;
     if (strcmp(route->id, "game-crates") == 0) return test_crates_touch(probe);
     if (!tiles && !snake) return true;
 
-    const char *default_mode = tiles ? "滑动" : "模式 · 触摸";
-    const bool toggled = tiles ? (click_label(probe, default_mode) && click_label(probe, "倾斜")) :
-        snake_start_with_live_imu(probe);
+    const bool acceleration_selected = tiles && page_has_label(probe, "加速度");
+    const char *initial_mode = tiles ? (acceleration_selected ? "加速度" : "滑动") : "模式 · 触摸";
+    bool toggled;
+    if (tiles) {
+        const bool enabled = acceleration_selected || click_label(probe, "滑动");
+        const bool idle_ok = enabled && test_tiles_acceleration_idle(probe);
+        toggled = enabled && click_label(probe, "加速度") &&
+                  (!acceleration_selected || click_label(probe, "滑动")) && idle_ok;
+    } else toggled = snake_start_with_live_imu(probe);
     if (!toggled) return false;
 
     if (!lvgl_port_lock(1000)) return false;
     lv_obj_t *content = probe->ui->content;
-    const bool verified = current_page(probe) && button_for(content, default_mode) &&
-        (tiles ? find_label(content, "滑动棋盘", false) != NULL :
+    const bool verified = current_page(probe) && button_for(content, initial_mode) &&
+        (tiles ? (acceleration_selected || find_label(content, "滑动棋盘", false) != NULL) :
             no_direction_buttons(content) && touch_surface(touch_board(content, 250)) &&
             find_label(content, "开始游戏", false) == NULL);
     lvgl_port_unlock();
@@ -1982,6 +2058,66 @@ static bool load_wallpaper_fixture(app_ui_t *ui, app_media_image_t *image)
     return ok;
 }
 
+static bool test_photo_decoders(app_ui_t *ui)
+{
+    static const uint8_t png[] = {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00,
+        0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+        0x9f, 0xe1, 0x3f, 0x43, 0x23, 0xbe, 0x87, 0xf5, 0x00, 0x00, 0x00, 0x0c,
+        0x49, 0x44, 0x41, 0x54, 0x03, 0x03, 0x98, 0xfe, 0xff, 0xff, 0x3f, 0x00,
+        0x3f, 0xd7, 0x08, 0x79, 0xa8, 0x57, 0xf3, 0x97, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+    static const uint8_t gif[] = {
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x02, 0x00, 0x02, 0x00, 0x81, 0x00,
+        0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff,
+        0xff, 0x21, 0xff, 0x0b, 0x4e, 0x45, 0x54, 0x53, 0x43, 0x41, 0x50, 0x45,
+        0x32, 0x2e, 0x30, 0x03, 0x01, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x01,
+        0x05, 0x00, 0x02, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02,
+        0x00, 0x00, 0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x30, 0x20, 0x20, 0x00,
+        0x3b,
+    };
+    static const struct {
+        const char *suffix;
+        const uint8_t *bytes;
+        size_t size;
+        uint16_t pixels[4];
+    } cases[] = {{"png", png, sizeof(png), {0xf800, 0x0400, 0, 0xffff}},
+                 {"gif", gif, sizeof(gif), {0xf800, 0x07e0, 0, 0xffff}}};
+    const char *root = AETHER_STORAGE_MOUNT_POINT;
+    if (!aether_media_fs_path_ready(ui->storage, root) || app_io_usb_storage_blocked(ui->io)) {
+        ESP_LOGI(TAG, "SKIP PNG/GIF physical TF decode: card unavailable");
+        return true;
+    }
+    aether_media_fs_lease_t lease = {0};
+    if (aether_media_fs_acquire(ui->storage, root, &lease) != ESP_OK) return false;
+    bool all_ok = true;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char path[88];
+        snprintf(path, sizeof(path), "%s/.aether-image-%08" PRIx32 ".%s", root,
+                 (uint32_t)esp_timer_get_time(), cases[i].suffix);
+        const uint32_t generation = aether_media_fs_generation(ui->storage, path);
+        const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        bool written = fd >= 0 && write(fd, cases[i].bytes, cases[i].size) == (ssize_t)cases[i].size;
+        if (fd >= 0 && close(fd) != 0) written = false;
+        const atomic_bool cancelled = false;
+        app_media_image_t image = {0};
+        const esp_err_t decoded = written ? app_media_image_read(ui->storage, path, generation,
+            &cancelled, 408, 276, false, &image) : ESP_FAIL;
+        const bool removed = fd >= 0 && aether_media_fs_available(&lease) &&
+            aether_media_fs_generation(ui->storage, path) == generation && unlink(path) == 0;
+        const bool ok = decoded == ESP_OK && removed && image.width == 2 && image.height == 2 &&
+            memcmp(image.pixels, cases[i].pixels, sizeof(cases[i].pixels)) == 0;
+        free(image.pixels);
+        ESP_LOGI(TAG, "%s %s physical TF decode and RGB565 pixels", ok ? "PASS" : "FAIL", cases[i].suffix);
+        all_ok = all_ok && ok;
+    }
+    aether_media_fs_release(&lease);
+    return all_ok;
+}
+
 static bool test_wallpaper_store(app_ui_t *ui)
 {
     if (!lvgl_port_lock(1000)) return false;
@@ -2071,7 +2207,8 @@ static void test_task(void *context)
         const bool files_ok = selftest_files(probe.ui);
         const bool nes_ok = idle_media(probe.ui) && selftest_nes(probe.ui);
         const bool wallpaper_ok = (ROUNDS != 0 && ROUNDS < 100) || test_wallpaper_store(probe.ui);
-        ok = mic_ok && files_ok && nes_ok && wallpaper_ok;
+        const bool photos_ok = test_photo_decoders(probe.ui);
+        ok = mic_ok && files_ok && nes_ok && wallpaper_ok && photos_ok;
     }
     app_display_metrics_get(&end_display);
     const uint32_t drops = end_display.dropped_regions - start_display.dropped_regions;

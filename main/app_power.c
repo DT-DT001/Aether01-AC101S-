@@ -433,9 +433,11 @@ static void set_render_enabled(app_power_t *manager, bool enabled)
         if (refresh) lv_timer_pause(refresh);
         lv_display_enable_invalidation(manager->display, false);
         manager->render_paused = true;
+        app_touch_set_screen_awake(false);
     } else if (enabled && manager->render_paused) {
         lv_display_enable_invalidation(manager->display, true);
         manager->render_paused = false;
+        app_touch_set_screen_awake(true);
         if (refresh) { lv_timer_resume(refresh); lv_timer_ready(refresh); }
     }
 }
@@ -552,8 +554,7 @@ static esp_err_t apply_wake(app_power_t *manager)
     return err;
 }
 
-/* Sample idle duration across a stable LVGL tick for timeout/dimming only.
- * Touch and generic GUI activity never request a screen wake. */
+/* Sample idle duration across a stable LVGL tick for timeout and dimming. */
 static bool read_activity_tick(lv_display_t *display, uint32_t *inactive,
                                 uint32_t *activity)
 {

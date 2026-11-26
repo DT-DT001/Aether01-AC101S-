@@ -10,7 +10,7 @@
 
 extern const lv_font_t font_16, font_24;
 static uint16_t frame[480 * 480], buffer[480 * 20];
-static app_pc_remote_status_t status = {.available=true};
+static app_pc_remote_status_t status = {.available=true, .sensitivity=APP_PC_MOUSE_DEFAULT};
 static app_pc_shortcut_t shortcuts[] = {{5,0x42},{5,0x43},{5,0x44},{5,0x45}};
 static char scene_names[APP_PC_REMOTE_SCENES][APP_PC_REMOTE_SCENE_BYTES];
 static bool pressed, air_mode, moving, confirm_value;
@@ -48,6 +48,13 @@ esp_err_t app_telemetry_gyro_calibration_cancel(void)
 void app_telemetry_gyro_calibration_get(app_gyro_calibration_status_t *out) { *out = calibration; }
 
 void app_pc_remote_get_status(app_pc_remote_status_t *out) { *out = status; }
+esp_err_t app_pc_remote_set_sensitivity(unsigned percent)
+{
+    assert(percent >= APP_PC_MOUSE_MIN && percent <= APP_PC_MOUSE_MAX && !moving && !air_mode);
+    status.sensitivity = percent;
+    status.save_pending = true;
+    return ESP_OK;
+}
 esp_err_t app_pc_remote_set_enabled(bool enabled)
 {
     status.requested = status.discoverable = enabled;
@@ -177,6 +184,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui, const char *title)
     }
     if (ui->timer) { lv_timer_delete(ui->timer); ui->timer = NULL; }
     ui->page_suspend = NULL;
+    ui->page_back = NULL;
     ui->screen = lv_obj_create(NULL);
     lv_obj_remove_flag(ui->screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen, lv_color_hex(0x070A12), 0);
@@ -379,7 +387,24 @@ int main(int argc, char **argv)
     assert(clicks == 2 && last_click == 2);
     status.gyro_ready = true; advance(170);
     assert(lv_obj_has_state(move, LV_STATE_USER_1));
-    assert(find_label(ui.screen, "平放设备，或点漂移校准"));
+    assert(find_label(ui.screen, "平放设备，或在配置中校准"));
+    assert(!find_label(ui.screen, "漂移校准"));
+    tap(control(ui.screen, "配置"));
+    assert(find_label(ui.screen, "飞鼠配置") && ui.page_back == app_open_pc_remote);
+    assert(!air_mode && !moving && status.connected && releases == 1);
+    tap(control(ui.screen, "+"));
+    assert(find_label(ui.screen, "110%") && find_label(ui.screen, "正在保存设置…"));
+    tap(control(ui.screen, "-"));
+    assert(find_label(ui.screen, "100%"));
+    for (unsigned i = 0; i < 5; ++i) tap(control(ui.screen, "-"));
+    assert(find_label(ui.screen, "50%") && lv_obj_has_state(control(ui.screen, "-"), LV_STATE_DISABLED));
+    for (unsigned i = 0; i < 15; ++i) tap(control(ui.screen, "+"));
+    assert(find_label(ui.screen, "200%") && lv_obj_has_state(control(ui.screen, "+"), LV_STATE_DISABLED));
+    tap(control(ui.screen, "恢复默认"));
+    assert(status.sensitivity == APP_PC_MOUSE_DEFAULT);
+    status.save_pending = false;
+    advance(170);
+    snapshot(display, argv[1], "pc-air-mouse-settings");
     status.connected = false;
     advance(170);
     tap(control(ui.screen, "漂移校准"));
@@ -409,7 +434,10 @@ int main(int argc, char **argv)
     assert(find_label(ui.screen, "设备忙，请稍后重试。"));
     tap(control(ui.screen, "关闭"));
     status.connected = true;
+    ui.page_back(&ui);
+    assert(!ui.page_back && status.connected && air_mode && releases == 2);
     advance(170);
+    move = control(ui.screen, "按住移动");
     tap(control(ui.screen, "回中"));
     assert(recenters == 1);
     touch(move);
@@ -435,7 +463,7 @@ int main(int argc, char **argv)
     assert(moving);
     assert(ui.page_suspend);
     ui.page_suspend(&ui, true);
-    assert(releases == 1 && !moving && !air_mode && status.connected);
+    assert(releases == 3 && !moving && !air_mode && status.connected);
     lift();
     ui.page_suspend(&ui, false);
     assert(!moving && air_mode && status.connected);
@@ -443,7 +471,7 @@ int main(int argc, char **argv)
     assert(moving);
     app_open_obs_switcher(&ui);
     lift();
-    assert(releases == 2 && !moving && !air_mode && status.requested && status.connected && !triggers);
+    assert(releases == 4 && !moving && !air_mode && status.requested && status.connected && !triggers);
     puts("PASS leaving the air mouse stops motion and OBS immediately reuses the existing HID link");
 
     lv_obj_t *scenes[4];
@@ -529,14 +557,14 @@ int main(int argc, char **argv)
     assert(find_label(ui.screen, "快捷键已提交"));
     app_open_pc_remote(&ui);
     advance(170);
-    assert(releases == 3 && find_label(ui.screen, "设备已连接"));
+    assert(releases == 5 && find_label(ui.screen, "设备已连接"));
     tap(control(ui.screen, "回车"));
     assert(keys == 3 && last_key == 0x28 && last_modifiers == 0);
     status.connected = false;
     status.confirm_pending = true;
     app_ui_begin_page(&ui, "首页");
     advance(170);
-    assert(releases == 4 && status.requested && status.confirm_pending && !app_ui_modal_present(ui.screen));
+    assert(releases == 6 && status.requested && status.confirm_pending && !app_ui_modal_present(ui.screen));
     app_open_pc_remote(&ui);
     advance(170);
     tap(control(find_class(ui.screen, &lv_msgbox_class), "关闭键鼠"));

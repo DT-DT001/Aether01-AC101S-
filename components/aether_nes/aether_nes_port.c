@@ -474,9 +474,15 @@ void osd_getinput(void)
         esp_lcd_touch_point_data_t points[OSD_TOUCH_POINTS];
         uint8_t count = 0;
         const int64_t input_begin = esp_timer_get_time();
-        esp_err_t input_error = esp_lcd_touch_read_data(s_active->touch);
-        if (input_error == ESP_OK)
-            input_error = esp_lcd_touch_get_data(s_active->touch, points, &count, OSD_TOUCH_POINTS);
+        esp_err_t input_error;
+        if (s_active->touch_reader) {
+            input_error = s_active->touch_reader(s_active->touch_reader_context, points, &count,
+                                                 OSD_TOUCH_POINTS);
+        } else {
+            input_error = esp_lcd_touch_read_data(s_active->touch);
+            if (input_error == ESP_OK)
+                input_error = esp_lcd_touch_get_data(s_active->touch, points, &count, OSD_TOUCH_POINTS);
+        }
         s_cost.input += (uint64_t)(esp_timer_get_time() - input_begin);
         if (input_error != ESP_OK) {
             s_consume_touch = true; s_exit_touch_us = 0;

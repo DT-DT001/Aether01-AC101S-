@@ -130,6 +130,12 @@ void app_open_music_path(app_ui_t *ui, const char *path)
     strlcpy(opened, path, sizeof(opened));
     if (simulate_playback_page) (void)app_ui_begin_page(ui, "回放");
 }
+void app_open_image_path(app_ui_t *ui, const char *path)
+{
+    route = 5;
+    strlcpy(opened, path, sizeof(opened));
+    (void)app_ui_begin_page(ui, "图片");
+}
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p){uint16_t *v=(uint16_t*)p;for(int y=a->y1;y<=a->y2;++y)for(int x=a->x1;x<=a->x2;++x)framebuffer[y*480+x]=*v++;lv_display_flush_ready(d);}
 static void read_input(lv_indev_t *i,lv_indev_data_t *d){(void)i;d->point=point;d->state=held?LV_INDEV_STATE_PRESSED:LV_INDEV_STATE_RELEASED;}
 static void advance(unsigned ms){for(unsigned i=0;i<ms;++i){lv_tick_inc(1);lv_timer_handler();}}
@@ -319,6 +325,23 @@ static void test_txt_browser_return(app_ui_t *ui)
     advance(80);
     assert(find(ui->screen, "novel.txt"));
     puts("PASS TXT routes back to its original Files folder instead of the app drawer");
+}
+
+static void test_image_browser_return(app_ui_t *ui)
+{
+    app_io_entry_t photo = {.path = "/sdcard/Photos/Trips/sunset.PNG"};
+    app_io_result_t listing = {.operation = APP_IO_CATALOG, .entries = &photo, .count = 1, .total_count = 1};
+    app_open_files_path(ui, "/sdcard/Photos/Trips");
+    complete(ui, &listing);
+    advance(80);
+    tap_text(ui->screen, "sunset.PNG");
+    assert(route == 5 && !strcmp(opened, photo.path) && find(ui->screen, "图片") && ui->page_back);
+    tap_text(ui->screen, LV_SYMBOL_LEFT);
+    assert(ui->io_complete && !strcmp(request.path, "/sdcard/Photos/Trips"));
+    complete(ui, &listing);
+    advance(80);
+    assert(find(ui->screen, "sunset.PNG"));
+    puts("PASS Files opens PNG and returns to the source folder");
 }
 
 static void snapshot(lv_display_t *d,const char *dir,const char *name){lv_refr_now(d);char p[1024];snprintf(p,sizeof(p),"%s/%s.ppm",dir,name);FILE *f=fopen(p,"wb");assert(f);fprintf(f,"P6\n480 480\n255\n");for(unsigned i=0;i<480*480;++i){uint16_t v=framebuffer[i];uint8_t rgb[]={(v>>11)*255/31,((v>>5)&63)*255/63,(v&31)*255/31};assert(fwrite(rgb,1,3,f)==3);}fclose(f);}
@@ -631,6 +654,7 @@ int main(int argc,char **argv)
         test_recordings_back(&ui);
         test_nested_recording_back(&ui);
         test_txt_browser_return(&ui);
+        test_image_browser_return(&ui);
         test_file_operations(&ui, d, argv[1]);
         capture_phone_files(&ui, d, argv[1]);
     }

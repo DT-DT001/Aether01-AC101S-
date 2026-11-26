@@ -1,0 +1,10 @@
+# NSNet3's private state and lookup tables are used only after PSRAM is up.
+[scheme:aether_nsnet3_psram]
+entries:
+    bss -> extern_ram
+
+[mapping:aether_nsnet3_tables]
+archive: libnsnet3.a
+entries:
+    if IDF_TARGET_ESP32S31 = y && SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y && SR_NSN_NSNET3 = y:
+        * (aether_nsnet3_psram)

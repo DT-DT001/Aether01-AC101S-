@@ -11,13 +11,15 @@
 
 #define MOTION_LEASE_US 200000
 #define IMU_MAX_AGE_MS 100U
-#define SHORTCUT_VERSION 2U
+#define SHORTCUT_VERSION 3U
 #define SHORTCUT_RETRY_US 2000000
+#define MOUSE_SAVE_DELAY_US 400000
 
 typedef struct {
     uint32_t version;
     app_pc_shortcut_t shortcut[APP_PC_REMOTE_SCENES];
     char scene_names[APP_PC_REMOTE_SCENES][APP_PC_REMOTE_SCENE_BYTES];
+    uint8_t sensitivity;
 } shortcut_settings_t;
 
 static shortcut_settings_t s_shortcuts;
@@ -80,7 +82,9 @@ static bool scene_name_copy(char stored[APP_PC_REMOTE_SCENE_BYTES], const char *
 static void service_shortcuts(int64_t now)
 {
     portENTER_CRITICAL(&s_lock);
-    const bool pending = s_save_pending && now >= s_save_retry_at;
+    /* NVS writes run in the telemetry task. Defer them while the mouse
+     * movement lease needs an uninterrupted IMU stream. */
+    const bool pending = s_save_pending && now >= s_save_retry_at && s_motion_until <= now;
     const uint32_t revision = s_save_revision;
     const shortcut_settings_t settings = s_shortcuts;
     portEXIT_CRITICAL(&s_lock);
@@ -119,6 +123,7 @@ static void service_remote(const app_telemetry_snapshot_t *sample)
         stop_motion_locked();
     const bool moving = s_air_mode && s_motion_until > now;
     const uint32_t epoch = s_motion_epoch;
+    const uint8_t sensitivity = s_shortcuts.sensitivity;
     portEXIT_CRITICAL(&s_lock);
     if (!moving || !fresh_gyro(sample, (uint32_t)(now / 1000)) || !power_allows_input()) {
         s_mouse = (app_air_mouse_t){0};
@@ -127,7 +132,8 @@ static void service_remote(const app_telemetry_snapshot_t *sample)
         s_mouse_epoch = epoch;
         int8_t dx, dy;
         if (app_air_mouse_update(&s_mouse, sample->imu.accel_mps2, sample->imu.gyro_dps,
-                                 sample->imu.gyro_stationary, sample->imu_updated_ms, &dx, &dy)) {
+                                 sample->imu.gyro_stationary, sample->imu_updated_ms,
+                                 sensitivity, &dx, &dy)) {
             const int64_t send_now = esp_timer_get_time();
             portENTER_CRITICAL(&s_lock);
             /* A release/recenter that wins the lock invalidates this sample.
@@ -150,6 +156,7 @@ void app_pc_remote_init(aether_bluetooth_handle_t bluetooth, app_power_t *power,
     s_shortcuts = (shortcut_settings_t){
         .version = SHORTCUT_VERSION,
         .shortcut = {{0x05, 0x42}, {0x05, 0x43}, {0x05, 0x44}, {0x05, 0x45}},
+        .sensitivity = APP_PC_MOUSE_DEFAULT,
     };
     s_save_pending = false;
     s_save_error = ESP_OK;
@@ -160,11 +167,14 @@ void app_pc_remote_init(aether_bluetooth_handle_t bluetooth, app_power_t *power,
         size_t size = sizeof(stored);
         if (nvs_get_blob(nvs, "shortcuts", &stored, &size) == ESP_OK) {
             const bool legacy = stored.version == 1 && size == offsetof(shortcut_settings_t, scene_names);
+            const bool named = stored.version == 2 && size == offsetof(shortcut_settings_t, sensitivity);
             const bool current = stored.version == SHORTCUT_VERSION && size == sizeof(stored);
-            for (unsigned i = 0; (legacy || current) && i < APP_PC_REMOTE_SCENES; ++i) {
+            if (current && stored.sensitivity >= APP_PC_MOUSE_MIN && stored.sensitivity <= APP_PC_MOUSE_MAX)
+                s_shortcuts.sensitivity = stored.sensitivity;
+            for (unsigned i = 0; (legacy || named || current) && i < APP_PC_REMOTE_SCENES; ++i) {
                 if (supported_key(stored.shortcut[i].key)) s_shortcuts.shortcut[i] = stored.shortcut[i];
                 char name[APP_PC_REMOTE_SCENE_BYTES] = {0};
-                if (current && scene_name_copy(name, stored.scene_names[i]))
+                if ((named || current) && scene_name_copy(name, stored.scene_names[i]))
                     memcpy(s_shortcuts.scene_names[i], name, sizeof(name));
             }
         }
@@ -194,6 +204,7 @@ void app_pc_remote_get_status(app_pc_remote_status_t *status)
     portENTER_CRITICAL(&s_lock);
     status->save_pending = s_save_pending;
     status->save_error = s_save_error;
+    status->sensitivity = s_shortcuts.sensitivity;
     portEXIT_CRITICAL(&s_lock);
 }
 
@@ -283,6 +294,22 @@ static void queue_settings_save(void)
     s_save_pending = true;
     s_save_error = ESP_OK;
     s_save_retry_at = 0;
+}
+
+esp_err_t app_pc_remote_set_sensitivity(unsigned percent)
+{
+    if (percent < APP_PC_MOUSE_MIN || percent > APP_PC_MOUSE_MAX) return ESP_ERR_INVALID_ARG;
+    if (!power_allows_input()) return ESP_ERR_INVALID_STATE;
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (s_shortcuts.sensitivity != percent) {
+        s_shortcuts.sensitivity = percent;
+        stop_motion_locked();
+        queue_settings_save();
+        s_save_retry_at = now + MOUSE_SAVE_DELAY_US;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    return ESP_OK;
 }
 
 esp_err_t app_pc_remote_set_shortcut(unsigned slot, app_pc_shortcut_t shortcut)

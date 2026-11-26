@@ -181,9 +181,33 @@ int main(void)
     power_status.sleeping = false;
     puts("PASS OBS v1 migration, UTF-8 scene names, shared NVS commit/retry, reboot and input gating");
 
+    const uint32_t old_version = 2;
+    memcpy(stored, &old_version, sizeof(old_version));
+    stored_size -= 4; /* v2 lacks the sensitivity byte and its alignment padding. */
+    app_pc_remote_init(bluetooth, &power, true, flash_busy);
+    app_pc_remote_get_status(&status);
+    assert(status.sensitivity == APP_PC_MOUSE_DEFAULT);
+    assert(app_pc_remote_get_scene_name(0, name) == ESP_OK && !strcmp(name, "开场直播"));
+    const unsigned before_adjustment = writes;
+    assert(app_pc_remote_set_sensitivity(49) == ESP_ERR_INVALID_ARG);
+    assert(app_pc_remote_set_sensitivity(150) == ESP_OK);
+    sample_after(200);
+    assert(app_pc_remote_set_sensitivity(170) == ESP_OK);
+    sample_after(399);
+    assert(writes == before_adjustment && app_pc_remote_save_pending());
+    sample_after(1);
+    assert(writes == before_adjustment + 1 && !app_pc_remote_save_pending());
+    app_pc_remote_init(bluetooth, &power, true, flash_busy);
+    app_pc_remote_get_status(&status);
+    assert(status.sensitivity == 170 && status.requested && status.connected);
+    assert(app_pc_remote_get_scene_name(1, name) == ESP_OK && !strcmp(name, "媒体预览"));
+    puts("PASS mouse sensitivity coalesces writes and restores with existing OBS names and Bluetooth link");
+
     app_pc_remote_set_air_mode(true);
     assert(interest == APP_TELEMETRY_IMU);
     app_pc_remote_set_motion(true);
+    const unsigned before_motion_save = writes;
+    assert(app_pc_remote_set_shortcut(2, (app_pc_shortcut_t){0x04, 0x12}) == ESP_OK);
     imu.imu.accel_mps2[1] = 9.80665f;
     imu.imu.gyro_dps[1] = 40;
     sample_after(20);
@@ -193,10 +217,12 @@ int main(void)
     sample_after(20);
     sample_after(20);
     assert(moves == 1 && motion_queued);
+    assert(writes == before_motion_save && app_pc_remote_save_pending());
     assert(app_pc_remote_click(1) == ESP_OK && queued_clicks == 1);
     const unsigned cancelled = cancels;
     sample_after(200);
     assert(moves == 1 && cancels == cancelled + 1 && !motion_queued && queued_clicks == 1);
+    assert(writes == before_motion_save + 1 && !app_pc_remote_save_pending());
     app_pc_remote_set_motion(true);
     imu.imu.gyro_stationary = true;
     sample_after(20);

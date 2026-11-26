@@ -19,9 +19,15 @@ typedef enum {
     AETHER_RECORDER_FINISHED,
     AETHER_RECORDER_ERROR,
 } aether_recorder_state_t;
+typedef enum {
+    AETHER_RECORDER_ORIGINAL = 0,
+    AETHER_RECORDER_VOICE_DENOISE,
+} aether_recorder_mode_t;
 typedef struct {
     aether_recorder_state_t state;
+    aether_recorder_mode_t mode; /* Applied mode, including any fallback. */
     bool active; /* Includes STARTING/PAUSED/SAVING until codec/file/lease cleanup. */
+    bool denoise_fallback;
     uint64_t duration_ms; /* Recorded sample time; paused samples are excluded. */
     uint64_t data_bytes;
     uint16_t peak; /* Absolute slot-0 PCM peak, 0..32768; zero while paused. */
@@ -36,6 +42,10 @@ esp_err_t aether_recorder_new(ac101s_audio_handle_t audio,
 aether_recorder_handle_t aether_recorder_get_default(void);
 /* Async acceptance. Creates a unique WAV in /sdcard/Recordings, PCM16 mono 48kHz. */
 esp_err_t aether_recorder_start(aether_recorder_handle_t handle);
+/* Optional voice denoise uses PCM16 mono 16kHz. Initialization failure falls
+ * back to the original format before creating the file and is reported in status. */
+esp_err_t aether_recorder_start_mode(aether_recorder_handle_t handle, aether_recorder_mode_t mode);
+bool aether_recorder_denoise_supported(void);
 esp_err_t aether_recorder_set_paused(aether_recorder_handle_t handle, bool paused);
 /** Park the microphone while preserving the current WAV and manual pause. */
 void aether_recorder_set_screen_paused(aether_recorder_handle_t handle, bool paused);

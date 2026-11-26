@@ -27,6 +27,11 @@ static const char *output;
 static unsigned video_starts,video_stops,video_releases,nes_starts,nes_stops,nes_releases;
 static unsigned media_release_posts,user_exit_arms;
 static bool nes_viewport_enabled;
+static lv_area_t registered_nes_viewport;
+static bool same_area(lv_area_t a, lv_area_t b)
+{
+    return a.x1 == b.x1 && a.y1 == b.y1 && a.x2 == b.x2 && a.y2 == b.y2;
+}
 bool app_display_sync_present_nes(lv_obj_t *image, const uint16_t *pixels,
     uint16_t width, uint16_t height)
 {
@@ -37,7 +42,7 @@ void app_display_sync_set_nes_viewport(lv_display_t *display,const lv_area_t *ar
 {
     assert(display==lv_display_get_default());
     nes_viewport_enabled=area!=NULL;
-    if(area) assert(area->x1==48&&area->y1==96&&area->x2==431&&area->y2==431);
+    if (area) registered_nes_viewport = *area;
 }
 esp_err_t app_io_release_media(app_io_handle_t io){assert(io);++media_release_posts;return ESP_OK;}
 void app_ui_set_user_key_exit(app_ui_t *ui,bool armed){assert(ui);if(armed)++user_exit_arms;}
@@ -241,7 +246,8 @@ static void test_nes(app_ui_t *ui)
 {
     app_open_nes_path(ui,"/sdcard/ROMs/全屏测试.nes");deliver(ui,ESP_OK);assert(ui->media_active&&!touch_enabled&&user_exit_arms&&nes_viewport_enabled);fixture(384,336,true);nes_callback(pixels,384,336,1,nes_context);nes.emulation_fps_x100=5980;nes.render_fps_x100=3000;advance(220);
     lv_obj_t *image=ui->app_obj[0];lv_area_t viewport=area(image);
-    assert(viewport.x1==48&&viewport.y1==96&&viewport.x2==431&&viewport.y2==431);
+    assert(viewport.x1==48&&viewport.y1==72&&viewport.x2==431&&viewport.y2==407);
+    assert(same_area(viewport, registered_nes_viewport));
     assert(lv_image_get_src_width(image)==384&&lv_image_get_src_height(image)==336);
     assert(lv_image_get_inner_align(image)==LV_IMAGE_ALIGN_CENTER&&!lv_image_get_antialias(image));
     capture(ui,"nes-playing");
@@ -256,7 +262,26 @@ static void test_nes(app_ui_t *ui)
     unsigned stops=nes_stops,releases=nes_releases;send_click(ui,"返回");assert(nes_stops==stops+1&&nes_releases==releases+1);touch_enabled=true;
     nes_error=ESP_FAIL;app_open_nes_path(ui,"/sdcard/ROMs/test.nes");deliver(ui,ESP_OK);assert(!ui->media_active&&!ui->media_started);nes_error=ESP_OK;
     app_open_nes_path(ui,"/sdcard/ROMs/test.nes");deliver(ui,ESP_OK);nes.state=AETHER_NES_STOPPED;advance(220);assert(!ui->media_active&&!ui->timer);
-    puts("PASS NES TE-budgeted 384x336 nearest viewport, equal axes, no overlays, pause/error/stop and touch handoff");
+    puts("PASS NES centered TE-budgeted 384x336 nearest viewport, matching sync window, no overlays, pause/error/stop and touch handoff");
+}
+static void test_nes_smaller_display(app_ui_t *ui)
+{
+    lv_display_t *display = lv_obj_get_display(ui->screen);
+    lv_display_set_resolution(display, 320, 240);
+    app_open_nes_path(ui, "/sdcard/ROMs/test.nes");
+    deliver(ui, ESP_OK);
+    fixture(384, 336, true);
+    nes_callback(pixels, 384, 336, 1, nes_context);
+    advance(220);
+    lv_obj_t *image = ui->app_obj[0];
+    const lv_area_t viewport = area(image);
+    assert(viewport.x1 == 24 && viewport.y1 == 1 && viewport.x2 == 295 && viewport.y2 == 238);
+    assert(same_area(viewport, registered_nes_viewport));
+    assert(lv_image_get_inner_align(image) == LV_IMAGE_ALIGN_CONTAIN && !lv_image_get_antialias(image));
+    assert(lv_image_get_src_width(image) == 384 && lv_image_get_src_height(image) == 336);
+    app_ui_show_home(ui);
+    lv_display_set_resolution(display, 480, 480);
+    puts("PASS NES fits a 320x240 display at exact 8:7 with nearest-neighbor and safe fallback");
 }
 static void test_storage_ready(app_ui_t *ui)
 {
@@ -326,7 +351,7 @@ int main(int argc,char **argv)
     assert(argc==2);output=argv[1];setbuf(stdout,NULL);lv_init();lv_display_t *d=lv_display_create(480,480);assert(d);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);lv_display_set_buffers(d,draw_buffer,NULL,sizeof(draw_buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);lv_display_set_flush_cb(d,flush);
     input=lv_indev_create();lv_indev_set_type(input,LV_INDEV_TYPE_POINTER);lv_indev_set_display(input,d);lv_indev_set_read_cb(input,read_input);lv_timer_set_period(lv_indev_get_read_timer(input),8);
     app_ui_t ui={.storage=(void*)1,.io=(void*)2,.video_player=(void*)1,.nes=(void*)1,.touch_indev=input};assert(app_frames_new(&ui.frames)==ESP_OK);active_ui=&ui;
-    test_video(&ui);test_seek_feedback(&ui);test_errors(&ui);test_storage_ready(&ui);test_catalog_end(&ui);test_nes(&ui);
+    test_video(&ui);test_seek_feedback(&ui);test_errors(&ui);test_storage_ready(&ui);test_catalog_end(&ui);test_nes(&ui);test_nes_smaller_display(&ui);
     for(unsigned i=0;i<100;++i){app_open_video_path(&ui,"/sdcard/Video/test.avi");deliver(&ui,ESP_OK);app_open_nes_path(&ui,"/sdcard/ROMs/test.nes");deliver(&ui,ESP_OK);app_ui_show_home(&ui);assert(!ui.media_active&&!ui.timer&&!ui.page_context&&lv_mem_test()==LV_RESULT_OK);}
     active_ui=NULL;lv_obj_delete(ui.screen);app_frames_delete(ui.frames);lv_indev_delete(input);lv_display_delete(d);assert(lv_mem_test()==LV_RESULT_OK);lv_deinit();puts("PASS 100 fullscreen video/NES/home rebuilds with actual app_frames and LVGL allocator integrity; synthetic clips are not board performance");return 0;
 }

@@ -869,7 +869,7 @@ void app_open_settings(app_ui_t *ui)
     lv_obj_add_event_cb(page->output, output_event, LV_EVENT_VALUE_CHANGED, ui);
     page->audio_status = section_text(sound, "", 173, 0x9CCFBE);
 
-    lv_obj_t *display = section_card(content, 0, 270, LV_SYMBOL_IMAGE, "显示", 0xADC8FF);
+    lv_obj_t *display = section_card(content, 0, 268, LV_SYMBOL_IMAGE, "显示", 0xADC8FF);
     ui->app_obj[1] = section_text(display, "", 59, 0xD9E8FF);
     lv_obj_t *brightness = lv_slider_create(display);
     lv_obj_set_pos(brightness, 24, 94);
@@ -888,7 +888,7 @@ void app_open_settings(app_ui_t *ui)
     }
     lv_obj_add_event_cb(timeout, timeout_event, LV_EVENT_VALUE_CHANGED, ui);
     action(display, "立即息屏", 16, 174, 140, sleep_event, ui);
-    ui->app_obj[2] = section_text(display, "按电源键唤醒屏幕", 225, 0xA6B4CD);
+    ui->app_obj[2] = section_text(display, "按电源键唤醒屏幕", 226, 0xA6B4CD);
 
     lv_obj_t *storage = section_card(content, 0, 206, LV_SYMBOL_SD_CARD, "存储与按键", 0xBEBAFF);
     section_text(storage, "USB 虚拟U盘", 67, 0xD9E8FF);

@@ -4,6 +4,7 @@
 #include "app_home.h"
 #include "app_battery.h"
 #include "app_screen.h"
+#include "app_theme.h"
 #include "app_utilities.h"
 #include "aether_wifi.h"
 #include <assert.h>
@@ -24,6 +25,21 @@ static app_tools_snapshot_t tools = {.ready=true,.battery_updated_ms=1000,
     .battery={.presence_valid=true,.battery_present=true,.percentage_valid=true,.percentage=80}};
 static bool held;
 static lv_point_t point;
+static bool wallpaper_enabled;
+static uint32_t wallpaper_color;
+uint32_t app_theme_color(uint32_t fallback) { return fallback; }
+uint32_t app_theme_background(uint32_t fallback) { return fallback; }
+lv_obj_t *app_theme_wallpaper_view(lv_obj_t *parent)
+{
+    if (!wallpaper_enabled) return NULL;
+    lv_obj_t *view = lv_obj_create(parent);
+    lv_obj_remove_style_all(view);
+    lv_obj_remove_flag(view, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(view, 480, 480);
+    lv_obj_set_style_bg_color(view, lv_color_hex(wallpaper_color), 0);
+    lv_obj_set_style_bg_opa(view, LV_OPA_COVER, 0);
+    return view;
+}
 aether_wifi_handle_t aether_wifi_get_default(void) {return (void*)1;}
 esp_err_t aether_wifi_get_status(aether_wifi_handle_t handle,aether_wifi_status_t *s) {assert(handle);*s=wifi;return ESP_OK;}
 aether_bluetooth_handle_t app_audio_system_bluetooth(void) {return (void*)1;}
@@ -152,6 +168,52 @@ static void capture(lv_display_t *display,const char *directory,const char *name
     FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n480 480\n255\n");
     for(unsigned i=0;i<480*480;++i){uint16_t p=framebuffer[i];uint8_t rgb[]={((p>>11)&31)*255/31,((p>>5)&63)*255/63,(p&31)*255/31};assert(fwrite(rgb,1,3,f)==3);}fclose(f);
 }
+static void check_home_layout(app_ui_t *ui)
+{
+    lv_obj_update_layout(ui->screen);
+    lv_obj_t *date = find(ui->screen, "11月3日  星期二");
+    lv_obj_t *city = find(ui->screen, "上海");
+    assert(date && city);
+    lv_obj_t *card = lv_obj_get_parent(city);
+    lv_area_t time_area, date_area, weather_area;
+    lv_obj_get_coords(ui->home_time, &time_area);
+    lv_obj_get_coords(date, &date_area);
+    lv_obj_get_coords(card, &weather_area);
+    assert(time_area.y1 == 76 && date_area.y1 == 137 && weather_area.y1 == 181);
+    assert(time_area.y2 < date_area.y1 && date_area.y2 < weather_area.y1);
+    assert(lv_obj_get_style_bg_opa(card, 0) == LV_OPA_TRANSP && !lv_obj_get_style_border_width(card, 0));
+}
+static unsigned pixel_brightness(unsigned x, unsigned y)
+{
+    const uint16_t pixel = framebuffer[y * 480 + x];
+    const unsigned red = (pixel >> 11) * 255 / 31;
+    const unsigned green = ((pixel >> 5) & 63) * 255 / 63;
+    const unsigned blue = (pixel & 31) * 255 / 31;
+    return (red * 299 + green * 587 + blue * 114) / 1000;
+}
+static void test_wallpaper(app_ui_t *ui, lv_display_t *display, const char *directory)
+{
+    wallpaper_enabled = true;
+    for (unsigned i = 0; i < 2; ++i) {
+        wallpaper_color = i ? 0x203040 : 0xFFFFFF;
+        return_home(ui);
+        check_home_layout(ui);
+        lv_obj_t *hint = find(ui->screen, LV_SYMBOL_UP);
+        assert(hint && lv_obj_get_style_bg_opa(hint, 0) == LV_OPA_50);
+        capture(display, directory, i ? "home-wallpaper-dark" : "home-wallpaper-bright");
+        const unsigned upper = pixel_brightness(52, 191);
+        const unsigned lower = pixel_brightness(52, 460);
+        /* Inside/outside the old card now show the same solid-wallpaper pixels. */
+        assert(framebuffer[191 * 480 + 52] == framebuffer[191 * 480 + 25]);
+        assert(lower > upper && upper < 112);
+        if (!i) assert(upper > 60 && lower > 175);
+        swipe(240, 280, 240, 155);
+        assert(ui->content && !ui->home_time && opened == 0);
+    }
+    wallpaper_enabled = false;
+    return_home(ui);
+    puts("PASS transparent weather, raised nonoverlapping clock/date/weather, bright and dark wallpaper and swipe through weather");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);lv_init();lv_display_t *display=lv_display_create(480,480);
@@ -182,7 +244,9 @@ int main(int argc,char **argv)
     lv_obj_t *wifi_icon=find(ui.screen,LV_SYMBOL_WIFI);
     assert(wifi_icon&&lv_color_eq(lv_obj_get_style_text_color(wifi_icon,0),lv_color_hex(0xA4EBD4)));
     assert(find(ui.screen,LV_SYMBOL_BLUETOOTH)&&find(ui.screen,LV_SYMBOL_SD_CARD));
+    check_home_layout(&ui);
     capture(display,argv[1],"home-desktop");
+    test_wallpaper(&ui,display,argv[1]);
     lv_obj_t *desktop=ui.screen;
     tap(240,315);
     tap(240,315);

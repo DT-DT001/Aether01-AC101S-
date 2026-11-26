@@ -11,6 +11,7 @@ struct app_ui {
     void *page_context;
     void (*page_cleanup)(app_ui_t *);
     void (*page_back)(app_ui_t *);
+    void (*page_suspend)(app_ui_t *, bool);
 };
 bool app_power_is_sleeping(const app_power_t *);
 const lv_font_t *app_ui_chinese_font(void);

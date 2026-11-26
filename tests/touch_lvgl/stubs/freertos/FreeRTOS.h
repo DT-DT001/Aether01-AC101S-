@@ -7,4 +7,5 @@ typedef void *TaskHandle_t;
 #define pdFALSE 0
 #define pdPASS 1
 #define portMAX_DELAY UINT32_MAX
+#define pdMS_TO_TICKS(ms) (ms)
 #define portYIELD_FROM_ISR() ((void)0)

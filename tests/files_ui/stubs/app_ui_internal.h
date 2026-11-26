@@ -35,6 +35,7 @@ void app_open_files(app_ui_t *);
 void app_open_files_path(app_ui_t *,const char *);
 void app_open_reader_path(app_ui_t *,const char *);
 void app_open_music_path(app_ui_t *,const char *);
+void app_open_image_path(app_ui_t *,const char *);
 void app_open_video_path(app_ui_t *,const char *);
 void app_open_nes_path(app_ui_t *,const char *);
 size_t strlcpy(char *,const char *,size_t);

@@ -17,6 +17,7 @@ static app_io_entry_t fixtures[GALLERY_CATALOG_LIMIT];
 static app_io_request_t request;
 static bool mounted[] = {true, false};
 static bool usb_blocked, pressed;
+static bool reject_raster_resize;
 static lv_point_t point;
 static unsigned catalog_queries, catalog_cancels, leases, task_creates, previous_page_calls;
 static uint32_t generations[] = {1, 1};
@@ -33,6 +34,9 @@ uint32_t aether_media_fs_generation(aether_storage_handle_t storage, const char 
 bool app_io_usb_storage_blocked(app_io_handle_t io) { assert(io); return usb_blocked; }
 bool app_ui_input_blocked(const app_ui_t *ui) { assert(ui); return false; }
 void *heap_caps_malloc(size_t size, unsigned caps) { assert(caps == 3); return malloc(size); }
+void *heap_caps_calloc(size_t count, size_t size, unsigned caps) { assert(caps == 3); return calloc(count, size); }
+void *heap_caps_realloc(void *p, size_t size, unsigned caps)
+{ assert(caps == 3); return reject_raster_resize ? NULL : realloc(p, size); }
 esp_err_t aether_media_fs_acquire(aether_storage_handle_t storage, const char *path, aether_media_fs_lease_t *lease)
 {
     assert(storage && path && !lease->held);
@@ -202,6 +206,50 @@ static void tap(lv_obj_t *object)
 }
 
 static void previous_page(app_ui_t *ui) { assert(ui); ++previous_page_calls; }
+
+static void test_picture_formats(app_ui_t *ui)
+{
+    mounted[0] = true;
+    const uint32_t generation = generations[0];
+    const atomic_bool cancelled = false;
+    app_media_image_t image;
+    const uint16_t png[] = {0xf800, 0x0400, 0x0000, 0xffff};
+    const uint16_t gif[] = {0xf800, 0x07e0, 0x0000, 0xffff};
+    assert(app_media_image_read(ui->storage, "photos/fixture.PNG", generation, &cancelled, 480, 480, false, &image) == ESP_OK);
+    assert(image.width == 2 && image.height == 2 && !memcmp(image.pixels, png, sizeof(png)));
+    free(image.pixels);
+    assert(app_media_image_read(ui->storage, "photos/interlaced.png", generation, &cancelled, 480, 480, false, &image) == ESP_OK);
+    assert(image.width == 17 && image.height == 17);
+    for (unsigned y = 0; y < 17; ++y)
+        for (unsigned x = 0; x < 17; ++x) assert(image.pixels[y * 17 + x] == png[(y % 2) * 2 + x % 2]);
+    free(image.pixels);
+    assert(app_media_image_read(ui->storage, "photos/animated.GIF", generation, &cancelled, 480, 480, false, &image) == ESP_OK);
+    assert(image.width == 2 && image.height == 2 && !memcmp(image.pixels, gif, sizeof(gif)));
+    free(image.pixels);
+    assert(app_media_image_read(ui->storage, "photos/truncated.png", generation, &cancelled, 480, 480, false, &image) != ESP_OK);
+    assert(!image.pixels && !leases);
+    assert(app_media_image_read(ui->storage, "photos/truncated.gif", generation, &cancelled, 480, 480, false, &image) != ESP_OK);
+    assert(!image.pixels && !leases);
+    assert(app_media_image_read(ui->storage, "photos/oversize.png", generation, &cancelled, 480, 480, false, &image) == ESP_ERR_INVALID_SIZE);
+    assert(!image.pixels && !leases);
+    reject_raster_resize = true;
+    assert(app_media_image_read(ui->storage, "photos/fixture.PNG", generation, &cancelled, 480, 480, false, &image) == ESP_ERR_NO_MEM);
+    assert(!image.pixels && !leases);
+    reject_raster_resize = false;
+
+    app_open_image_path(ui, "photos/fixture.PNG");
+    ui->page_back = previous_page;
+    gallery_page_t *page = ui->page_context;
+    assert(page->job && !page->rows.viewport && !page->older && !page->newer);
+    run_worker();
+    advance(90);
+    assert(page->pixels && !strcmp(lv_label_get_text(page->image_label), "fixture.PNG") && ui->page_back == previous_page);
+    mounted[0] = false;
+    ++generations[0];
+    advance(300);
+    assert(!page->job && !page->pixels && strstr(lv_label_get_text(page->image_label), "断开"));
+    puts("PASS Gallery PNG/GIF: alpha, Adam7, GIF first frame, truncated/oversized input, and direct preview eject lifecycle");
+}
 
 static void test_wallpaper_upscale(app_ui_t *ui)
 {
@@ -431,6 +479,7 @@ int main(void)
         assert(lv_mem_test() == LV_RESULT_OK);
     }
     test_theme(&ui, display);
+    test_picture_formats(&ui);
     app_ui_begin_page(&ui, "桌面");
     advance(30);
     lv_indev_delete(pointer);

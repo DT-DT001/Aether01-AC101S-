@@ -111,6 +111,7 @@ void app_open_music(app_ui_t *ui);
 void app_open_video(app_ui_t *ui);
 void app_open_camera(app_ui_t *ui);
 void app_open_gallery(app_ui_t *ui);
+void app_open_image_path(app_ui_t *ui, const char *path);
 void app_open_reader(app_ui_t *ui);
 void app_open_files(app_ui_t *ui);
 void app_open_files_path(app_ui_t *ui, const char *path);

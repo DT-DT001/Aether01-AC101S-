@@ -352,6 +352,18 @@ esp_err_t aether_nes_set_input_gate(aether_nes_handle_t handle, bool (*gate)(voi
     return ESP_OK;
 }
 
+esp_err_t aether_nes_set_touch_reader(aether_nes_handle_t handle,
+                                      aether_nes_touch_reader_t reader, void *context)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&handle->lock);
+    if (handle->running) { portEXIT_CRITICAL(&handle->lock); return ESP_ERR_INVALID_STATE; }
+    handle->touch_reader = reader;
+    handle->touch_reader_context = context;
+    portEXIT_CRITICAL(&handle->lock);
+    return ESP_OK;
+}
+
 esp_err_t aether_nes_stop_wait(aether_nes_handle_t handle, uint32_t timeout_ms)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;

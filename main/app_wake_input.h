@@ -1,5 +1,9 @@
 #pragma once
 
-/* Consume held touch across an explicit power/BOOT-key wake. No display wake
- * is requested by touch input, and this function performs no I2C or LVGL IO. */
+#include <stdbool.h>
+
+/* Consume held touch across a display wake. The gesture never reaches LVGL. */
 void app_touch_consume_wake_gesture(void);
+
+/* Enable touch IRQ dispatch only while the display is awake. Called with the LVGL lock held. */
+void app_touch_set_screen_awake(bool awake);

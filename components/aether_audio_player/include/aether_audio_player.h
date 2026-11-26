@@ -110,6 +110,8 @@ esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t handl
 esp_err_t aether_audio_player_restore(aether_audio_player_handle_t handle);
 /** Previous/next wrap the playlist and replace the current stream asynchronously. */
 esp_err_t aether_audio_player_next(aether_audio_player_handle_t handle, int direction);
+/* Step an already playing music playlist while its screen is suspended. */
+esp_err_t aether_audio_player_step_in_standby(aether_audio_player_handle_t handle, int direction);
 /** Select a playlist entry without relying on a foreground UI timer. */
 esp_err_t aether_audio_player_select(aether_audio_player_handle_t handle, size_t index);
 /** Wait for codec, file, and mount lease cleanup. Call outside the LVGL task. */

@@ -15,7 +15,9 @@ typedef struct {
     uint32_t state_color;
     float shown_roll,shown_pitch,shown_yaw,shown_linear;
     app_motion_action_t shown_action;
-    bool sleeping;
+    float previous_gravity[3];
+    uint32_t zero_requested_ms;
+    bool sleeping, zero_pending, have_gravity;
 } motion_page_t;
 typedef struct {float x,y,z;} vector_t;
 /* The relative zero belongs to this power session, not a single screen. */
@@ -134,21 +136,58 @@ static bool fresh_imu(const app_telemetry_snapshot_t *sample)
            now - sample->imu_updated_ms <= 250;
 }
 
+static bool apply_zero(motion_page_t *page, const app_telemetry_snapshot_t *sample)
+{
+    if (!fresh_imu(sample) || !app_motion_filter_zero_at(&page->filter, sample->imu.accel_mps2,
+                                                       sample->imu_updated_ms)) return false;
+    memcpy(zero_reference, page->filter.reference, sizeof(zero_reference));
+    page->zero_pending = false;
+    update_labels(page);
+    motion_state(page, "已归零", INSTRUMENT_TEAL);
+    lv_obj_invalidate(page->model);
+    return true;
+}
+
 static void motion_zero(lv_event_t *event)
 {
     app_ui_t *ui = lv_event_get_user_data(event);
     motion_page_t *page = ui->page_context;
-    if (!page || !page->filter.initialized || app_power_is_sleeping(ui->power)) return;
+    if (!page || app_power_is_sleeping(ui->power)) return;
     app_telemetry_snapshot_t sample;
     app_telemetry_get(&sample);
-    if (!fresh_imu(&sample) || !app_motion_level_reference(sample.imu.accel_mps2, zero_reference)) {
+    if (!apply_zero(page, &sample)) {
+        page->zero_pending = true;
+        page->zero_requested_ms = (uint32_t)(esp_timer_get_time() / 1000);
         motion_state(page, "将设备放稳", INSTRUMENT_MUTED);
-        return;
     }
-    memcpy(page->filter.q, zero_reference, sizeof(zero_reference));
-    app_motion_filter_zero(&page->filter);
-    update_labels(page);
-    lv_obj_invalidate(page->model);
+}
+
+static const float *motion_rates(motion_page_t *page, const qmi8658a_sample_t *imu, float adjusted[3])
+{
+    const float *accel = imu->accel_mps2, *gyro = imu->gyro_dps;
+    const float norm = sqrtf(accel[0]*accel[0] + accel[1]*accel[1] + accel[2]*accel[2]);
+    bool steady_gravity = false;
+    if (norm >= 7.8f && norm <= 11.8f) {
+        float delta = 0.0f;
+        for (unsigned i = 0; i < 3; ++i) {
+            const float direction = accel[i] / norm;
+            const float difference = direction - page->previous_gravity[i];
+            delta += difference * difference;
+            page->previous_gravity[i] = direction;
+        }
+        steady_gravity = page->have_gravity && delta < 0.0001f;
+        page->have_gravity = true;
+    } else page->have_gravity = false;
+    if (imu->gyro_stationary) return adjusted;
+    if (!steady_gravity) return gyro;
+
+    /* A steady gravity vector contradicts transverse angular drift. Keep
+     * heading about gravity, which the accelerometer cannot observe. */
+    float heading = 0.0f;
+    for (unsigned i = 0; i < 3; ++i) heading += gyro[i] * page->previous_gravity[i];
+    if (fabsf(heading) > 1.2f)
+        for (unsigned i = 0; i < 3; ++i) adjusted[i] = heading * page->previous_gravity[i];
+    return adjusted;
 }
 static void motion_calibrate(lv_event_t *event)
 {
@@ -163,12 +202,18 @@ static void motion_tick(lv_timer_t *timer) {
     if(asleep) {
         if(!page->sleeping) app_telemetry_set_interest(0);
         app_ui_gyro_calibration_close(&page->calibration);
+        page->zero_pending = page->have_gravity = false;
         page->sleeping=true;return;
     }
     if(page->sleeping) {page->sleeping=false;app_telemetry_set_interest(APP_TELEMETRY_IMU);}
     app_ui_gyro_calibration_refresh(&page->calibration);
     app_telemetry_snapshot_t sample;app_telemetry_get(&sample);
     if(sample.gyro_calibrating) return;
+    const uint32_t now=(uint32_t)(esp_timer_get_time()/1000);
+    if (page->zero_pending) {
+        if (now - page->zero_requested_ms > 800) page->zero_pending = false;
+        else if (apply_zero(page, &sample)) return;
+    }
     if(sample.imu_error!=ESP_OK) {
         motion_state(page, "等待采样", INSTRUMENT_MUTED);
         app_ui_label_text(page->acceleration, "--");
@@ -181,11 +226,11 @@ static void motion_tick(lv_timer_t *timer) {
         app_ui_label_text(page->rotation, "--");
         return;
     }
-    const float still_gyro[3] = {0};
-    const float *gyro = sample.imu.gyro_stationary ? still_gyro : sample.imu.gyro_dps;
+    if (page->filter.initialized && sample.imu_updated_ms == page->filter.stamp) return;
+    float adjusted[3] = {0};
+    const float *gyro = motion_rates(page, &sample.imu, adjusted);
     if(!app_motion_filter_update_tilt(&page->filter,sample.imu.accel_mps2,gyro,
                                       sample.imu_updated_ms,sample.imu.gyro_bias_valid)) return;
-    uint32_t now=(uint32_t)(esp_timer_get_time()/1000);
     bool changed=fabsf(page->filter.roll-page->shown_roll)>.15f || fabsf(page->filter.pitch-page->shown_pitch)>.15f ||
         fabsf(page->filter.yaw-page->shown_yaw)>.15f || fabsf(page->filter.linear-page->shown_linear)>.12f || page->shown_action!=page->filter.action;
     if(changed && now-page->draw_ms>=33) {
@@ -256,7 +301,7 @@ static void level_tick(lv_timer_t *timer)
     const float angle = hypotf(page->roll, page->pitch);
     const float scale = 82.0f / fmaxf(12.0f, angle);
     if (!was_ready) lv_obj_remove_flag(page->bubble, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_align(page->bubble, LV_ALIGN_CENTER, (int)lroundf(page->pitch * scale),
+    lv_obj_align(page->bubble, LV_ALIGN_CENTER, (int)lroundf(-page->pitch * scale),
                  (int)lroundf(-page->roll * scale));
     const bool level = angle <= (page->level && was_ready ? .6f : .45f);
     if (!was_ready || page->level != level) {
@@ -369,6 +414,5 @@ void app_open_motion(app_ui_t *ui) {
     instrument_button_style(level, INSTRUMENT_SECONDARY);
     lv_obj_add_event_cb(level, open_level, LV_EVENT_CLICKED, ui);
     app_ui_add_text(level, "水平仪", LV_ALIGN_CENTER, 0, 0, 0xFFFFFF, small);
-    text(content,"相对航向可能随时间漂移",8,333,INSTRUMENT_MUTED,16);
     app_ui_set_timer(ui,motion_tick,20);motion_tick(ui->timer);
 }

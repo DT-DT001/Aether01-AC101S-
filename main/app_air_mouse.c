@@ -18,7 +18,7 @@ static void normalize(float v[3])
     for (unsigned axis = 0; axis < 3; ++axis) v[axis] /= norm;
 }
 
-static int8_t pixels(app_air_mouse_t *mouse, unsigned axis, float rate, float dt)
+static int8_t pixels(app_air_mouse_t *mouse, unsigned axis, float rate, float dt, float sensitivity)
 {
     const float deadband = 0.65f;
     const float effective = copysignf(fmaxf(0, fabsf(rate) - deadband), rate);
@@ -28,7 +28,7 @@ static int8_t pixels(app_air_mouse_t *mouse, unsigned axis, float rate, float dt
         return 0;
     }
     const float gain = 8.0f + fminf(4.0f, fabsf(effective) * 0.04f);
-    const float total = mouse->fraction[axis] + mouse->velocity[axis] * dt * gain;
+    const float total = mouse->fraction[axis] + mouse->velocity[axis] * dt * gain * sensitivity;
     const int8_t whole = (int8_t)fmaxf(-127, fminf(127, total));
     mouse->fraction[axis] = fabsf(total) < 127 ? total - whole : 0;
     return whole;
@@ -36,7 +36,7 @@ static int8_t pixels(app_air_mouse_t *mouse, unsigned axis, float rate, float dt
 
 bool app_air_mouse_update(app_air_mouse_t *mouse, const float accel[3],
                           const float gyro[3], bool stationary, uint32_t stamp,
-                          int8_t *dx, int8_t *dy)
+                          unsigned sensitivity_percent, int8_t *dx, int8_t *dy)
 {
     *dx = *dy = 0;
     for (unsigned axis = 0; axis < 3; ++axis) {
@@ -73,7 +73,8 @@ bool app_air_mouse_update(app_air_mouse_t *mouse, const float accel[3],
     const float horizontal = hypotf(mouse->up[0], mouse->up[1]);
     const float pitch = horizontal > 0.25f ?
         (gyro[0]*mouse->up[1] - gyro[1]*mouse->up[0]) / horizontal : gyro[0];
-    *dx = pixels(mouse, 0, -dot(gyro, mouse->up), dt);
-    *dy = pixels(mouse, 1, -pitch, dt);
+    const float sensitivity = sensitivity_percent * .01f;
+    *dx = pixels(mouse, 0, -dot(gyro, mouse->up), dt, sensitivity);
+    *dy = pixels(mouse, 1, -pitch, dt, sensitivity);
     return *dx != 0 || *dy != 0;
 }

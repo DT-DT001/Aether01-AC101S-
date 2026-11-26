@@ -14,6 +14,8 @@ struct aether_nes_t {
     aether_media_fs_lease_t media_lease;
     ac101s_audio_handle_t audio;
     esp_lcd_touch_handle_t touch;
+    aether_nes_touch_reader_t touch_reader;
+    void *touch_reader_context;
     portMUX_TYPE lock;
     bool running;
     bool stop_barrier;

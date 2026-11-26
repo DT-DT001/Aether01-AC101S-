@@ -880,6 +880,7 @@ static void test_playback_standby(void)
     aether_audio_player_set_screen_suspended(h, false);
     current = wait_state(h, AETHER_AUDIO_PLAYING);
     wait_pcm(before);
+    assert(aether_audio_player_step_in_standby(h, 1) == ESP_ERR_INVALID_STATE);
 
     /* Park the next song while it opens, then enter timed standby at STARTING. */
     acquire_entered = false;
@@ -901,6 +902,13 @@ static void test_playback_standby(void)
         vTaskDelay(1);
     }
     assert(current.position_ms > 1250 && current.state == AETHER_AUDIO_PLAYING);
+    assert(aether_audio_player_step_in_standby(h, -1) == ESP_OK);
+    for (unsigned i = 0; i < 1000; ++i) {
+        assert(aether_audio_player_get_status(h, &current) == ESP_OK);
+        if (current.state == AETHER_AUDIO_PLAYING && !strcmp(current.path, first)) break;
+        vTaskDelay(1);
+    }
+    assert(current.state == AETHER_AUDIO_PLAYING && !strcmp(current.path, first));
     aether_audio_player_set_screen_suspended(h, false);
 
     /* A user's pause remains independent of screen power. */
@@ -908,6 +916,7 @@ static void test_playback_standby(void)
     current = wait_state(h, AETHER_AUDIO_PAUSED);
     before = writes;
     aether_audio_player_set_screen_suspended(h, true);
+    assert(aether_audio_player_step_in_standby(h, 1) == ESP_ERR_INVALID_STATE);
     aether_audio_player_set_screen_suspended(h, false);
     vTaskDelay(20);
     assert(writes == before && !codec_on);

@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <string.h>
-#include <setjmp.h>
 #include "../../main/app_touch.c"
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %u: %s\n", __LINE__, #c); return 1; } } while (0)
@@ -17,37 +16,15 @@ static lv_display_t display;
 static struct esp_lcd_touch touch;
 static app_power_t power;
 static void (*registered_irq)(esp_lcd_touch_handle_t);
-static void (*wake_worker)(void *);
-static void *wake_worker_context;
-static bool task_allowed;
-static unsigned notify_count, worker_creates, isr_notifies, isr_yields;
-static jmp_buf wake_worker_exit;
-
-BaseType_t xTaskCreate(void (*entry)(void *), const char *name, uint32_t stack,
-                       void *context, unsigned priority, TaskHandle_t *out)
-{
-    (void)name; (void)stack; (void)priority;
-    ++worker_creates;
-    if (!task_allowed) return pdFALSE;
-    wake_worker = entry; wake_worker_context = context; *out = &wake_worker;
-    return pdPASS;
-}
-uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t wait)
-{
-    if (clear != pdTRUE || wait != portMAX_DELAY) return 0;
-    if (!notify_count) longjmp(wake_worker_exit, 1);
-    unsigned count = notify_count; notify_count = 0; return count;
-}
-void vTaskNotifyGiveFromISR(TaskHandle_t task, BaseType_t *yield)
-{
-    if (task == &wake_worker) { ++notify_count; ++isr_notifies; *yield = pdTRUE; }
-}
-void test_yield_from_isr(void) { ++isr_yields; }
 int64_t esp_timer_get_time(void) { return now_us; }
 uint32_t cst9220_report_sequence(esp_lcd_touch_handle_t handle)
 { return handle == &touch ? source_sequence : 0; }
 esp_err_t esp_lcd_touch_read_data(esp_lcd_touch_handle_t handle)
-{ (void)handle; ++read_calls; return read_error; }
+{
+    (void)handle;
+    ++read_calls;
+    return read_error;
+}
 esp_err_t esp_lcd_touch_get_data(esp_lcd_touch_handle_t handle, esp_lcd_touch_point_data_t *points,
                                  uint8_t *count, uint8_t maximum)
 {
@@ -107,8 +84,6 @@ static void reset(void)
     point_x = 100; point_y = 120;
     touch.config.int_gpio_num = 7;
     registered_irq = NULL;
-    wake_worker = NULL; wake_worker_context = NULL; task_allowed = true;
-    notify_count = worker_creates = isr_notifies = isr_yields = 0;
 }
 
 static lv_indev_data_t sample(void)
@@ -140,7 +115,6 @@ static int test_initialization(void)
     CHECK(registered_irq);
     registered_irq(&touch);
     CHECK(task_wakes == 1);
-    CHECK(worker_creates == 0 && isr_notifies == 0 && isr_yields == 0);
     reset();
     touch.config.int_gpio_num = GPIO_NUM_NC;
     CHECK(app_touch_add(&display, &touch, &power));
@@ -153,21 +127,29 @@ static int test_independent_wake(void)
 {
     reset();
     CHECK(app_touch_add(&display, &touch, &power));
-    CHECK(!wake_worker && worker_creates == 0);
-    power.sleeping = true;
-    registered_irq(&touch);
-    CHECK(wake_calls == 0 && notify_count == 0 && read_calls == 0);
-    lock_allowed = false;
-    CHECK(sample().state == LV_INDEV_STATE_RELEASED && s_touch.consume_gesture);
-    registered_irq(&touch);
-    CHECK(sample().state == LV_INDEV_STATE_RELEASED && !wake_calls);
-    power.sleeping = false; /* Physical key completed the wake. */
-    CHECK(sample().state == LV_INDEV_STATE_RELEASED);
-    point_count = 0;
-    CHECK(sample().state == LV_INDEV_STATE_RELEASED && !s_touch.consume_gesture);
-    point_count = 1;
-    CHECK(sample().state == LV_INDEV_STATE_PRESSED);
-    puts("PASS screen-off IRQ/polling never requests wake or creates wake worker; held finger consumed across physical-key wake");
+    for (unsigned round = 0; round < 3; ++round) {
+        const unsigned before_reads = read_calls, before_wakes = task_wakes;
+        power.sleeping = true;
+        app_touch_set_screen_awake(false);
+        point_count = 1;
+        for (unsigned i = 0; i < 24; ++i) {
+            point_x = (uint16_t)(450 - i * 15);
+            ++source_sequence;
+            registered_irq(&touch);
+            CHECK(sample().state == LV_INDEV_STATE_RELEASED);
+        }
+        CHECK(read_calls == before_reads && task_wakes == before_wakes && !wake_calls);
+        CHECK(power.sleeping && !power.wake_requested);
+        app_touch_consume_wake_gesture();
+        power.sleeping = false;
+        app_touch_set_screen_awake(true);
+        CHECK(sample().state == LV_INDEV_STATE_RELEASED);
+        point_count = 0; ++source_sequence;
+        CHECK(sample().state == LV_INDEV_STATE_RELEASED && !s_touch.consume_gesture);
+        point_count = 1; ++source_sequence;
+        CHECK(sample().state == LV_INDEV_STATE_PRESSED);
+    }
+    puts("PASS three cycles discard dark-screen swipes without I2C/IRQ dispatch; held touch consumed through power-key wake");
     return 0;
 }
 

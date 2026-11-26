@@ -5,14 +5,11 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 #define TOUCH_STALE_US 1800000LL
 #define TOUCH_UNMATCHED_IRQ_US 64000LL
 #define TOUCH_MOVING_IRQ_US 140000LL
 #define TOUCH_MOTION_DISTANCE 12
-
 typedef struct {
     esp_lcd_touch_handle_t touch;
     app_power_t *power;
@@ -22,6 +19,7 @@ typedef struct {
     atomic_bool consume_gesture;
     atomic_bool enabled;
     atomic_uint irq_count;
+    atomic_bool screen_awake;
     bool pressed, moving, have_report, transport_blocked, stale_report, unmatched_irq;
     int16_t origin_x, origin_y;
     uint32_t report_sequence, report_irq;
@@ -36,6 +34,28 @@ typedef struct {
 /* One fitted touch controller, retained for the entire application lifetime. */
 static touch_context_t s_touch;
 static atomic_bool s_touch_registered;
+
+/* Both callers hold the LVGL port lock. This also serializes the
+ * touch controller's paired read/get operations across screen transitions. */
+static esp_err_t read_points(const touch_context_t *ctx, esp_lcd_touch_point_data_t *points,
+                            uint8_t *count, uint8_t capacity)
+{
+    esp_err_t err = esp_lcd_touch_read_data(ctx->touch);
+    if (err == ESP_OK) err = esp_lcd_touch_get_data(ctx->touch, points, count, capacity);
+    return err;
+}
+
+esp_err_t app_touch_read_nes(void *context, esp_lcd_touch_point_data_t *points,
+                             uint8_t *count, uint8_t capacity)
+{
+    (void)context;
+    if (!atomic_load(&s_touch_registered) || !lvgl_port_lock(1)) return ESP_ERR_TIMEOUT;
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (!atomic_load(&s_touch.enabled) && !app_power_is_sleeping(s_touch.power))
+        err = read_points(&s_touch, points, count, capacity);
+    lvgl_port_unlock();
+    return err;
+}
 
 static void cancel_press(touch_context_t *ctx)
 {
@@ -83,14 +103,17 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
     touch_context_t *ctx = lv_indev_get_driver_data(indev);
     const int64_t now = esp_timer_get_time();
     data->state = LV_INDEV_STATE_RELEASED;
+    if (!atomic_load(&ctx->screen_awake) || app_power_is_sleeping(ctx->power)) {
+        cancel_press(ctx);
+        atomic_store(&ctx->consume_gesture, true);
+        return;
+    }
     if (now < ctx->retry_after_us) return;
 
     const uint32_t irq = atomic_load(&ctx->irq_count);
     uint8_t count = 0;
     esp_lcd_touch_point_data_t points[CONFIG_ESP_LCD_TOUCH_MAX_POINTS] = {0};
-    esp_err_t err = esp_lcd_touch_read_data(ctx->touch);
-    if (err == ESP_OK) err = esp_lcd_touch_get_data(ctx->touch, points, &count,
-                                                   CONFIG_ESP_LCD_TOUCH_MAX_POINTS);
+    const esp_err_t err = read_points(ctx, points, &count, CONFIG_ESP_LCD_TOUCH_MAX_POINTS);
     const int64_t sampled_at = esp_timer_get_time();
     const uint32_t sequence = cst9220_report_sequence(ctx->touch);
     if (sequence != ctx->report_sequence) {
@@ -118,8 +141,7 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
         return;
     }
     ctx->retry_after_us = 0;
-    const bool sleeping = ctx->power && app_power_is_sleeping(ctx->power);
-    if (sleeping || atomic_load(&ctx->consume_gesture)) cancel_press(ctx);
+    if (atomic_load(&ctx->consume_gesture)) cancel_press(ctx);
     if (count == 0) {
         ctx->pressed = false;
         ctx->transport_blocked = false;
@@ -134,13 +156,6 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
         cancel_press(ctx);
         return;
     }
-    if (sleeping) {
-        /* Screen-off touch is consumed, including a finger held across a
-         * later power-key wake. Only an explicit wake source lights the panel. */
-        atomic_store(&ctx->consume_gesture, true);
-        return;
-    }
-    /* A held screen-off/key-wake gesture must not click the foreground page. */
     if (atomic_load(&ctx->consume_gesture)) return;
     if (ctx->stale_report) return;
     if (ctx->have_report) {
@@ -178,7 +193,7 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
 static void touch_interrupt(esp_lcd_touch_handle_t touch)
 {
     touch_context_t *ctx = touch->config.user_data;
-    if (!ctx || !ctx->indev) return;
+    if (!ctx || !ctx->indev || !atomic_load(&ctx->screen_awake)) return;
     atomic_fetch_add(&ctx->irq_count, 1);
     /* This installed esp_lvgl_port implementation handles ISR context itself. */
     lvgl_port_task_wake(LVGL_PORT_EVENT_TOUCH, ctx->indev);
@@ -207,6 +222,16 @@ bool app_touch_set_shutdown_paused(bool paused)
     return was_enabled;
 }
 
+void app_touch_set_screen_awake(bool awake)
+{
+    if (!atomic_load(&s_touch_registered)) return;
+    atomic_store(&s_touch.screen_awake, awake);
+    if (!awake) {
+        atomic_store(&s_touch.consume_gesture, true);
+        cancel_press(&s_touch);
+    }
+}
+
 void app_touch_consume_wake_gesture(void)
 {
     if (atomic_load(&s_touch_registered) && atomic_load(&s_touch.enabled))
@@ -223,6 +248,7 @@ lv_indev_t *app_touch_add(lv_display_t *display, esp_lcd_touch_handle_t touch,
         atomic_init(&s_touch.consume_gesture, false);
         atomic_init(&s_touch.enabled, true);
         atomic_init(&s_touch.irq_count, 0);
+        atomic_init(&s_touch.screen_awake, !app_power_is_sleeping(power));
         lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
         lv_indev_set_disp(indev, display);
         lv_indev_set_driver_data(indev, &s_touch);
@@ -235,7 +261,7 @@ lv_indev_t *app_touch_add(lv_display_t *display, esp_lcd_touch_handle_t touch,
             if (err != ESP_OK) ESP_LOGW("app_touch", "IRQ unavailable, using polling: %s", esp_err_to_name(err));
         }
         atomic_store(&s_touch_registered, true);
-        ESP_LOGI("app_touch", "touch polling=8 ms; screen-off touch wake disabled");
+        ESP_LOGI("app_touch", "touch polling=8 ms while display is awake");
     }
     lvgl_port_unlock();
     return indev;

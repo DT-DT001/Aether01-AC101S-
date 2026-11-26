@@ -1,5 +1,6 @@
 #include "app_ui_internal.h"
 #include "app_catalog_ui.h"
+#include "app_gallery_format.h"
 #include "app_scroll_list.h"
 #include "app_text.h"
 #include "app_media_image.h"
@@ -137,21 +138,28 @@ static void gallery_drop_pixels(gallery_page_t *page)
     page->pixels = NULL;
 }
 
-static void gallery_close_viewer(app_ui_t *ui, gallery_page_t *page)
+static void gallery_cancel_decode(gallery_page_t *page)
 {
     if (page->job) {
         atomic_store(&page->job->cancelled, true);
         job_release(page->job);
         page->job = NULL;
     }
+}
+
+static void gallery_close_viewer(app_ui_t *ui, gallery_page_t *page)
+{
+    gallery_cancel_decode(page);
     gallery_drop_pixels(page);
     if (page->viewer) {
         lv_obj_delete(page->viewer);
         page->viewer = NULL;
         page->image = NULL;
         page->apply = NULL;
-        ui->page_back = page->list_back;
-        lv_obj_remove_flag(page->rows.viewport, LV_OBJ_FLAG_HIDDEN);
+        if (page->rows.viewport) {
+            ui->page_back = page->list_back;
+            lv_obj_remove_flag(page->rows.viewport, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -194,6 +202,7 @@ static size_t adjacent_photo(const gallery_page_t *page, int direction)
 
 static void viewer_controls(gallery_page_t *page)
 {
+    if (!page->rows.viewport) return;
     const bool ready = !page->job && !page->saving;
     set_enabled(page->older, ready && adjacent_photo(page, -1) != SIZE_MAX);
     set_enabled(page->newer, ready && adjacent_photo(page, 1) != SIZE_MAX);
@@ -260,21 +269,23 @@ static void gallery_show_image(app_ui_t *ui, size_t index)
         page->image_label = app_ui_add_text(page->viewer, "", LV_ALIGN_TOP_LEFT, 8, 280, 0xB7CCE8, NULL);
         lv_obj_set_width(page->image_label, 392);
         lv_label_set_long_mode(page->image_label, LV_LABEL_LONG_DOT);
-        page->older = gallery_button(page->viewer, LV_SYMBOL_PREV, 240, 307, 72, viewer_action, ui, -1);
-        page->newer = gallery_button(page->viewer, LV_SYMBOL_NEXT, 328, 307, 72, viewer_action, ui, 1);
+        if (page->rows.viewport) {
+            page->older = gallery_button(page->viewer, LV_SYMBOL_PREV, 240, 307, 72, viewer_action, ui, -1);
+            page->newer = gallery_button(page->viewer, LV_SYMBOL_NEXT, 328, 307, 72, viewer_action, ui, 1);
+            page->list_back = ui->page_back;
+            ui->page_back = gallery_viewer_back;
+            lv_obj_stop_scroll_anim(page->rows.viewport);
+            lv_obj_add_flag(page->rows.viewport, LV_OBJ_FLAG_HIDDEN);
+        }
         if (page->wallpaper) {
             page->apply = gallery_button(page->viewer, "设为壁纸", 8, 307, 146, apply_wallpaper, ui, 0);
             lv_obj_set_style_text_font(lv_obj_get_child(page->apply, 0), app_ui_chinese_font(), 0);
         }
-        page->list_back = ui->page_back;
-        ui->page_back = gallery_viewer_back;
-        lv_obj_stop_scroll_anim(page->rows.viewport);
-        lv_obj_add_flag(page->rows.viewport, LV_OBJ_FLAG_HIDDEN);
     }
     page->selected = index;
     gallery_drop_pixels(page);
     if (atomic_exchange(&decode_running, true)) {
-        app_ui_label_text(page->image_label, "上次读图正在结束，返回列表后重试");
+        app_ui_label_text(page->image_label, "上一张正在结束，请返回后重试");
         viewer_controls(page);
         return;
     }
@@ -287,7 +298,9 @@ static void gallery_show_image(app_ui_t *ui, size_t index)
         job->wallpaper = page->wallpaper;
         job->generation = page->media.generations[gallery_source(path)];
         strlcpy(job->path, path, sizeof(job->path));
-        if (xTaskCreate(image_decode_task, "gallery", 4096, job, 3, NULL) != pdPASS) {
+        /* PNG's Huffman tables are larger than the streaming BMP/GIF stack. */
+        const unsigned stack = app_gallery_format(path) == APP_IMAGE_PNG ? 12288 : 4096;
+        if (xTaskCreate(image_decode_task, "gallery", stack, job, 3, NULL) != pdPASS) {
             free(job);
             job = NULL;
         }
@@ -327,13 +340,15 @@ static void gallery_present(gallery_page_t *page)
         char name[192];
         strlcpy(name, file_name(job->path), sizeof(name));
         app_text_sanitize_utf8(name, strlen(name));
-        app_ui_label_fmt(page->image_label, "%u / %u  ·  %s", (unsigned)page->selected + 1U,
-                         (unsigned)page->count, name);
+        if (page->rows.viewport) {
+            app_ui_label_fmt(page->image_label, "%u / %u  ·  %s", (unsigned)page->selected + 1U,
+                             (unsigned)page->count, name);
+        } else app_ui_label_text(page->image_label, name);
     } else {
-        const char *reason = job->error == ESP_ERR_NOT_SUPPORTED ? "仅支持基线 JPEG 或 24/32 位未压缩 BMP" :
+        const char *reason = job->error == ESP_ERR_NOT_SUPPORTED ? "图片编码暂不支持" :
                              job->error == ESP_ERR_NO_MEM ? "内存不足" :
                              job->error == ESP_ERR_INVALID_SIZE ? "图片太大或尺寸无效" :
-                             job->error == ESP_ERR_NOT_FOUND ? "文件已移除" : "文件损坏或读取失败";
+                             job->error == ESP_ERR_NOT_FOUND ? "文件已移除" : "数据损坏或解码失败";
         app_ui_label_fmt(page->image_label, "无法打开图片 · %s", reason);
     }
     job_release(job);
@@ -426,7 +441,7 @@ static void gallery_catalog_ready(app_ui_t *ui, const app_io_result_t *result)
     } else if (page->count) {
         app_ui_label_fmt(page->summary, "共 %u 张", (unsigned)page->count);
     } else {
-        app_ui_label_text(page->summary, "没有可显示的图片 · 支持 JPEG、BMP");
+        app_ui_label_text(page->summary, "没有可显示的图片 · JPEG、PNG、BMP、GIF");
     }
     catalog_controls(page);
 }
@@ -482,6 +497,16 @@ static void gallery_timer(lv_timer_t *timer)
     app_ui_t *ui = lv_timer_get_user_data(timer);
     gallery_page_t *page = ui->page_context;
     if (!page) return;
+    if (!page->rows.viewport) {
+        if (page->viewer && !gallery_selection_ready(ui, page, page->entries[0].path)) {
+            gallery_cancel_decode(page);
+            gallery_drop_pixels(page);
+            app_ui_label_text(page->image_label, "图片来源已断开");
+            lv_timer_pause(timer);
+        } else gallery_present(page);
+        if (!page->job) lv_timer_set_period(timer, 250);
+        return;
+    }
     if (page->saving) {
         const esp_err_t result = app_theme_write_status();
         if (result == ESP_ERR_NOT_FINISHED) return;
@@ -533,3 +558,29 @@ static void open_gallery(app_ui_t *ui, bool wallpaper)
 
 void app_open_gallery(app_ui_t *ui) { open_gallery(ui, false); }
 void app_open_wallpaper_picker(app_ui_t *ui) { open_gallery(ui, true); }
+
+void app_open_image_path(app_ui_t *ui, const char *path)
+{
+    lv_obj_t *content = app_ui_begin_page(ui, "图片");
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    app_catalog_panel(content);
+    lv_obj_set_style_pad_all(content, 19, 0);
+    gallery_page_t *page = calloc(1, sizeof(*page));
+    if (page) page->entries = calloc(1, sizeof(*page->entries));
+    if (!page || !page->entries) {
+        free(page);
+        app_ui_add_text(content, "内存不足", LV_ALIGN_CENTER, 0, 0, 0xFF8888, NULL);
+        return;
+    }
+    ui->page_context = page;
+    ui->page_cleanup = gallery_cleanup;
+    page->count = 1;
+    strlcpy(page->entries[0].path, path, sizeof(page->entries[0].path));
+    page->media = gallery_media(ui, false);
+    if (!gallery_selection_ready(ui, page, page->entries[0].path)) {
+        app_ui_add_text(content, "图片来源已断开", LV_ALIGN_CENTER, 0, 0, 0xFF8888, NULL);
+        return;
+    }
+    app_ui_set_timer(ui, gallery_timer, 250);
+    gallery_show_image(ui, 0);
+}

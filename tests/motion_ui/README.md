@@ -29,3 +29,6 @@ filter suite covers its arithmetic with ASan/UBSan.
 The runner exports `build/host_motion_ui/stand.png`, `tilt.png` and `rotate.png`
 from actual mock-display pixels for visual review. The omitted common battery
 badge is covered by its own UI suite.
+
+For native Windows use `CC` with the full path to an installed MinGW Clang and
+`AETHER_MOTION_UI_OUT` with a writable native build directory.

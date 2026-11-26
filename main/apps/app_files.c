@@ -1,5 +1,6 @@
 #include "aether_media_fs.h"
 #include "app_ui_internal.h"
+#include "app_gallery_format.h"
 #include "app_catalog_ui.h"
 #include "app_text.h"
 #include "ui/app_scroll_list.h"
@@ -404,7 +405,8 @@ static void file_clicked(lv_event_t *event)
     const char *ext = strrchr(item.path, '.');
     const bool text = ext && !strcasecmp(ext, ".txt");
     const bool audio = ext && (!strcasecmp(ext, ".wav") || !strcasecmp(ext, ".mp3") || !strcasecmp(ext, ".m4a"));
-    if (text || audio) {
+    const bool image = app_gallery_format(item.path) != APP_IMAGE_UNKNOWN;
+    if (text || audio || image) {
         files_capture_entry_route(ui, page);
         app_files_return_t previous = {
             .exit_path_length = page->exit_path_length,
@@ -415,7 +417,8 @@ static void file_clicked(lv_event_t *event)
         /* Opening a file frees this browser page. Keep its return location. */
         strlcpy(previous.directory, page->directory, sizeof(previous.directory));
         if (text) app_open_reader_path(ui, item.path);
-        else app_open_music_path(ui, item.path);
+        else if (audio) app_open_music_path(ui, item.path);
+        else app_open_image_path(ui, item.path);
         ui->files_return = previous;
         ui->page_back = files_back_from_media;
     }

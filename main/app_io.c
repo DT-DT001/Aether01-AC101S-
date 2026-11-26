@@ -94,7 +94,7 @@ static bool matches(const char *name, app_io_operation_t filter)
     case APP_IO_VIDEO: return !strcasecmp(dot, ".mjpg") || !strcasecmp(dot, ".mjpeg") || !strcasecmp(dot, ".avi") || !strcasecmp(dot, ".mp4") || !strcasecmp(dot, ".m4v");
     case APP_IO_NES: return !strcasecmp(dot, ".nes");
     case APP_IO_BOOK: return !strcasecmp(dot, ".txt");
-    case APP_IO_IMAGES: return !strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".bmp");
+    case APP_IO_IMAGES: return app_gallery_format(name) != APP_IMAGE_UNKNOWN;
     default: return false;
     }
 }
@@ -208,13 +208,19 @@ static bool gallery_photo(const app_io_entry_t *item, bool *partial)
     if (item->size < 16) return false;
     FILE *file = fopen(item->path, "rb");
     if (!file) { *partial = true; return false; }
-    const char *ext = strrchr(item->path, '.');
+    const app_gallery_format_t format = app_gallery_format(item->path);
     bool valid;
-    if (ext && !strcasecmp(ext, ".bmp")) {
+    if (format == APP_IMAGE_BMP) {
         uint8_t header[54];
         app_gallery_bmp_t bmp;
         valid = item->size <= LONG_MAX && fread(header, 1, sizeof(header), file) == sizeof(header) &&
                 app_gallery_bmp_header(header, item->size, &bmp) == ESP_OK;
+    } else if (format == APP_IMAGE_PNG || format == APP_IMAGE_GIF) {
+        uint8_t header[33];
+        unsigned width, height;
+        const size_t bytes = fread(header, 1, sizeof(header), file);
+        valid = item->size <= APP_GALLERY_RASTER_MAX_FILE &&
+                app_gallery_raster_header(format, header, bytes, &width, &height) == ESP_OK;
     } else {
         valid = jpeg_photo_header(file, item->size);
     }

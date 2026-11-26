@@ -623,16 +623,23 @@ void app_open_nes_path(app_ui_t *ui, const char *path)
         media_button(ui->screen, "返回", APP_HEADER_SIDE_INSET, APP_HEADER_TOP_INSET, 72, media_back, ui);
         app_ui_add_text(content, "NES 未就绪，请检查触摸和存储", LV_ALIGN_CENTER, 0, 0, 0xFF8888, NULL); return;
     }
-    lv_obj_t *viewport = content;
-    ui->app_obj[0] = lv_image_create(viewport);
-    lv_obj_set_size(ui->app_obj[0], AETHER_NES_OUTPUT_WIDTH, AETHER_NES_OUTPUT_HEIGHT);
-    app_frames_set_viewport(ui->frames, AETHER_NES_OUTPUT_WIDTH, AETHER_NES_OUTPUT_HEIGHT);
-    lv_image_set_inner_align(ui->app_obj[0], LV_IMAGE_ALIGN_CENTER);
+    lv_display_t *display = lv_obj_get_display(content);
+    const int32_t width = lv_display_get_horizontal_resolution(display);
+    const int32_t height = lv_display_get_vertical_resolution(display);
+    lv_obj_set_size(content, width, height);
+    /* Fit the 8:7 picture without exceeding the tested RGB565/TE budget. */
+    const int32_t units = LV_MIN(LV_MIN(width, (int32_t)AETHER_NES_OUTPUT_WIDTH) / 8,
+                                 LV_MIN(height, (int32_t)AETHER_NES_OUTPUT_HEIGHT) / 7);
+    const int32_t view_width = LV_MAX(1, units * 8);
+    const int32_t view_height = LV_MAX(1, units * 7);
+    const bool native_size = view_width == AETHER_NES_OUTPUT_WIDTH && view_height == AETHER_NES_OUTPUT_HEIGHT;
+    ui->app_obj[0] = lv_image_create(content);
+    lv_obj_set_size(ui->app_obj[0], view_width, view_height);
+    app_frames_set_viewport(ui->frames, view_width, view_height);
+    lv_image_set_inner_align(ui->app_obj[0], native_size ? LV_IMAGE_ALIGN_CENTER : LV_IMAGE_ALIGN_CONTAIN);
     lv_image_set_antialias(ui->app_obj[0], false);
     lv_obj_remove_flag(ui->app_obj[0], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    /* Keep the same frame size and give the top-to-bottom OLED scan 24 more
-     * rows of transfer lead after the line-zero TE edge. */
-    lv_obj_align(ui->app_obj[0], LV_ALIGN_CENTER, 0, 24);
+    lv_obj_center(ui->app_obj[0]);
     ui->app_obj[1] = app_ui_add_text(ui->screen, "正在加载ROM…",
                                      LV_ALIGN_TOP_LEFT, 20, 84, 0xFFCA5C,
                                      app_ui_chinese_font());

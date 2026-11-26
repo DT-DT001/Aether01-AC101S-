@@ -268,9 +268,9 @@ uint32_t arcade_snake_interval(const arcade_snake_t *game)
     return eaten < 22 ? 232 - eaten * 7 : 78;
 }
 
-arcade_direction_t arcade_tilt_update(arcade_tilt_t *tilt, float x, float y, bool require_neutral)
+arcade_direction_t arcade_tilt_update(arcade_tilt_t *tilt, float x, float y)
 {
-    enum { RELEASE_DEGREES = 7, TILES_DEGREES = 12, SNAKE_DEGREES = 10,
+    enum { RELEASE_DEGREES = 7, TRIGGER_DEGREES = 10,
            AXIS_MARGIN_DEGREES = 3, CONFIRM_SAMPLES = 2 };
     const float abs_x = fabsf(x), abs_y = fabsf(y);
     if (!isfinite(abs_x) || !isfinite(abs_y)) {
@@ -288,12 +288,10 @@ arcade_direction_t arcade_tilt_update(arcade_tilt_t *tilt, float x, float y, boo
         return ARCADE_NONE;
     }
     tilt->neutral_samples = 0;
-    if (require_neutral && tilt->held != ARCADE_NONE) return ARCADE_NONE;
-    const float trigger = require_neutral ? TILES_DEGREES : SNAKE_DEGREES;
     arcade_direction_t direction = ARCADE_NONE;
-    if (abs_x >= trigger && abs_x - abs_y >= AXIS_MARGIN_DEGREES) {
+    if (abs_x >= TRIGGER_DEGREES && abs_x - abs_y >= AXIS_MARGIN_DEGREES) {
         direction = x > 0 ? ARCADE_RIGHT : ARCADE_LEFT;
-    } else if (abs_y >= trigger && abs_y - abs_x >= AXIS_MARGIN_DEGREES) {
+    } else if (abs_y >= TRIGGER_DEGREES && abs_y - abs_x >= AXIS_MARGIN_DEGREES) {
         direction = y > 0 ? ARCADE_DOWN : ARCADE_UP;
     }
     if (direction != tilt->candidate) {
@@ -305,6 +303,152 @@ arcade_direction_t arcade_tilt_update(arcade_tilt_t *tilt, float x, float y, boo
     if (tilt->samples < CONFIRM_SAMPLES) return ARCADE_NONE;
     tilt->held = direction;
     return direction;
+}
+
+static float vector_length_squared(const float value[3])
+{
+    return value[0] * value[0] + value[1] * value[1] + value[2] * value[2];
+}
+
+static void accel_lock(arcade_accel_t *state, uint32_t stamp, bool hold_reference)
+{
+    state->armed = state->steady = false;
+    state->lock_ms = stamp;
+    state->candidate = ARCADE_NONE;
+    state->hold_reference = hold_reference;
+    state->grip_turn = 0.0f;
+}
+
+bool arcade_accel_update(arcade_accel_t *state, const float accel[3], const float gyro[3],
+                         uint32_t stamp, arcade_direction_t *move)
+{
+    enum { MAX_SAMPLE_GAP_MS = 85, READY_MS = 140, REARM_MS = 100, LOCK_MS = 235 };
+    enum { PULSE_CONFIRM_MS = 8, PULSE_WINDOW_MS = 90, MAX_PULSE_GAP_MS = 40 };
+    const float max_rotation_squared = 42.0f * 42.0f;
+    const float accel_squared = vector_length_squared(accel);
+    *move = ARCADE_NONE;
+    if (!isfinite(accel_squared) || accel_squared > 80.0f * 80.0f) {
+        *state = (arcade_accel_t){0};
+        return false;
+    }
+    uint32_t elapsed = 0;
+    if (state->initialized) {
+        elapsed = stamp - state->stamp;
+        if (!elapsed || elapsed > UINT32_MAX / 2U) return true;
+        if (elapsed > MAX_SAMPLE_GAP_MS) {
+            *state = (arcade_accel_t){0};
+            elapsed = 0;
+        }
+    }
+    const float gyro_squared = gyro ? vector_length_squared(gyro) : INFINITY;
+    const bool have_gyro = gyro_squared < 2200.0f * 2200.0f;
+    float difference[3], step[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        difference[i] = accel[i] - state->gravity[i];
+        step[i] = accel[i] - state->previous[i];
+        state->previous[i] = accel[i];
+    }
+    const float difference_squared = vector_length_squared(difference);
+    const float step_squared = vector_length_squared(step);
+    const float gravity_squared = vector_length_squared(state->gravity);
+    const bool valid_gravity = accel_squared > 8.0f * 8.0f && accel_squared < 11.6f * 11.6f;
+    const bool stable_accel = valid_gravity && step_squared < .24f;
+    if (!state->ready && !state->steady && have_gyro && gyro_squared < 38.0f * 38.0f && stable_accel)
+        memcpy(state->gyro_zero, gyro, sizeof(state->gyro_zero));
+    float angular[3] = {0};
+    if (have_gyro)
+        for (unsigned i = 0; i < 3; ++i) angular[i] = gyro[i] - state->gyro_zero[i];
+    const float angular_squared = vector_length_squared(angular);
+    const bool stable = stable_accel && angular_squared < 19.0f * 19.0f;
+    state->stamp = stamp;
+    state->initialized = true;
+    if (!state->armed) {
+        if (state->hold_reference && angular_squared > 4.0f * 4.0f) {
+            const float heading = angular[0] * state->gravity[0] + angular[1] * state->gravity[1] +
+                                  angular[2] * state->gravity[2];
+            const float transverse_squared = angular_squared - heading * heading / gravity_squared;
+            if (transverse_squared > 4.0f * 4.0f)
+                state->grip_turn += sqrtf(transverse_squared) * ((float)elapsed * .001f);
+            if (state->grip_turn >= 4.0f) state->hold_reference = false;
+        }
+        /* After a translational pulse, a constant force in the same direction
+         * is not a new rest position. Wait for the actual return to rest. */
+        if (!stable || (state->hold_reference && difference_squared > .85f)) {
+            state->steady = false;
+            return true;
+        }
+        /* A quiet, repeatable gravity vector establishes the current grip. */
+        if (!state->steady || (!state->hold_reference && difference_squared > .50f)) {
+            state->steady = true;
+            state->steady_ms = stamp;
+            if (!state->hold_reference) memcpy(state->gravity, accel, sizeof(state->gravity));
+        }
+        if (stamp - state->steady_ms >= (state->ready ? REARM_MS : READY_MS) &&
+            (!state->ready || stamp - state->lock_ms >= LOCK_MS)) {
+            state->ready = state->armed = true;
+        }
+        return true;
+    }
+    if (accel_squared < 4.0f * 4.0f || angular_squared > max_rotation_squared) {
+        accel_lock(state, stamp, angular_squared <= max_rotation_squared);
+        return true;
+    }
+    const float gravity_difference = fabsf(accel_squared - gravity_squared);
+    const float x = fabsf(difference[0]), y = fabsf(difference[1]);
+    const bool horizontal = x > y;
+    const float primary = horizontal ? x : y;
+    const bool planar = primary >= 1.45f * (horizontal ? y : x) &&
+                        fabsf(difference[2]) <= .68f * primary + .35f;
+    /* AC101S native +X is screen right, +Y is screen up for translation. */
+    const arcade_direction_t direction = horizontal ? (difference[0] > 0 ? ARCADE_RIGHT : ARCADE_LEFT) :
+                                                      (difference[1] > 0 ? ARCADE_UP : ARCADE_DOWN);
+    if (state->candidate != ARCADE_NONE) {
+        const uint32_t duration = stamp - state->candidate_ms;
+        if (!planar || primary < .55f || direction != state->candidate ||
+            elapsed > MAX_PULSE_GAP_MS || duration > PULSE_WINDOW_MS) {
+            /* Even an aborted or ambiguous pulse may have a strong rebound. */
+            accel_lock(state, stamp, true);
+            return true;
+        }
+        if (primary > state->candidate_peak) state->candidate_peak = primary;
+        state->candidate_impulse += (primary + state->candidate_previous) * (float)elapsed * .0005f;
+        state->candidate_previous = primary;
+        if (duration >= PULSE_CONFIRM_MS && state->candidate_peak >= 1.20f && state->candidate_impulse >= .012f) {
+            *move = direction;
+            accel_lock(state, stamp, true);
+        }
+        return true;
+    }
+    if (primary >= .75f) {
+        /* An inclined grip can preserve the norm even during a translation.
+         * Compare onset to the largest gravity change explained by rotation. */
+        const float angular_limit = have_gyro ? sqrtf(angular_squared) * .00027f * (float)elapsed : 0.0f;
+        const float abs_step = fabsf(step[horizontal ? 0 : 1]);
+        const bool abrupt = have_gyro && abs_step > .11f + angular_limit;
+        const bool norm_changed = gravity_difference >= (have_gyro ? 1.3f : 1.0f);
+        if (!planar) {
+            accel_lock(state, stamp, true);
+        } else if (abrupt || (norm_changed && angular_squared < 19.0f * 19.0f)) {
+            state->candidate = direction;
+            state->candidate_ms = stamp;
+            state->candidate_previous = state->candidate_peak = primary;
+            state->candidate_impulse = 0.0f;
+        } else {
+            accel_lock(state, stamp, false);
+        }
+    } else if (fabsf(difference[2]) > 2.2f) {
+        accel_lock(state, stamp, true);
+    } else if (stable && difference_squared < 1.4f) {
+        /* Keep the response consistent when fresh frames arrive at 10 or 25 ms. */
+        const float interval = (float)elapsed;
+        const float gravity_gain = interval / (160.0f + interval);
+        const float gyro_gain = interval / (1400.0f + interval);
+        for (unsigned i = 0; i < 3; ++i) {
+            state->gravity[i] += difference[i] * gravity_gain;
+            if (have_gyro) state->gyro_zero[i] += angular[i] * gyro_gain;
+        }
+    }
+    return true;
 }
 
 enum { JUMP_CHARGE_MS = 850, JUMP_FLIGHT_MS = 490, JUMP_PAN_MS = 210, JUMP_FALL_MS = 230 };
@@ -319,6 +463,159 @@ uint16_t arcade_jump_distance(uint16_t power)
 {
     if (power > 1000) power = 1000;
     return 38 + power * 196 / 1000;
+}
+
+/* Bit n is the cell at column n % 4, row n / 4 of the piece's box. */
+uint16_t arcade_fall_shape(unsigned piece, unsigned rotation)
+{
+    static const uint16_t shapes[ARCADE_FALL_PIECES][4] = {
+        {0x00F0, 0x4444, 0x0F00, 0x2222},
+        {0x0066, 0x0066, 0x0066, 0x0066},
+        {0x0072, 0x0262, 0x0270, 0x0232},
+        {0x0036, 0x0462, 0x0360, 0x0231},
+        {0x0063, 0x0264, 0x0630, 0x0132},
+        {0x0071, 0x0226, 0x0470, 0x0322},
+        {0x0074, 0x0622, 0x0170, 0x0223},
+    };
+    return shapes[piece][rotation & 3U];
+}
+
+static bool fall_fits(const arcade_fall_t *game, int x, int y, unsigned rotation)
+{
+    for (unsigned cells = arcade_fall_shape(game->piece, rotation); cells; cells &= cells - 1U) {
+        const unsigned bit = __builtin_ctz(cells);
+        const int col = x + (int)(bit % 4U), row = y + (int)(bit / 4U);
+        if (col < 0 || col >= ARCADE_FALL_COLUMNS || row >= ARCADE_FALL_ROWS ||
+            (row >= 0 && game->cells[row][col])) return false;
+    }
+    return true;
+}
+
+static uint8_t fall_draw_piece(arcade_fall_t *game)
+{
+    if (game->bag_pos == ARCADE_FALL_PIECES) {
+        for (unsigned i = 0; i < ARCADE_FALL_PIECES; ++i) game->bag[i] = i;
+        for (unsigned i = ARCADE_FALL_PIECES - 1; i > 0; --i) {
+            const unsigned j = random_next(&game->random) % (i + 1U);
+            const uint8_t piece = game->bag[i];
+            game->bag[i] = game->bag[j];
+            game->bag[j] = piece;
+        }
+        game->bag_pos = 0;
+    }
+    return game->bag[game->bag_pos++];
+}
+
+static void fall_spawn(arcade_fall_t *game)
+{
+    game->piece = game->next;
+    game->next = fall_draw_piece(game);
+    game->rotation = 0;
+    game->x = (ARCADE_FALL_COLUMNS - 4) / 2;
+    game->y = 0;
+    game->over = !fall_fits(game, game->x, game->y, 0);
+}
+
+void arcade_fall_init(arcade_fall_t *game, uint32_t seed)
+{
+    memset(game, 0, sizeof(*game));
+    game->random = seed;
+    game->bag_pos = ARCADE_FALL_PIECES;
+    game->next = fall_draw_piece(game);
+    fall_spawn(game);
+}
+
+bool arcade_fall_move(arcade_fall_t *game, int dx, int dy)
+{
+    if (game->over || !fall_fits(game, game->x + dx, game->y + dy, game->rotation)) return false;
+    game->x += dx;
+    game->y += dy;
+    return true;
+}
+
+bool arcade_fall_rotate(arcade_fall_t *game)
+{
+    if (game->over) return false;
+    const unsigned rotation = (game->rotation + 1U) & 3U;
+    static const int8_t kicks[][2] = {{0, 0}, {-1, 0}, {1, 0}, {-2, 0}, {2, 0},
+                                     {0, -1}, {-1, -1}, {1, -1}, {0, -2}};
+    for (unsigned i = 0; i < sizeof(kicks) / sizeof(kicks[0]); ++i) {
+        const int x = game->x + kicks[i][0], y = game->y + kicks[i][1];
+        if (!fall_fits(game, x, y, rotation)) continue;
+        game->x = x;
+        game->y = y;
+        game->rotation = rotation;
+        return true;
+    }
+    return false;
+}
+
+int arcade_fall_landing(const arcade_fall_t *game)
+{
+    int y = game->y;
+    while (fall_fits(game, game->x, y + 1, game->rotation)) ++y;
+    return y;
+}
+
+unsigned arcade_fall_level(const arcade_fall_t *game)
+{
+    const unsigned level = game->lines / 10U;
+    return 1U + (level < 13U ? level : 13U);
+}
+
+uint32_t arcade_fall_interval(const arcade_fall_t *game)
+{
+    return 800U - (arcade_fall_level(game) - 1U) * 52U;
+}
+
+static void fall_lock(arcade_fall_t *game)
+{
+    const unsigned shape = arcade_fall_shape(game->piece, game->rotation);
+    const int first_row = game->y + (int)(__builtin_ctz(shape) / 4U);
+    if (first_row < 0) {
+        game->over = true;
+        return;
+    }
+    for (unsigned cells = shape; cells; cells &= cells - 1U) {
+        const unsigned bit = __builtin_ctz(cells);
+        game->cells[game->y + (int)(bit / 4U)][game->x + (int)(bit % 4U)] = game->piece + 1U;
+    }
+    int write = ARCADE_FALL_ROWS - 1;
+    for (int row = write; row >= 0; --row) {
+        unsigned col = 0;
+        while (col < ARCADE_FALL_COLUMNS && game->cells[row][col]) ++col;
+        if (col == ARCADE_FALL_COLUMNS) continue;
+        if (row != write) memcpy(game->cells[write], game->cells[row], sizeof(game->cells[row]));
+        --write;
+    }
+    const unsigned cleared = (unsigned)(write + 1);
+    memset(game->cells, 0, cleared * sizeof(game->cells[0]));
+    static const uint16_t line_points[] = {0, 100, 300, 500, 800};
+    add_score(&game->score, line_points[cleared > 4U ? 4U : cleared] * arcade_fall_level(game));
+    add_score(&game->lines, cleared);
+    fall_spawn(game);
+}
+
+void arcade_fall_step(arcade_fall_t *game)
+{
+    if (!game->over && !arcade_fall_move(game, 0, 1)) fall_lock(game);
+}
+
+void arcade_fall_drop(arcade_fall_t *game)
+{
+    if (game->over) return;
+    const int landing = arcade_fall_landing(game);
+    add_score(&game->score, 2U * (unsigned)(landing - game->y));
+    game->y = landing;
+    fall_lock(game);
+}
+
+uint8_t arcade_roll_die(uint32_t *random)
+{
+    /* Xorshift visits all nonzero words. Discard the incomplete final group. */
+    uint32_t draw;
+    do { draw = random_next(random); } while (draw > UINT32_MAX - UINT32_MAX % 6U);
+    return 1U + (draw - 1U) % 6U;
 }
 
 void arcade_jump_init(arcade_jump_t *game, uint32_t seed)

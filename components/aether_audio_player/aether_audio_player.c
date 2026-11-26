@@ -901,12 +901,14 @@ esp_err_t aether_audio_player_select(aether_audio_player_handle_t h, size_t inde
     return ESP_OK;
 }
 
-esp_err_t aether_audio_player_next(aether_audio_player_handle_t h, int direction)
+static esp_err_t step_playlist(aether_audio_player_handle_t h, int direction, bool standby_only)
 {
     if (!h || (direction != -1 && direction != 1)) return ESP_ERR_INVALID_ARG;
     if (xSemaphoreTake(h->command_lock, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&h->state_lock);
-    if (h->terminate || h->status.closing) {
+    if (h->terminate || h->status.closing ||
+        (standby_only && (!h->screen_suspended || !h->standby_music ||
+                          h->status.state != AETHER_AUDIO_PLAYING || h->pause_requested))) {
         portEXIT_CRITICAL(&h->state_lock);
         xSemaphoreGive(h->command_lock);
         return ESP_ERR_INVALID_STATE;
@@ -922,6 +924,16 @@ esp_err_t aether_audio_player_next(aether_audio_player_handle_t h, int direction
     xTaskNotifyGive(h->task);
     xSemaphoreGive(h->command_lock);
     return ESP_OK;
+}
+
+esp_err_t aether_audio_player_next(aether_audio_player_handle_t h, int direction)
+{
+    return step_playlist(h, direction, false);
+}
+
+esp_err_t aether_audio_player_step_in_standby(aether_audio_player_handle_t h, int direction)
+{
+    return step_playlist(h, direction, true);
 }
 
 esp_err_t aether_audio_player_get_resume_path(aether_audio_player_handle_t h, char *path, size_t size)

@@ -44,12 +44,15 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_flash.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "esp_lvgl_port.h"
 #include "esp_psram.h"
 #include "lvgl.h"
+#include "miniz.h"
+#include "src/misc/cache/instance/lv_image_cache.h"
 #include "nvs_flash.h"
 #include "app_theme.h"
 #include "sdkconfig.h"
@@ -411,8 +414,9 @@ enum {
     BOOT_LOGO_MIN_VISIBLE_MS = 2500, BOOT_LOGO_ANIMATION_MS = 680,
     BOOT_LOGO_START_SCALE = 232,
 };
-extern const uint8_t boot_logo_data[] asm("_binary_boot_logo_rgb565_start");
-static const lv_image_dsc_t boot_logo = {
+extern const uint8_t boot_logo_begin[] asm("_binary_boot_logo_rgb565_zlib_start");
+extern const uint8_t boot_logo_end[] asm("_binary_boot_logo_rgb565_zlib_end");
+static lv_image_dsc_t boot_logo = {
     .header = {
         .magic = LV_IMAGE_HEADER_MAGIC,
         .cf = LV_COLOR_FORMAT_RGB565,
@@ -421,8 +425,38 @@ static const lv_image_dsc_t boot_logo = {
         .stride = BOOT_LOGO_WIDTH * 2,
     },
     .data_size = BOOT_LOGO_WIDTH * BOOT_LOGO_HEIGHT * 2,
-    .data = boot_logo_data,
 };
+
+static esp_err_t decode_boot_logo(void)
+{
+    const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    tinfl_decompressor *decoder = heap_caps_malloc(sizeof(*decoder), caps);
+    uint8_t *pixels = heap_caps_malloc(boot_logo.data_size, caps);
+    esp_err_t error = ESP_ERR_NO_MEM;
+    if (decoder && pixels) {
+        tinfl_init(decoder);
+        const size_t compressed_size = (uintptr_t)boot_logo_end - (uintptr_t)boot_logo_begin;
+        size_t input = compressed_size, output = boot_logo.data_size;
+        const tinfl_status status = tinfl_decompress(decoder, boot_logo_begin, &input, pixels, pixels, &output,
+            TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+        error = ESP_ERR_INVALID_RESPONSE;
+        if (status == TINFL_STATUS_DONE && input == compressed_size && output == boot_logo.data_size) {
+            boot_logo.data = pixels;
+            error = ESP_OK;
+        }
+    }
+    free(decoder);
+    if (error != ESP_OK) free(pixels);
+    return error;
+}
+
+static void release_boot_logo(lv_event_t *event)
+{
+    (void)event;
+    lv_image_cache_drop(&boot_logo);
+    free((void *)boot_logo.data);
+    boot_logo.data = NULL;
+}
 
 /* Both callers hold LVGL exclusively. Render the full screen and wait for its
  * final staged DMA transfer before reporting the frame as presented. */
@@ -463,10 +497,15 @@ static esp_err_t present_boot_frame(lv_display_t *display, int64_t *logo_on_us)
     lv_obj_remove_style_all(screen);
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-    lv_obj_t *logo = lv_image_create(screen);
-    lv_image_set_src(logo, &boot_logo);
-    lv_image_set_scale(logo, BOOT_LOGO_START_SCALE);
-    lv_obj_center(logo);
+    lv_obj_t *logo = NULL;
+    const esp_err_t decoded = decode_boot_logo();
+    if (decoded == ESP_OK) {
+        logo = lv_image_create(screen);
+        lv_obj_add_event_cb(logo, release_boot_logo, LV_EVENT_DELETE, NULL);
+        lv_image_set_src(logo, &boot_logo);
+        lv_image_set_scale(logo, BOOT_LOGO_START_SCALE);
+        lv_obj_center(logo);
+    } else ESP_LOGW(TAG, "boot logo decode failed: %s", esp_err_to_name(decoded));
 
     /* The initialized panel is blank until its entire first frame is ready. */
     esp_err_t error = complete_boot_refresh(display);
@@ -474,6 +513,8 @@ static esp_err_t present_boot_frame(lv_display_t *display, int64_t *logo_on_us)
         error = esp_lcd_panel_disp_on_off(s_board.display, true);
         if (error == ESP_OK) {
             *logo_on_us = esp_timer_get_time();
+        }
+        if (error == ESP_OK && logo) {
             lv_anim_t animation;
             lv_anim_init(&animation);
             lv_anim_set_var(&animation, logo);
@@ -484,6 +525,7 @@ static esp_err_t present_boot_frame(lv_display_t *display, int64_t *logo_on_us)
             lv_anim_start(&animation);
         }
     }
+    if (error != ESP_OK && logo) lv_obj_delete(logo);
     return error;
 }
 
@@ -696,6 +738,12 @@ void app_main(void)
     if (s_board.touch_ready) {
         touch_indev = app_touch_add(display, s_board.touch, &s_power);
         if (!touch_indev) ESP_LOGW(TAG, "LVGL touch input unavailable");
+        else {
+            if (s_nes) {
+                const esp_err_t error = aether_nes_set_touch_reader(s_nes, app_touch_read_nes, NULL);
+                if (error != ESP_OK) ESP_LOGW(TAG, "NES touch sharing unavailable: %s", esp_err_to_name(error));
+            }
+        }
     }
 
     ESP_ERROR_CHECK(app_tools_init(&s_board));

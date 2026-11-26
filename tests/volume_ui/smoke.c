@@ -124,6 +124,7 @@ lv_obj_t *app_ui_begin_page(app_ui_t *ui,const char *title)
     if(ui->timer){lv_timer_delete(ui->timer);ui->timer=NULL;}if(ui->page_cleanup){ui->page_cleanup(ui);ui->page_cleanup=NULL;}
     ui->page_can_exit=NULL;
     ui->page_back=NULL;
+    ui->app_value=0;
     ui->screen=lv_obj_create(NULL);lv_obj_remove_flag(ui->screen,LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui->screen,lv_color_hex(0x101321),0);lv_obj_set_style_bg_opa(ui->screen,LV_OPA_COVER,0);
     lv_obj_set_style_text_font(ui->screen,&font_16,0);
@@ -408,6 +409,42 @@ static void test_settings_connections(app_ui_t *ui)
         assert_settings_at_top(ui);
     }
     puts("PASS Settings places Wi-Fi and Bluetooth first, Device status last, and uses one header Back for all three pages");
+}
+
+static void test_settings_display(app_ui_t *ui)
+{
+    app_open_settings(ui);
+    advance(300);
+    assert(!find(ui->content, "息屏手势"));
+    lv_obj_t *title = find(ui->content, "显示");
+    assert(title);
+    lv_obj_t *display = lv_obj_get_parent(title);
+    lv_obj_t *brightness = lv_obj_get_child_by_type(display, 0, &lv_slider_class);
+    lv_obj_t *timeout = lv_obj_get_child_by_type(display, 0, &lv_dropdown_class);
+    assert(brightness && timeout);
+    assert(lv_obj_get_height(display) < 320 && find(display, "按电源键唤醒屏幕"));
+
+    lv_slider_set_value(brightness, 45, LV_ANIM_OFF);
+    lv_obj_send_event(brightness, LV_EVENT_VALUE_CHANGED, NULL);
+    assert(ui->power->brightness == 45 && find(display, "屏幕亮度：45%"));
+    lv_obj_send_event(brightness, LV_EVENT_RELEASED, NULL);
+
+    lv_dropdown_set_selected(timeout, 4);
+    lv_obj_send_event(timeout, LV_EVENT_VALUE_CHANGED, NULL);
+    assert(ui->power->timeout == 120 && find(display, "自动息屏：120 秒"));
+    lv_dropdown_set_selected(timeout, 0);
+    lv_obj_send_event(timeout, LV_EVENT_VALUE_CHANGED, NULL);
+    assert(ui->power->timeout == 0 && find(display, "自动息屏：永不"));
+
+    lv_obj_t *sleep_label = find(display, "立即息屏");
+    assert(sleep_label);
+    tap_switch(lv_obj_get_parent(sleep_label));
+    assert(find(display, "正在息屏"));
+
+    app_open_settings(ui);
+    advance(300);
+    assert(find(ui->content, "屏幕亮度：45%") && find(ui->content, "自动息屏：永不"));
+    puts("PASS Settings display exposes brightness, auto sleep and immediate sleep after removal of screen-off gestures");
 }
 
 /* Force a stale event past LVGL's disabled state to check the handler guard. */
@@ -702,6 +739,7 @@ int main(int argc,char **argv)
     app_power_t power={.brightness=75,.timeout=60};app_ui_t ui={.power=&power,.storage=(void*)1,.audio_player=(void*)2,.io=(void*)4};
     test_settings_entry(&ui);
     test_settings_connections(&ui);
+    test_settings_display(&ui);
     app_open_settings(&ui);advance(200);unsigned seen=0;lv_obj_t *s=slider(ui.content,0,&seen);assert(s);
     drag(s,70,offset);assert(requested_master==70&&master.master_volume==70&&saved_master==70&&master_persist==1&&master_updates>=10);
     advance(1500);assert(lv_slider_get_value(s)==70&&master.master_volume==70);

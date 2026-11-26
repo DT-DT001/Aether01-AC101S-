@@ -4,12 +4,12 @@
 #define G 9.80665f
 #define RAD 0.01745329252f
 #define DEG 57.29577951f
-static bool level_gravity(const float accel[3])
+static bool valid_gravity(const float accel[3])
 {
     const float x = accel[0], y = accel[1], z = accel[2];
     const float norm_squared = x * x + y * y + z * z;
     return isfinite(norm_squared) && norm_squared >= 7.8f * 7.8f &&
-           norm_squared <= 11.8f * 11.8f && z > 0.0f;
+           norm_squared <= 11.8f * 11.8f;
 }
 
 static void attitude_from_gravity(const float accel[3], float q[4])
@@ -26,14 +26,14 @@ static void attitude_from_gravity(const float accel[3], float q[4])
 
 bool app_motion_level_reference(const float accel[3], float reference[4])
 {
-    if (!level_gravity(accel)) return false;
+    if (!valid_gravity(accel)) return false;
     attitude_from_gravity(accel, reference);
     return true;
 }
 
 bool app_motion_level_angles(const float accel[3], const float reference[4], float *roll, float *pitch)
 {
-    if (!level_gravity(accel)) return false;
+    if (!valid_gravity(accel) || accel[2] <= 0.0f) return false;
     float x = accel[0], y = accel[1], z = accel[2];
     if (reference) {
         const float w = reference[0], qx = reference[1], qy = reference[2], qz = reference[3];
@@ -76,6 +76,15 @@ void app_motion_filter_init(app_motion_filter_t *f) {
 void app_motion_filter_zero(app_motion_filter_t *f) {
     if(!f || !f->initialized) return;
     memcpy(f->reference,f->q,sizeof(f->reference)); angles(f);
+}
+bool app_motion_filter_zero_at(app_motion_filter_t *f, const float accel[3], uint32_t stamp)
+{
+    if (f->initialized && stamp - f->stamp > UINT32_MAX / 2U) return false;
+    if (!app_motion_level_reference(accel, f->q)) return false;
+    f->stamp = stamp;
+    f->initialized = true;
+    app_motion_filter_zero(f);
+    return true;
 }
 static bool update_attitude(app_motion_filter_t *f,const float a[3],const float gyro[3],
                             uint32_t stamp,bool use_gyro) {

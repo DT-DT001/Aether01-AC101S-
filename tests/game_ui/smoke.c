@@ -35,6 +35,9 @@ static bool imu_publish_during_read;
 static bool imu_gyro_bias_valid = true;
 static float imu_gravity = 9.80665f;
 static float imu_roll_bias;
+static float imu_pitch_bias;
+static float imu_translation[3];
+static bool imu_accel_invalid;
 static app_tools_arcade_preferences_t arcade_preferences;
 
 uint32_t esp_random(void) { return 41; }
@@ -56,10 +59,11 @@ void app_telemetry_get(app_telemetry_snapshot_t *snapshot)
         imu_stamp_ms = clock_ms + callback_elapsed_ms;
     }
     *snapshot = (app_telemetry_snapshot_t){
-        .imu = {.accel_mps2 = {imu_gravity * sinf(pitch_angle) * cosf(roll_angle),
-                             imu_gravity * sinf(roll_angle),
-                             imu_gravity * cosf(pitch_angle) * cosf(roll_angle)},
-                .gyro_dps = {roll_rate + imu_roll_bias, pitch_rate, imu_invalid ? NAN : 0},
+        .imu = {.accel_mps2 = {imu_accel_invalid ? NAN : imu_gravity * sinf(pitch_angle) *
+                              cosf(roll_angle) + imu_translation[0],
+                             imu_gravity * sinf(roll_angle) + imu_translation[1],
+                             imu_gravity * cosf(pitch_angle) * cosf(roll_angle) + imu_translation[2]},
+                .gyro_dps = {roll_rate + imu_roll_bias, pitch_rate + imu_pitch_bias, imu_invalid ? NAN : 0},
                 .gyro_bias_valid = imu_gyro_bias_valid},
         .imu_updated_ms = imu_stamp_ms,
         .imu_error = imu_status,
@@ -169,7 +173,8 @@ static void advance(unsigned ms)
         roll_angle += roll_rate * 0.00001745329252f;
         ++clock_ms;
         callback_elapsed_ms = 0;
-        if (!imu_frozen && clock_ms % 20 == 0) imu_stamp_ms = clock_ms;
+        const unsigned imu_period = interest & APP_TELEMETRY_IMU_GAME ? 10U : 20U;
+        if (!imu_frozen && clock_ms % imu_period == 0) imu_stamp_ms = clock_ms;
         lv_tick_inc(1);
         lv_timer_handler();
     }
@@ -403,15 +408,18 @@ static lv_point_t crate_player(lv_display_t *display, lv_obj_t *board)
     return (lv_point_t){0};
 }
 
-static void assert_tiles(lv_obj_t *board, const arcade_tiles_t *expected)
+static void assert_tiles_at(lv_obj_t *board, const arcade_tiles_t *expected, unsigned line)
 {
     for (unsigned i = 0; i < 16; ++i) {
         lv_obj_t *cell = lv_obj_get_child(board, i);
         char text[12] = "";
         if (expected->cells[i]) snprintf(text, sizeof(text), "%u", 1U << expected->cells[i]);
-        assert(!strcmp(lv_label_get_text(lv_obj_get_child(cell, 0)), text));
+        const char *actual = lv_label_get_text(lv_obj_get_child(cell, 0));
+        if (strcmp(actual, text)) printf("2048 line %u, cell %u: expected '%s', got '%s'\n", line, i, text, actual);
+        assert(!strcmp(actual, text));
     }
 }
+#define assert_tiles(board, expected) assert_tiles_at(board, expected, __LINE__)
 
 int main(int argc, char **argv)
 {
@@ -430,7 +438,7 @@ int main(int argc, char **argv)
     ui.timer = lv_timer_create(NULL, 20, &ui);
     app_open_game(&ui);
     advance(150);
-    assert(lv_obj_get_child_count(ui.content) == 4);
+    assert(lv_obj_get_child_count(ui.content) == 6);
     screenshot(display, argv[1], "game-hub");
     click(ui.content, "2048");
     advance(120);
@@ -452,8 +460,10 @@ int main(int argc, char **argv)
     press(board, 45);
     extend_drag(0, 85);
     sleeping = true;
+    ui.page_suspend(&ui, true);
     advance(70);
     sleeping = false;
+    ui.page_suspend(&ui, false);
     advance(40);
     release();
     assert_tiles(board, &expected_swipe);
@@ -474,72 +484,110 @@ int main(int argc, char **argv)
     }
     screenshot(display, argv[1], "game-2048-swipe");
     click(ui.content, "滑动");
-    assert(interest && label_visible(ui.screen, "倾斜") && label_visible(ui.screen, LV_SYMBOL_GPS));
+    assert(interest && label_visible(ui.screen, "加速度") && label_visible(ui.screen, LV_SYMBOL_GPS));
     assert_tiles(board, &expected_swipe);
     swipe(board, 92, 0);
     assert_tiles(board, &expected_swipe);
-    click(ui.content, "倾斜");
+    click(ui.content, "加速度");
     assert(!interest && label_visible(ui.screen, "滑动") && !label_visible(ui.screen, LV_SYMBOL_GPS));
     assert_tiles(board, &expected_swipe);
     click(ui.content, "滑动");
     click(ui.content, LV_SYMBOL_REFRESH);
-    advance(120);
-    assert(interest == APP_TELEMETRY_IMU && find(ui.screen, "轻倾移块，回正后再倾"));
+    assert(interest == APP_TELEMETRY_IMU_GAME && find(ui.screen, "请拿稳设备"));
+    imu_gravity = 8.882f;
+    imu_gyro_bias_valid = false;
+    imu_roll_bias = 8.58f;
+    imu_pitch_bias = 3.19f;
+    pitch_angle = -.06066f;
+    roll_angle = -.02579f;
+    const float still_pitch = pitch_angle;
+    const float still_roll = roll_angle;
+    advance(220);
+    assert(interest == APP_TELEMETRY_IMU_GAME && find(ui.screen, "沿屏幕方向轻推"));
     imu_publish_during_read = true;
     advance(10);
-    assert(!imu_publish_during_read && find(ui.screen, "轻倾移块，回正后再倾"));
-    static const struct { float pitch, roll; arcade_direction_t direction; } tilts[] = {
-        {-120, 0, ARCADE_LEFT}, {120, 0, ARCADE_RIGHT},
-        {0, -120, ARCADE_UP}, {0, 120, ARCADE_DOWN},
+    assert(!imu_publish_during_read && find(ui.screen, "沿屏幕方向轻推"));
+    static const struct { unsigned axis; float impulse; arcade_direction_t direction; } pulses[] = {
+        {0, -1.55f, ARCADE_LEFT}, {0, 1.55f, ARCADE_RIGHT},
+        {1, 1.55f, ARCADE_UP}, {1, -1.55f, ARCADE_DOWN},
     };
-    for (unsigned i = 0; i < sizeof(tilts) / sizeof(tilts[0]); ++i) {
+    for (unsigned i = 0; i < sizeof(pulses) / sizeof(pulses[0]); ++i) {
         if (i) {
-            pitch_angle = roll_angle = 0;
             click(ui.content, LV_SYMBOL_REFRESH);
-            advance(100);
+            advance(220);
         }
         arcade_tiles_t expected;
         arcade_tiles_init(&expected, esp_random());
         assert_tiles(board, &expected);
         if (!i) {
-            rotate(-120, 0, 65);
-            advance(100);
+            rotate(-120, 0, 150);
+            advance(360);
+            rotate(28, 0, 180);
             assert_tiles(board, &expected);
-            rotate(-45, 0, 160);
-        } else rotate(tilts[i].pitch, tilts[i].roll, 145);
+            rotate(24, 0, 540);
+            advance(350);
+            imu_translation[0] = imu_translation[1] = 3.2f;
+            advance(65);
+            memset(imu_translation, 0, sizeof(imu_translation));
+            advance(355);
+            assert_tiles(board, &expected);
+        }
+        imu_translation[pulses[i].axis] = pulses[i].impulse;
         advance(55);
-        assert(arcade_tiles_move(&expected, tilts[i].direction));
+        assert(arcade_tiles_move(&expected, pulses[i].direction));
         assert_tiles(board, &expected);
+        assert(label_visible(ui.screen, "停稳后继续"));
         assert(lv_display_get_inactive_time(display) < 250);
         advance(360);
+        imu_translation[pulses[i].axis] = -pulses[i].impulse * 1.2f;
+        advance(80);
+        memset(imu_translation, 0, sizeof(imu_translation));
+        advance(345);
         assert_tiles(board, &expected);
     }
     uint32_t moved = board_checksum(display, board);
+    sleeping = true;
+    ui.page_suspend(&ui, true);
+    assert(!interest);
+    imu_translation[0] = 4.5f;
+    advance(240);
+    assert(board_checksum(display, board) == moved);
+    memset(imu_translation, 0, sizeof(imu_translation));
+    sleeping = false;
+    ui.page_suspend(&ui, false);
+    assert(interest && label_visible(ui.screen, "请拿稳设备"));
+    advance(220);
+    assert(label_visible(ui.screen, "沿屏幕方向轻推") && board_checksum(display, board) == moved);
     imu_frozen = true;
     advance(90);
     assert(board_checksum(display, board) == moved);
     advance(80);
     assert(label_visible(ui.screen, "传感器暂不可用 · 可切回滑动"));
     imu_frozen = false;
-    roll_angle = 0;
-    advance(120);
-    assert(find(ui.screen, "轻倾移块，回正后再倾"));
-    imu_invalid = true;
+    roll_angle = still_roll;
+    advance(220);
+    assert(find(ui.screen, "沿屏幕方向轻推"));
+    imu_accel_invalid = true;
     advance(40);
     assert(label_visible(ui.screen, "传感器暂不可用 · 可切回滑动") && board_checksum(display, board) == moved);
-    imu_invalid = false;
+    imu_accel_invalid = false;
     imu_status = ESP_ERR_TIMEOUT;
     advance(100);
     assert(label_visible(ui.screen, "传感器暂不可用 · 可切回滑动"));
     imu_status = ESP_OK;
-    pitch_angle = 0;
+    pitch_angle = still_pitch;
     click(ui.content, LV_SYMBOL_GPS);
-    advance(150);
-    assert(find(ui.screen, "轻倾移块，回正后再倾"));
+    assert(label_visible(ui.screen, "请拿稳设备"));
+    advance(220);
+    assert(find(ui.screen, "沿屏幕方向轻推"));
     screenshot(display, argv[1], "game-2048");
     click(ui.screen, LV_SYMBOL_LEFT);
     assert(!ui.page_context && !interest && cleanups == 1);
-    puts("PASS LVGL 2048 default swipe in four directions with release/reset/sleep guards, mode/board retention, gyro directions and sensor fault handling");
+    pitch_angle = roll_angle = 0;
+    imu_gravity = 9.80665f;
+    imu_gyro_bias_valid = true;
+    imu_roll_bias = imu_pitch_bias = 0;
+    puts("PASS LVGL 2048 four-way swipe and acceleration, mode and board retention, tilt/diagonal/brake rejection, sleep, stale samples, error recovery and recenter");
 
     click(ui.content, "推箱子");
     assert(find(ui.screen, "1 / 6  ·  0 步"));
@@ -784,9 +832,96 @@ int main(int argc, char **argv)
     assert(!ui.page_context && !interest && cleanups == 4);
     puts("PASS LVGL jump charging, landing, input reset, sleep cancellation, falling and held exit");
 
+    click(ui.content, "摇骰子");
+    assert(!interest && label_visible(ui.content, "1 枚"));
+    board = lv_obj_get_child(ui.content, 2);
+    click(ui.content, "1 枚");
+    click(ui.content, "2 枚");
+    assert(label_visible(ui.content, "3 枚"));
+    tap(board);
+    assert(label_visible(ui.content, "摇动中"));
+    advance(160);
+    const uint32_t rolling_dice = board_checksum(display, board);
+    sleeping = true;
+    ui.page_suspend(&ui, true);
+    advance(1500);
+    assert(label_visible(ui.content, "摇动中") && board_checksum(display, board) == rolling_dice);
+    sleeping = false;
+    ui.page_suspend(&ui, false);
+    advance(700);
+    assert(!label_visible(ui.content, "摇动中"));
+    screenshot(display, argv[1], "game-dice");
+    click(ui.content, "3 枚");
+    assert(label_visible(ui.content, "1 枚"));
+    click(ui.content, "感应关");
+    assert(interest == APP_TELEMETRY_IMU && label_visible(ui.content, "感应开"));
+    advance(100);
+    imu_gravity = 22;
+    advance(135);
+    assert(label_visible(ui.content, "摇动中"));
+    advance(900);
+    assert(!label_visible(ui.content, "摇动中"));
+    advance(200);
+    assert(!label_visible(ui.content, "摇动中"));
+    imu_gravity = 9.80665f;
+    click(ui.content, "感应开");
+    assert(!interest);
+    click(ui.content, "掷骰");
+    assert(label_visible(ui.content, "摇动中"));
+    expected_pointer_cleanup = board;
+    tap(lv_obj_get_child(ui.screen, 0));
+    assert(!expected_pointer_cleanup && cleanups == 5 && !ui.page_context && !interest);
+    puts("PASS LVGL dice tray, 1–3 dice, manual and IMU rolling, sleep, stationary rearm and exit during animation");
+
+    click(ui.content, "落块挑战");
+    board = lv_obj_get_child(ui.content, 3);
+    assert(lv_obj_get_width(board) == 178 && lv_obj_get_height(board) == 348);
+    assert(label_visible(ui.content, "开始") && label_visible(ui.content, "下一块"));
+    click(ui.content, "开始");
+    uint32_t falling = board_checksum(display, board);
+    click(ui.content, LV_SYMBOL_LEFT);
+    assert(board_checksum(display, board) != falling);
+    click(ui.content, LV_SYMBOL_RIGHT);
+    assert(board_checksum(display, board) == falling);
+    click(ui.content, "旋转");
+    click(ui.content, LV_SYMBOL_DOWN);
+    assert(board_checksum(display, board) != falling);
+    click(ui.content, "快速落下");
+    assert(!label_visible(ui.content, "得分  0"));
+    screenshot(display, argv[1], "game-fall");
+    click(ui.content, LV_SYMBOL_PAUSE);
+    assert(label_visible(ui.content, "已暂停"));
+    falling = board_checksum(display, board);
+    advance(1700);
+    assert(board_checksum(display, board) == falling);
+    click(ui.content, "继续");
+    falling = board_checksum(display, board);
+    sleeping = true;
+    ui.page_suspend(&ui, true);
+    advance(3000);
+    assert(board_checksum(display, board) == falling);
+    sleeping = false;
+    ui.page_suspend(&ui, false);
+    advance(120);
+    assert(board_checksum(display, board) == falling);
+    advance(800);
+    assert(board_checksum(display, board) != falling);
+    click(ui.content, LV_SYMBOL_REFRESH);
+    assert(label_visible(ui.content, "得分  0") && label_visible(ui.content, "开始"));
+    click(ui.content, "开始");
+    for (unsigned i = 0; i < 20 && !label_visible(ui.content, "游戏结束"); ++i)
+        click(ui.content, "快速落下");
+    assert(label_visible(ui.content, "游戏结束") && label_visible(ui.content, "再玩一次"));
+    click(ui.content, "再玩一次");
+    assert(!label_visible(ui.content, "游戏结束") && label_visible(ui.content, "得分  0"));
+    expected_draw_cleanup = board;
+    tap(lv_obj_get_child(ui.screen, 0));
+    assert(!expected_draw_cleanup && cleanups == 6 && !ui.page_context && !interest);
+    puts("PASS LVGL falling blocks movement, rotation, two drop speeds, pause, retained sleep state, reset and replay");
+
     click(ui.content, "2048");
-    assert(interest && label_visible(ui.screen, "倾斜"));
-    click(ui.content, "倾斜");
+    assert(interest && label_visible(ui.screen, "加速度"));
+    click(ui.content, "加速度");
     board = lv_obj_get_child(ui.content, 3);
     assert(lv_obj_get_event_count(board) == 4);
     press(board, 45);
@@ -796,7 +931,7 @@ int main(int argc, char **argv)
     lv_indev_reset(input, NULL);
     lv_indev_wait_release(input);
     release();
-    assert(!expected_pointer_cleanup && !ui.page_context && !interest && cleanups == 5);
+    assert(!expected_pointer_cleanup && !ui.page_context && !interest && cleanups == 7);
     puts("PASS 2048 held-swipe exit unregisters all pointer callbacks before async screen retirement");
 
     static const char *const region_games[] = {"推箱子", "贪吃蛇"};
@@ -820,18 +955,18 @@ int main(int argc, char **argv)
         release();
         assert(!expected_pointer_cleanup && !expected_draw_cleanup && !ui.page_context && !interest);
     }
-    assert(cleanups == 7);
+    assert(cleanups == 9);
     puts("PASS held margin-touch exit retires both game boards' draw and surface callbacks safely");
     puts("PASS reopening 2048 and Snake restores independent control modes; Sokoban resumes its saved level");
 
-    static const char *const games[] = {"2048", "推箱子", "贪吃蛇", "跳一跳"};
+    static const char *const games[] = {"2048", "推箱子", "贪吃蛇", "跳一跳", "摇骰子", "落块挑战"};
     for (unsigned i = 0; i < 24; ++i) {
-        click(ui.content, games[i % 4]);
+        click(ui.content, games[i % (sizeof(games) / sizeof(games[0]))]);
         app_open_game(&ui);
         advance(40);
         assert(!ui.page_context && !interest && lv_mem_test() == LV_RESULT_OK);
     }
-    assert(cleanups == 31);
+    assert(cleanups == 33);
     click(ui.screen, LV_SYMBOL_LEFT);
     assert(label_visible(ui.screen, "应用列表") && !ui.page_context);
     puts("PASS the common header Back returns from a game to the hub and from the hub to the drawer");
