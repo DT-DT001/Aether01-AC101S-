@@ -10,30 +10,32 @@ This standalone firmware demo targets the AC101S edition of Aether01, a handheld
 
 ![Everyday apps on Aether01](docs/images/02-daily-apps.png)
 
+![Local AI voice noise suppression in Recorder and file management on the TF card](docs/images/06-recorder-files.png)
+
 ![Standard, scientific, and programmer calculator modes](docs/images/07-calculator-modes.png)
 
 ![Themes and wallpapers, stopwatch, and countdown](docs/images/08-theme-clock.png)
 
-![Enlarged offline Pinyin keyboard, TF and USB file browsing, and long-press file actions](docs/images/06-keyboard-files.png)
-
-![2048, Sokoban, Snake, and platform jumping](docs/images/03-built-in-games.png)
+![Built-in games on Aether01](docs/images/03-built-in-games.png)
 
 <details>
-<summary>Motion tools</summary>
+<summary>Motion and connectivity tools</summary>
 
 ![Orientation and spirit level in flat and tilted positions](docs/images/04-device-tools.png)
 
+![Air mouse, OBS controls, and USB transfer](docs/images/05-connectivity.png)
+
 </details>
 
-The 480 × 480 previews show the LVGL interface with demo content.
+The 480 × 480 screens were rendered from the firmware’s LVGL interface with demo content.
 
 Swipe up from the desktop to open the app drawer. Returning to the drawer restores its scroll position. The drawer's Home button or a two-second hold of the physical user button opens the desktop.
 
-The firmware includes music playback with a live five-band EQ, video, recording, a TXT reader, NES emulation, USB OTG, Wi-Fi, Bluetooth controls, and ESP-NOW push-to-talk. The clock has alarms, a lap stopwatch, and an audible countdown. The calculator has standard, scientific, and programmer modes. Attitude and the two-axis spirit level share the same zero reference. Themes offer six colour palettes and store proportionally resized JPEG or BMP wallpapers in internal flash.
+The firmware includes music playback with a live five-band EQ, video, recording, a TXT reader, NES emulation, USB OTG, Wi-Fi, Bluetooth controls, and ESP-NOW push-to-talk. The clock has alarms, a lap stopwatch, and an audible countdown. The calculator has standard, scientific, and programmer modes. Attitude and the two-axis spirit level share the same zero reference. Gallery and Files open baseline JPEG, PNG, uncompressed 24/32-bit BMP, and the first frame of GIFs. Themes offer six colour palettes and store proportionally resized wallpapers in internal flash.
 
-2048 supports swipe and tilt controls. Sokoban and Snake respond to directional touch regions, and Snake also supports tilt.
+2048 supports swipe controls and directional acceleration gestures. Hold the device steady, then move it briskly along the plane of the screen to shift the tiles. Sokoban and Snake respond to directional touch regions, and Snake also supports tilt. Dice supports one to three dice and optional shake input. Falling Blocks includes a landing preview, quick drop, and pause.
 
-The power button and screen timeout pause the foreground app while music keeps playing. Press the power button to resume. Air Mouse includes common computer shortcuts, and OBS scene labels can be renamed.
+The power button and screen timeout pause the foreground app while music keeps playing. Press the power button to resume. Air Mouse includes common computer shortcuts and saves drift calibration and sensitivity settings across restarts. OBS scene labels can be renamed.
 
 Music playback supports synchronized LRC lyrics, previews the target time while scrubbing, and remembers playback position. The recorder shows a live waveform and has its own recording list. The offline Pinyin keyboard supports Chinese text entry with word candidates and an optional vocabulary extension. Long-press a file to see its details, copy it, move it, or delete it.
 
